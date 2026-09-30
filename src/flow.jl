@@ -59,7 +59,7 @@ function TFlow(N::NTuple{D}, uBC; T=Float32, mem=CuArray, kw...) where D
     per = ntuple(j->j ∈ f.perdir, D)
     a = TFlow{D,T,typeof(f.p),typeof(f.u),typeof(f.μ₁),typeof(f.λ),typeof(bc),typeof(acc)}(
         f.u, f.u⁰, f.f, f.p, f.σ, f.V, f.μ₀, f.μ₁, f.uBC, f.Δt, f.ν, f.g, f.exitBC, f.perdir, f.λ,
-        bc, acc, Grid(f.p), per, CuVector{Int32}(undef,0), true, RedBuf())
+        bc, acc, Grid(f.p), per, CuVector{Int32}(undef,0), true, RedBuf(Grid(f.p)))
     update_band!(a)
     a
 end
@@ -184,8 +184,8 @@ end
 
 # ---------------------------------------------------------------- boundary conditions
 # One launch per direction j (order matters on edges), all components per thread.
-function k_bc!(lo, hi, a, g::Grid{D}, j, bc::B, t::T, saveexit::Bool, perj::Bool) where {D,B,T}
-    I, ok = cellidx(lo, hi); ok || return
+function k_bc!(lo, hi, j, a, g::Grid{D}, bc::B, t::T, saveexit::Bool, perj::Bool) where {D,B,T}
+    I, ok = faceidx(lo, hi, j); ok || return
     nj = g.n[j]
     l1 = lin(g, I)                 # I[j]==1
     sj = g.s[j]
@@ -210,8 +210,23 @@ function BC!(a::TFlow{D,T}, u, t) where {D,T}
     g = a.grid
     for j in 1:D
         lo = ntuple(_->1, D); hi = ntuple(d-> d==j ? 1 : Int(g.n[d]), D)
-        launch(k_bc!, lo, hi, u, g, j, a.bc, T(t), a.exitBC, a.per[j])
+        launch_face(k_bc!, lo, hi, j, u, g, a.bc, T(t), a.exitBC, a.per[j])
     end
+end
+
+# The exit-plane ghost of u₁ is not written by BC! when exitBC=true, so it must follow
+# the array swaps: dst[n₁,:,:,1] = src[n₁,:,:,1]
+function k_copyexit!(lo, hi, j, dst, src, g::Grid)
+    I, ok = faceidx(lo, hi, j); ok || return
+    l = lin(g, I)
+    @inbounds dst[l] = src[l]
+    return nothing
+end
+function copy_exit!(a::TFlow{D}, dst, src) where D
+    a.exitBC || return
+    g = a.grid
+    lo = ntuple(d-> d==1 ? Int(g.n[1]) : 1, D); hi = ntuple(d->Int(g.n[d]), D)
+    launch_face(k_copyexit!, lo, hi, 1, dst, src, g)
 end
 
 # Convective exit (single block, three phases): WaterLily.exitBC!
@@ -279,45 +294,22 @@ end
 exitBC!(a::TFlow{D,T}, u, u0, dt) where {D,T} = (@cuda threads=1024 k_exit!(u, u0, a.grid, T(dt)); nothing)
 
 # ---------------------------------------------------------------- CFL
-function k_cfl!(lo, hi, outs, outm, u, g::Grid{D}) where D
+function k_cfl!(lo, hi, ps, pm, u, g::Grid{D}) where D
     I, ok = cellidx(lo, hi)
     m = 0f0
     if ok
         l = lin(g, I)
         @unroll for i in i32:Int32(D)
-            ci = (i-1)*g.nc
+            ci = (i-i32)*g.nc
             @inbounds m += max(0f0, u[l+g.s[i]+ci]) + max(0f0, -u[l+ci])
         end
     end
-    # flatten the 3D block for the block reduction
-    block_red_flat!(outs, outm, 1, 0f0, m)
-    nothing
-end
-@inline function block_red_flat!(outs, outm, k, s, m)
-    shs = CuStaticSharedArray(Float32, 32)
-    shm = CuStaticSharedArray(Float32, 32)
-    t = threadIdx().x - i32 + (threadIdx().y - i32)*blockDim().x + (threadIdx().z - i32)*blockDim().x*blockDim().y
-    nt = blockDim().x*blockDim().y*blockDim().z
-    s, m = warp_red(s, m)
-    lane = t % Int32(32) + i32
-    wid = t ÷ Int32(32) + i32
-    nw = (nt + Int32(31)) ÷ Int32(32)
-    lane == i32 && (@inbounds shs[wid] = s; @inbounds shm[wid] = m)
-    sync_threads()
-    if wid == i32
-        s = lane <= nw ? @inbounds(shs[lane]) : 0f0
-        m = lane <= nw ? @inbounds(shm[lane]) : 0f0
-        s, m = warp_red(s, m)
-        if lane == i32
-            s != 0 && CUDA.@atomic outs[k] += Float64(s)
-            CUDA.@atomic outm[k] = max(outm[k], reinterpret(Int32, m))
-        end
-    end
-    nothing
+    block_partial!(ps, pm, 0f0, m)
+    return nothing
 end
 function WaterLily.CFL(a::TFlow; Δt_max=10)
-    g = a.grid; b = reset!(a.red)
-    launch(k_cfl!, inside_lo(g), inside_hi(g), b.s, b.m, a.u, g)
+    g = a.grid; b = a.red
+    red_launch(k_cfl!, inside_lo(g), inside_hi(g), b, 1, a.u, g)
     fetch!(b)
     min(Δt_max, inv(getmax(b,1) + 5a.ν))
 end
@@ -327,6 +319,7 @@ using WaterLily: @log
 function WaterLily.mom_step!(a::TFlow{D,T}, b::AbstractPoisson; udf=nothing, kwargs...) where {D,T}
     isnothing(udf) || return mom_step_udf!(a, b; udf, kwargs...)
     a.u, a.u⁰ = a.u⁰, a.u                     # u⁰ ← u (no copy)
+    copy_exit!(a, a.u, a.u⁰)
     t₁ = sum(a.Δt); t₀ = t₁ - a.Δt[end]
     # predictor
     @log "p"
@@ -337,6 +330,7 @@ function WaterLily.mom_step!(a::TFlow{D,T}, b::AbstractPoisson; udf=nothing, kwa
     # corrector
     @log "c"
     mom_update!(a, a.f, a.u, t₁, true)
+    copy_exit!(a, a.f, a.u)
     a.u, a.f = a.f, a.u
     BC!(a, a.u, t₁)
     WaterLily.mom_project!(a, b, 0.5, t₁)

@@ -68,12 +68,35 @@ Launch kernel `k(lo,hi,args...)` with one thread per cell of the box `lo:hi`.
 """
 function launch(k::K, lo::NTuple{D,<:Integer}, hi::NTuple{D,<:Integer}, args...) where {K,D}
     ext = hi .- lo .+ 1
-    any(ext .<= 0) && return nothing
+    any(ext .<= 0) && return 0
     th = threads_for(Val(D))
     ext3 = (ext..., ntuple(_->1, 3-D)...)
     bl = cld.(ext3, th)
     @cuda threads=th blocks=bl k(Int32.(lo), Int32.(hi), args...)
-    nothing
+    return prod(bl)
+end
+"""
+    launch_face(k, lo, hi, j, args...)
+
+Launch over a box that is one cell thick in direction `j`; threads are laid out over
+the other directions (the kernel uses `faceidx(lo,hi,j)`).
+"""
+function launch_face(k::K, lo::NTuple{D,<:Integer}, hi::NTuple{D,<:Integer}, j, args...) where {K,D}
+    ext = hi .- lo .+ 1
+    any(ext .<= 0) && return 0
+    oth = ntuple(d-> d < j ? ext[d] : ext[d+1], D-1)
+    th = D == 3 ? (32,8,1) : (256,1,1)
+    ext3 = (oth..., ntuple(_->1, 3-(D-1))...)
+    bl = cld.(ext3, th)
+    @cuda threads=th blocks=bl k(Int32.(lo), Int32.(hi), Int32(j), args...)
+    return prod(bl)
+end
+@inline function faceidx(lo::NTuple{D,Int32}, hi::NTuple{D,Int32}, j) where D
+    t = tid3()
+    I = ntuple(Val(D)) do d
+        d == j ? lo[d] : d < j ? lo[d] + t[d] - i32 : lo[d] + t[d-1] - i32
+    end
+    return I, all(ntuple(d->I[d]<=hi[d], Val(D)))
 end
 function launch1(k::K, n::Integer, args...; threads=256) where K
     n <= 0 && return nothing
@@ -84,9 +107,6 @@ inside_lo(::Grid{D}) where D = ntuple(_->2, D)
 inside_hi(g::Grid{D}) where D = ntuple(d->Int(g.n[d])-1, D)
 
 # ---------------------------------------------------------------- reductions
-# Block reduction of a (sum,max) pair; thread 1 of each block atomically
-# accumulates into outs[k] (Float64 sum) and outm[k] (max of non-negative Float32,
-# stored as its Int32 bit pattern, which orders like the float).
 @inline function warp_red(s::Float32, m::Float32)
     off = Int32(16)
     while off > 0
@@ -94,43 +114,97 @@ inside_hi(g::Grid{D}) where D = ntuple(d->Int(g.n[d])-1, D)
         m = max(m, shfl_down_sync(0xffffffff, m, off))
         off >>= 1
     end
-    s, m
+    return s, m
 end
-@inline function block_red_atomic!(outs, outm, k, s::Float32, m::Float32)
-    shs = CuStaticSharedArray(Float32, 32)
-    shm = CuStaticSharedArray(Float32, 32)
-    s, m = warp_red(s, m)
-    lane = (threadIdx().x - i32) % Int32(32) + i32
-    wid = (threadIdx().x - i32) ÷ Int32(32) + i32
-    nw = (blockDim().x + Int32(31)) ÷ Int32(32)
-    if lane == i32
-        @inbounds shs[wid] = s; @inbounds shm[wid] = m
+@inline function warp_red(s::Float64, m::Float32)
+    off = Int32(16)
+    while off > 0
+        s += shfl_down_sync(0xffffffff, s, off)
+        m = max(m, shfl_down_sync(0xffffffff, m, off))
+        off >>= 1
     end
+    return s, m
+end
+@inline flat_tid() = threadIdx().x - i32 + (threadIdx().y - i32)*blockDim().x +
+                     (threadIdx().z - i32)*blockDim().x*blockDim().y
+@inline flat_bid() = blockIdx().x + (blockIdx().y - i32)*gridDim().x +
+                     (blockIdx().z - i32)*gridDim().x*gridDim().y
+# (sum,max) over the block; every thread must call it. Returns the result on thread 0.
+@inline function block_red(s::S, m::Float32) where S
+    shs = CuStaticSharedArray(S, 32)
+    shm = CuStaticSharedArray(Float32, 32)
+    t = flat_tid()
+    nt = blockDim().x*blockDim().y*blockDim().z
+    s, m = warp_red(s, m)
+    lane = t % Int32(32) + i32
+    wid = t ÷ Int32(32) + i32
+    nw = (nt + Int32(31)) ÷ Int32(32)
+    lane == i32 && (@inbounds shs[wid] = s; @inbounds shm[wid] = m)
     sync_threads()
     if wid == i32
-        s = lane <= nw ? @inbounds(shs[lane]) : 0f0
+        s = lane <= nw ? @inbounds(shs[lane]) : zero(S)
         m = lane <= nw ? @inbounds(shm[lane]) : 0f0
         s, m = warp_red(s, m)
-        if lane == i32
-            CUDA.@atomic outs[k] += Float64(s)
-            CUDA.@atomic outm[k] = max(outm[k], reinterpret(Int32, m))
-        end
     end
-    nothing
+    return s, m
+end
+"Write this block's (sum,max) partial to `ps/pm[block]`."
+@inline function block_partial!(ps, pm, s::Float32, m::Float32)
+    s, m = block_red(s, m)
+    if flat_tid() == 0
+        b = flat_bid()
+        @inbounds ps[b] = s; @inbounds pm[b] = m
+    end
+    return nothing
+end
+function k_finish!(ps, pm, nb::Int32, outs, outm, k::Int32)
+    s = 0.0; m = 0f0
+    i = threadIdx().x
+    while i <= nb
+        @inbounds s += Float64(ps[i]); @inbounds m = max(m, pm[i])
+        i += blockDim().x
+    end
+    s, m = block_red(s, m)
+    if threadIdx().x == i32
+        @inbounds outs[k] = s; @inbounds outm[k] = m
+    end
+    return nothing
 end
 
-"Host-side reduction buffers: `s` (Float64 sums), `m` (Int32-encoded maxima)."
+"""
+    RedBuf(nblocks)
+
+Reduction scratch: per-block partials `ps/pm`, results `s` (Float64 sums) and `m`
+(Float32 maxima) on the device, and host mirrors `hs/hm`.
+"""
 struct RedBuf
     s::CuVector{Float64}
-    m::CuVector{Int32}
+    m::CuVector{Float32}
+    ps::CuVector{Float32}
+    pm::CuVector{Float32}
     hs::Vector{Float64}
-    hm::Vector{Int32}
+    hm::Vector{Float32}
 end
-RedBuf(n=8) = RedBuf(CUDA.zeros(Float64,n), CUDA.zeros(Int32,n), zeros(Float64,n), zeros(Int32,n))
-reset!(b::RedBuf) = (fill!(b.s,0); fill!(b.m,0); b)
+RedBuf(nb::Integer, n=8) = RedBuf(CUDA.zeros(Float64,n), CUDA.zeros(Float32,n),
+    CUDA.zeros(Float32,nb), CUDA.zeros(Float32,nb), zeros(Float64,n), zeros(Float32,n))
+RedBuf(g::Grid) = RedBuf(cld(Int(g.nc), 64) + 1)
 function fetch!(b::RedBuf)
     copyto!(b.hs, b.s); copyto!(b.hm, b.m)
-    b
+    return b
 end
-getsum(b::RedBuf,k) = b.hs[k]
-getmax(b::RedBuf,k) = reinterpret(Float32, b.hm[k])
+getsum(b::RedBuf, k) = b.hs[k]
+getmax(b::RedBuf, k) = b.hm[k]
+
+"""
+    red_launch(k, lo, hi, b::RedBuf, slot, args...)
+
+Launch `k(lo,hi,ps,pm,args...)` (which calls `block_partial!`) and reduce the partials
+into `b.s[slot]`, `b.m[slot]`.
+"""
+function red_launch(k::K, lo, hi, b::RedBuf, slot, args...) where K
+    nb = launch(k, lo, hi, b.ps, b.pm, args...)
+    nb == 0 && return nothing
+    @assert nb <= length(b.ps)
+    @cuda threads=1024 k_finish!(b.ps, b.pm, Int32(nb), b.s, b.m, Int32(slot))
+    return nothing
+end

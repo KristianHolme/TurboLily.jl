@@ -134,15 +134,16 @@ end
 # Biot-Savart kernel weighted(x-S, S, i, ω)
 @inline function bs_weight(r1, r2, r3, ω, ls, g::Grid{3}, i)
     @inbounds w1 = ω[ls]; @inbounds w2 = ω[ls + g.nc]; @inbounds w3 = ω[ls + 2g.nc]
-    r = sqrt(r1*r1 + r2*r2 + r3*r3)
+    ir = CUDA.rsqrt(r1*r1 + r2*r2 + r3*r3)
     c = i == 1 ? w2*r3 - w3*r2 : i == 2 ? w3*r1 - w1*r3 : w1*r2 - w2*r1
-    return c/(r*r*r)/Float32(π)/4f0
+    return c*(ir*ir*ir)
 end
 @inline function bs_weight(r1, r2, r3, ω, ls, g::Grid{2}, i)
     @inbounds w = ω[ls]
-    rr = r1*r1 + r2*r2
-    return (i == 1 ? -w*r2 : w*r1)/rr/Float32(π)/2f0
+    return (i == 1 ? -w*r2 : w*r1)*@fastmath(inv(r1*r1 + r2*r2))
 end
+bs_scale(::Val{3}) = 1f0/(4f0*Float32(π))
+bs_scale(::Val{2}) = 1f0/(2f0*Float32(π))
 @inline function outer_lo(T::NTuple{D,Int32}, g::Grid{D}, c, bottom, top) where D
     return ntuple(Val(D)) do d
         dT = (T[d] + Int32(2)) ÷ Int32(2)
@@ -157,39 +158,57 @@ end
         top ? min(v, g.n[d] - Int32(2)) : v
     end
 end
-# Interaction sum at one target of one level (BiotSavartBCs.interaction)
-function k_interact!(n, tar, ω, g::Grid{D}, top::Bool, bottom::Bool) where D
-    k = tid1(); k <= n || return
-    li = @inbounds tar[k]
+# Interaction sum at one target of one level (BiotSavartBCs.interaction).
+# P consecutive lanes share a target, splitting the outermost source loop; P ∈ {1,2,4,…,32}.
+function k_interact!(n, tar, ω, g::Grid{D}, top::Bool, bottom::Bool, P::Int32) where D
+    t = tid1() - i32
+    k = t ÷ P + i32; p = t % P
+    valid = k <= n
+    kk = valid ? k : n
+    li = @inbounds tar[kk]
     i = (li - i32) ÷ g.nc + i32
     l = li - (i-i32)*g.nc
     T = coords(g, l)
     c = closeR(Val(D))
-    # per-dimension ranges: domain R=2:n-1, inner = close(T,R), outer = up(close(down(T),down(R)))
     olo = outer_lo(T, g, c, bottom, top)
     ohi = outer_hi(T, g, c, bottom, top)
     ilo = ntuple(d-> max(T[d] - c, Int32(2)), Val(D))
     ihi = ntuple(d-> min(T[d] + c, g.n[d] - i32), Val(D))
     x = ntuple(d-> Float32(T[d]) + (d == i ? (T[d] == i32 ? 0.5f0 : -0.5f0) : 0f0), Val(D))
     val = 0f0
-    if D == 3
-        for s3 in olo[3]:ohi[3], s2 in olo[2]:ohi[2], s1 in olo[1]:ohi[1]
-            if !top
-                (ilo[1] <= s1 <= ihi[1]) & (ilo[2] <= s2 <= ihi[2]) & (ilo[3] <= s3 <= ihi[3]) && continue
+    if valid
+        if D == 3
+            s3 = olo[3] + p
+            while s3 <= ohi[3]
+                for s2 in olo[2]:ohi[2], s1 in olo[1]:ohi[1]
+                    if !top
+                        (ilo[1] <= s1 <= ihi[1]) & (ilo[2] <= s2 <= ihi[2]) & (ilo[3] <= s3 <= ihi[3]) && continue
+                    end
+                    ls = s1 + (s2 - i32)*g.s[2] + (s3 - i32)*g.s[3]
+                    val += bs_weight(x[1]-s1, x[2]-s2, x[D]-s3, ω, ls, g, i)
+                end
+                s3 += P
             end
-            ls = s1 + (s2 - i32)*g.s[2] + (s3 - i32)*g.s[3]
-            val += bs_weight(x[1]-s1, x[2]-s2, x[D]-s3, ω, ls, g, i)
-        end
-    else
-        for s2 in olo[2]:ohi[2], s1 in olo[1]:ohi[1]
-            if !top
-                (ilo[1] <= s1 <= ihi[1]) & (ilo[2] <= s2 <= ihi[2]) && continue
+        else
+            s2 = olo[2] + p
+            while s2 <= ohi[2]
+                for s1 in olo[1]:ohi[1]
+                    if !top
+                        (ilo[1] <= s1 <= ihi[1]) & (ilo[2] <= s2 <= ihi[2]) && continue
+                    end
+                    ls = s1 + (s2 - i32)*g.s[2]
+                    val += bs_weight(x[1]-s1, x[2]-s2, 0f0, ω, ls, g, i)
+                end
+                s2 += P
             end
-            ls = s1 + (s2 - i32)*g.s[2]
-            val += bs_weight(x[1]-s1, x[2]-s2, 0f0, ω, ls, g, i)
         end
     end
-    @inbounds ω[li] = val
+    off = P ÷ Int32(2)
+    while off > 0
+        val += shfl_down_sync(0xffffffff, val, off)
+        off >>= 1
+    end
+    (valid && p == 0) && (@inbounds ω[li] = val*bs_scale(Val(D)))
     return nothing
 end
 # a[target] += bilinear projection of the coarse targets (BiotSavartBCs.project)
@@ -222,7 +241,9 @@ function fmm!(b::TBiotPoisson, ω1)
     ωs = (ω1, b.ω...)
     nl = length(ωs)
     for l in 1:nl
-        launch1(k_interact!, length(b.tar[l]), b.tar[l], ωs[l], b.g[l], l == 1, l == nl)
+        n = length(b.tar[l])
+        P = clamp(prevpow(2, max(1, 65536 ÷ n)), 1, 32)
+        @cuda threads=256 blocks=cld(n*P, 256) k_interact!(Int32(n), b.tar[l], ωs[l], b.g[l], l == 1, l == nl, Int32(P))
     end
     for l in nl-1:-1:1
         launch1(k_project!, length(b.tar[l]), b.tar[l], ωs[l], b.g[l], ωs[l+1], b.g[l+1])

@@ -126,13 +126,18 @@ struct TPoisson{T,S,V,D,R} <: AbstractPoisson{T,S,V}
     perdir :: NTuple
     nsolve :: Base.RefValue{Int}     # number of solved rows (count(!iszero, iD))
     red :: RedBuf
+    ωd :: CuVector{Float32}          # [ω, r₁]: relaxation and previous Σ|r| (device side)
+    fixd :: CuVector{Float32}        # [nsolve, tiny] for the lazy residual correction
+    graphs :: Dict{Any,CuGraphExec}
+    seen :: Set{Any}
 end
 function TPoisson(x::AbstractArray{T,D}, L, z; perdir=()) where {T,D}
     ml = MultiLevelPoisson(x, L, z; perdir)
     nl = length(ml.levels)
     per = ntuple(j->j ∈ perdir, D)
     levels = [Level(ml.levels[l], l < nl ? coarsen_mask(ml.levels[l].x, ml.levels[l+1].x) : ntuple(_->false,D), per) for l in 1:nl]
-    p = TPoisson{T,typeof(x),typeof(L),D,typeof(levels[1].op.reg)}(x, L, z, ml, levels, per, Int16[], perdir, Ref(0), RedBuf(Grid(x)))
+    p = TPoisson{T,typeof(x),typeof(L),D,typeof(levels[1].op.reg)}(x, L, z, ml, levels, per, Int16[], perdir, Ref(0), RedBuf(Grid(x)),
+        CUDA.ones(Float32, 2), CUDA.zeros(Float32, 2), Dict{Any,CuGraphExec}(), Set{Any}())
     finish_update!(p)
 end
 TPoisson(flow::AbstractFlow) = TPoisson(flow.p, flow.μ₀, flow.σ; perdir=flow.perdir)
@@ -189,8 +194,9 @@ end
 struct Prol{D,S,C}; cx::S; gc::Grid{D}; g::Grid{D}; c::C; per::NTuple{D,Bool}; end
 @inline (f::Prol)(I, l) = @inbounds f.cx[lin(f.gc, down(wrapI(f.g, I, f.per), f.c))]
 # increment with ϵ = prolongation(cx): r -= ωAϵ, x += ωϵ
-function k_prol_incr!(lo, hi, r, x, op::Op, cx, gc::Grid, c, ω)
+function k_prol_incr!(lo, hi, r, x, op::Op, cx, gc::Grid, c, ωd)
     I, ok = cellidx(lo, hi); ok || return
+    ω = @inbounds ωd[1]
     l = lin(op.g, I)
     f = Prol(cx, gc, op.g, c, op.per)
     e = f(I, l)
@@ -199,8 +205,9 @@ function k_prol_incr!(lo, hi, r, x, op::Op, cx, gc::Grid, c, ω)
     return nothing
 end
 # increment with stored ϵ (optionally the block partials of Σ|r|, max|r|)
-function k_incr!(lo, hi, ps, pm, r, x, ϵ, op::Op, ω, norms::Bool, sq::Bool=false)
+function k_incr!(lo, hi, ps, pm, r, x, ϵ, op::Op, ωd, ::Val{norms}, ::Val{sq}) where {norms, sq}
     I, ok = cellidx(lo, hi)
+    ω = @inbounds ωd[1]
     a = 0f0; m = 0f0
     if ok
         l = lin(op.g, I)
@@ -265,17 +272,17 @@ struct Rc{S,O}; r::S; op::O; s::Float32; apply::Bool; end
 end
 struct RcD{S,O}; rc::Rc{S,O}; end
 @inline (f::RcD)(I, l) = f.rc(I, l)*getiD(f.rc.op, l)
-@inline function make_rc(r, op, sums, nsolve, tiny)
-    s = Float32(@inbounds(sums[1])) / nsolve
-    return Rc(r, op, s, abs(s) > tiny)
+@inline function make_rc(r, op, sums, fixd)
+    s = Float32(@inbounds(sums[1])) / @inbounds(fixd[1])
+    return Rc(r, op, s, abs(s) > @inbounds(fixd[2]))
 end
 # Jacobi on the corrected residual; partial Σ|rc|, max|rc| (the initial residual norms)
-function k_jacobi_fix!(lo, hi, ps, pm, rn, r, x, op::Op, sums, nsolve, tiny)
+function k_jacobi_fix!(lo, hi, ps, pm, rn, r, x, op::Op, sums, fixd)
     I, ok = cellidx(lo, hi)
     a = 0f0
     if ok
         l = lin(op.g, I)
-        rc = make_rc(r, op, sums, nsolve, tiny)
+        rc = make_rc(r, op, sums, fixd)
         v = rc(I, l)
         f = RcD(rc)
         @inbounds rn[l] = v - mult_f(op, I, l, f)
@@ -293,36 +300,78 @@ function jacobi!(lv::Level, assign::Bool=false)
     lv.r, lv.ϵ = lv.ϵ, lv.r
 end
 gs_range(g::Grid{D}) where D = (inside_lo(g), ntuple(d-> d==D ? Int(g.n[d])÷2 : Int(g.n[d])-1, D))
-function smooth!(lv::Level{D,T}, ω, red::RedBuf, norms::Bool=false; it=4, sq=false) where {D,T}
+function smooth!(lv::Level{D,T}, ωd, red::RedBuf, norms::Bool=false; it=4, sq=false) where {D,T}
     g = lv.op.g
     lo, hi = gs_range(g)
     for i in 1:it
         launch(k_gs!, lo, hi, lv.ϵ, lv.r, lv.op, Int32(i), i==1)
     end
     if norms
-        red_launch(k_incr!, inside_lo(g), inside_hi(g), red, 3, lv.r, lv.x, lv.ϵ, lv.op, T(ω), true, sq)
+        red_launch(k_incr!, inside_lo(g), inside_hi(g), red, 3, lv.r, lv.x, lv.ϵ, lv.op, ωd, Val(true), Val(sq))
     else
-        launch(k_incr!, inside_lo(g), inside_hi(g), red.ps, red.pm, lv.r, lv.x, lv.ϵ, lv.op, T(ω), false)
+        launch(k_incr!, inside_lo(g), inside_hi(g), red.ps, red.pm, lv.r, lv.x, lv.ϵ, lv.op, ωd, Val(false), Val(false))
     end
 end
 # V-cycle below level l; `fix` = (nsolve, tiny): the fine residual still needs the
 # global correction, which is applied inside the fine Jacobi (norms into slot 2)
-function vcycle!(p::TPoisson{T}, l, ω, fix=nothing; assign=false) where T
+function vcycle!(p::TPoisson{T}, l, fix=nothing; assign=false) where T
     fine, coarse = p.levels[l], p.levels[l+1]
     if fix === nothing
         jacobi!(fine, assign)
     else
         g = fine.op.g
-        red_launch(k_jacobi_fix!, inside_lo(g), inside_hi(g), p.red, 2, fine.ϵ, fine.r, fine.x, fine.op, p.red.s, fix...)
+        red_launch(k_jacobi_fix!, inside_lo(g), inside_hi(g), p.red, 2, fine.ϵ, fine.r, fine.x, fine.op, p.red.s, p.fixd)
         fine.r, fine.ϵ = fine.ϵ, fine.r
     end
     gc = coarse.op.g
     launch(k_restrict!, inside_lo(gc), inside_hi(gc), coarse.r, gc, fine.r, fine.op.g, fine.c)
     fill!(coarse.x, 0)
-    l+1 < length(p.levels) && vcycle!(p, l+1, ω)
-    smooth!(coarse, ω, p.red)
+    l+1 < length(p.levels) && vcycle!(p, l+1)
+    smooth!(coarse, p.ωd, p.red)
     g = fine.op.g
-    launch(k_prol_incr!, inside_lo(g), inside_hi(g), fine.r, fine.x, fine.op, coarse.x, gc, fine.c, T(ω))
+    launch(k_prol_incr!, inside_lo(g), inside_hi(g), fine.r, fine.x, fine.op, coarse.x, gc, fine.c, p.ωd)
+end
+
+# ω update on the device (WaterLily.solver! rule); r₁ comes from slot 2 on the first iteration
+function k_omega!(ωd, sums, first::Bool)
+    ω = @inbounds ωd[1]
+    r₁ = first ? Float32(@inbounds(sums[2])) : @inbounds(ωd[2])
+    rnew = Float32(@inbounds(sums[3]))
+    @inbounds ωd[1] = rnew ≥ r₁ ? max(0.2f0, 0.9f0ω) : min(1f0, 1.02f0ω)
+    @inbounds ωd[2] = rnew
+    return nothing
+end
+swap_levels!(p::TPoisson) = for l in 1:length(p.levels)-1
+    lv = p.levels[l]; lv.r, lv.ϵ = lv.ϵ, lv.r
+end
+"""
+    graphed!(f, p, key)
+
+Run `f()` (a fixed sequence of launches that swaps the level buffers like one V-cycle)
+through a cached CUDA graph: plain execution the first time a (key, buffer state) is
+seen, capture on the second, graph replay afterwards.
+"""
+function graphed!(f::F, p::TPoisson, key) where F
+    k = (key, objectid(p.levels[1].r))
+    ex = get(p.graphs, k, nothing)
+    if ex !== nothing
+        CUDA.launch(ex); swap_levels!(p)
+    elseif k in p.seen
+        ex = CUDA.instantiate(CUDA.capture(f))
+        p.graphs[k] = ex
+        CUDA.launch(ex)
+    else
+        push!(p.seen, k); f()
+    end
+    return nothing
+end
+# one multigrid iteration: V-cycle, fine smoothing with norms into slot 3, ω update
+function iteration!(p::TPoisson; fix=false, assign=false, sq=false, adapt=true)
+    graphed!(p, (fix, assign, sq, adapt)) do
+        vcycle!(p, 1, fix ? true : nothing; assign)
+        smooth!(p.levels[1], p.ωd, p.red, true; sq)
+        adapt && @cuda k_omega!(p.ωd, p.red.s, fix)
+    end
 end
 
 """
@@ -335,18 +384,16 @@ caller solving for `p = x/Δt` passes `scale = Δt` and WaterLily's tolerances k
 function solve!(p::TPoisson{T}, scale; tol=2e-3, itmx=32) where T
     top = p.levels[1]
     r₁tol = WaterLily.l1n_tol(p.ml.levels[1], tol)/scale; r∞tol = tol/scale
-    fix = (Float32(p.nsolve[]), T(2eps(T)/scale))
-    ω = T(1); nᵖ = 0; r₁ = Inf
+    copyto!(p.fixd, Float32[p.nsolve[], 2eps(T)/scale])
+    fill!(p.ωd, 1)
+    nᵖ = 0
     while nᵖ < itmx
-        vcycle!(p, 1, ω, nᵖ == 0 ? fix : nothing)
-        smooth!(top, ω, p.red, true)
+        iteration!(p; fix = nᵖ == 0)
         fetch!(p.red)
-        nᵖ == 0 && (r₁ = getsum(p.red,2); @log ", 0, $(getmax(p.red,2)*scale), $(r₁*scale), $ω\n")
+        nᵖ == 0 && @log ", 0, $(getmax(p.red,2)*scale), $(getsum(p.red,2)*scale)\n"
         rnew, r∞ = getsum(p.red,3), getmax(p.red,3); nᵖ += 1
-        @log ", $nᵖ, $(r∞*scale), $(rnew*scale), $ω\n"
-        ω = rnew ≥ r₁ ? T(max(0.2, 0.9ω)) : T(min(1.0, 1.02ω))
-        r₁ = rnew
-        (r₁ < r₁tol && r∞ < r∞tol) && break
+        @log ", $nᵖ, $(r∞*scale), $(rnew*scale)\n"
+        (rnew < r₁tol && r∞ < r∞tol) && break
     end
     perBC!(top.x, top.op.g, p.per)
     push!(p.n, nᵖ)

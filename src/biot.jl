@@ -393,7 +393,7 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w, t; tol=1e-4, 
     dt = T(w)*a.Δt[end]; a.p .*= dt
     U = T.(bctuple(a.uBC, T(t), D))
     top = b.levels[1]; op = top.op; g = op.g
-    fill!(b.p, 0)
+    fill!(b.p, 0); fill!(b.pois.ωd, 1)
     launch(k_projupd!, inside_lo(g), inside_hi(g), a.u, a.p, b.p, op)
     fill_ω!(b, a.f, a.u); fmm!(b, a.f)
     launch1(k_biotbc!, length(b.tar[1]), b.tar[1], a.u, a.f, top.r, U, g, false)
@@ -405,8 +405,7 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w, t; tol=1e-4, 
     while nᵖ < itmx
         rtol = max(tol, 0.1r₂)
         while nᵖ < itmx
-            vcycle!(b.pois, 1, T(1); assign=xzero); xzero = false
-            smooth!(top, T(1), b.red, true; sq=true)
+            iteration!(b.pois; assign=xzero, sq=true, adapt=false); xzero = false
             fetch!(b.red); r₂ = getsum(b.red, 3); nᵖ += 1
             r₂ < rtol && break
         end

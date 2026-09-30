@@ -1,0 +1,13 @@
+name = "TurboLily"
+uuid = "7c1f7d4e-5b6a-4c2e-9e57-2b1f0a6b7d11"
+authors = ["Kristian Holme <holme.kristian@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+WaterLily = "ed894a53-35f9-47f1-b17f-85db9237eebd"
+BiotSavartBCs = "ec5a6caf-bdf7-41d0-b8e1-5fafde84e19f"
+
+[compat]
+julia = "1.11"

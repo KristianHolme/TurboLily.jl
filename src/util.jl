@@ -13,11 +13,16 @@ Grid(n::NTuple{D,<:Integer}) where D =
 Grid(a::AbstractArray) = Grid(size(a))
 
 @inline lin(g::Grid{D}, I::NTuple{D,Int32}) where D = i32 + sum(ntuple(d->(I[d]-i32)*g.s[d], Val(D)))
-@inline function coords(g::Grid{D}, l::Int32) where D
+@inline function coords(g::Grid{3}, l::Int32)
     l0 = l - i32
-    ntuple(Val(D)) do d
-        d == D ? l0 ÷ g.s[d] + i32 : (l0 ÷ g.s[d]) % g.n[d] + i32
-    end
+    k = l0 ÷ g.s[3]; r = l0 - k*g.s[3]
+    j = r ÷ g.s[2]; i = r - j*g.s[2]
+    return (i + i32, j + i32, k + i32)
+end
+@inline function coords(g::Grid{2}, l::Int32)
+    l0 = l - i32
+    j = l0 ÷ g.s[2]
+    return (l0 - j*g.s[2] + i32, j + i32)
 end
 @inline shift(I::NTuple{D,Int32}, j, k) where D = ntuple(d-> d==j ? I[d]+Int32(k) : I[d], Val(D))
 @inline setj(I::NTuple{D,Int32}, j, k) where D = ntuple(d-> d==j ? Int32(k) : I[d], Val(D))

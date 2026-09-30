@@ -47,7 +47,8 @@ mutable struct TFlow{D,T,Sf<:AbstractArray{T},Vf<:AbstractArray{T},Tf<:AbstractA
     acc :: Af                   # isbits acceleration or nothing
     grid :: Grid{D}
     per :: NTuple{D,Bool}
-    band :: CuVector{Int32}     # linear (I,i) indices of faces needing the full BDIM update
+    band :: CuVector{Int32}     # linear (I,i) indices of faces with μ₀≠1, μ₁=0 (u = V+μ₀f̃)
+    shell :: CuVector{Int32}    # linear (I,i) indices of faces with μ₁≠0 (full BDIM update)
     Vzero :: Bool               # true when V ≡ 0 (skip div(V) source)
     red :: RedBuf
 end
@@ -59,7 +60,7 @@ function TFlow(N::NTuple{D}, uBC; T=Float32, mem=CuArray, kw...) where D
     per = ntuple(j->j ∈ f.perdir, D)
     a = TFlow{D,T,typeof(f.p),typeof(f.u),typeof(f.μ₁),typeof(f.λ),typeof(bc),typeof(acc)}(
         f.u, f.u⁰, f.f, f.p, f.σ, f.V, f.μ₀, f.μ₁, f.uBC, f.Δt, f.ν, f.g, f.exitBC, f.perdir, f.λ,
-        bc, acc, Grid(f.p), per, CuVector{Int32}(undef,0), true, RedBuf(Grid(f.p)))
+        bc, acc, Grid(f.p), per, CuVector{Int32}(undef,0), CuVector{Int32}(undef,0), true, RedBuf(Grid(f.p)))
     update_band!(a)
     a
 end
@@ -71,36 +72,51 @@ function WaterLily.measure!(a::TFlow, body::AbstractBody; t=zero(eltype(a.p)), �
 end
 WaterLily.measure!(a::TFlow, ::NoBody; kwargs...) = nothing
 
+# 0: regular face, 1: μ₀≠1 and μ₁=0, 2: μ₁≠0
 function k_bandmask!(lo, hi, m, μ₀, μ₁, g::Grid{D}) where D
     I, ok = cellidx(lo, hi); ok || return
     l = lin(g, I)
     @unroll for i in i32:Int32(D)
-        li = l + (i-1)*g.nc
-        b = @inbounds μ₀[li] != 1
+        li = l + (i-i32)*g.nc
+        sh = false
         @unroll for j in i32:Int32(D)
-            b |= @inbounds μ₁[li + (j-1)*D*g.nc] != 0
+            sh |= @inbounds μ₁[li + (j-i32)*D*g.nc] != 0
         end
-        @inbounds m[li] = b
+        @inbounds m[li] = sh ? 0x02 : μ₀[li] != 1 ? 0x01 : 0x00
     end
-    nothing
+    return nothing
 end
 function update_band!(a::TFlow{D}) where D
     g = a.grid
-    m = CUDA.zeros(Bool, size(a.u))
+    m = CUDA.zeros(UInt8, size(a.u))
     launch(k_bandmask!, inside_lo(g), inside_hi(g), m, a.μ₀, a.μ₁, g)
-    a.band = CuVector{Int32}(findall(vec(m)))
+    mv = vec(m)
+    a.band = CuVector{Int32}(findall(==(0x01), mv))
+    a.shell = CuVector{Int32}(findall(==(0x02), mv))
     a.Vzero = !any(!iszero, a.V)
     CUDA.unsafe_free!(m)
-    nothing
+    return nothing
 end
 
 # ---------------------------------------------------------------- convection-diffusion
 # Flux Φⱼ of momentum component i through the lower j-face of cell I (WaterLily.conv_diff! semantics)
-@inline function flux(j, i, I::NTuple{D,Int32}, l, u, g::Grid{D}, λ::F, ν, per) where {D,F}
+# Interior face (3 ≤ Iⱼ ≤ nⱼ-1): the upwind stencil is selected first so λ is evaluated once.
+@inline function fluxi(j, i, l, u, g::Grid, λ::F, ν) where F
     nc, sj = g.nc, g.s[j]
-    ci = (i-1)*nc
-    @inbounds uf = (u[l + (j-1)*nc] + u[l - g.s[i] + (j-1)*nc]) * 0.5f0 # ϕ(i,CI(I,j),u)
+    ci = (i-i32)*nc
+    @inbounds uf = (u[l + (j-i32)*nc] + u[l - g.s[i] + (j-i32)*nc]) * 0.5f0 # ϕ(i,CI(I,j),u)
+    @inbounds c = u[l+ci]; @inbounds b = u[l-sj+ci]
+    up = uf > 0
+    @inbounds far = u[l + ci + (up ? -2sj : sj)]
+    return uf*λ(far, up ? b : c, up ? c : b) - ν*(c-b)
+end
+# Any face, including the domain-boundary faces Iⱼ=2 and Iⱼ=nⱼ
+@inline function flux(j, i, I::NTuple{D,Int32}, l, u, g::Grid{D}, λ::F, ν, per) where {D,F}
     Ij, nj = I[j], g.n[j]
+    ((Ij != 2i32) & (Ij != nj)) && return fluxi(j, i, l, u, g, λ, ν)
+    nc, sj = g.nc, g.s[j]
+    ci = (i-i32)*nc
+    @inbounds uf = (u[l + (j-i32)*nc] + u[l - g.s[i] + (j-i32)*nc]) * 0.5f0
     if per[j] && Ij == nj   # upper periodic face ≡ lower face at index 2
         l = l - (nj-Int32(2))*sj; Ij = Int32(2)
     end
@@ -112,11 +128,16 @@ end
         else
             return (uf > 0 ? uf*(c+b)*0.5f0 : uf*λ(@inbounds(u[l+sj+ci]), c, b)) - ν*(c-b)
         end
-    elseif Ij == nj
+    else # Ij == nj
         return (uf < 0 ? uf*(c+b)*0.5f0 : uf*λ(@inbounds(u[l-2sj+ci]), b, c)) - ν*(c-b)
-    else
-        return (uf > 0 ? uf*λ(@inbounds(u[l-2sj+ci]), b, c) : uf*λ(@inbounds(u[l+sj+ci]), c, b)) - ν*(c-b)
     end
+end
+@inline function iscore(I::NTuple{D,Int32}, g::Grid{D}) where D
+    c = true
+    @unroll for j in i32:Int32(D)
+        c &= (I[j] >= Int32(3)) & (I[j] <= g.n[j] - Int32(2))
+    end
+    return c
 end
 # rᵢ(I) = Σⱼ Φⱼ(I) - Φⱼ(I+δⱼ), zero on the lower ghosts, partial on the upper ghosts
 @inline function rconv(i, I::NTuple{D,Int32}, l, u, g::Grid{D}, λ::F, ν::T, per) where {D,F,T}
@@ -126,6 +147,13 @@ end
         lowghost |= I[j] == i32
     end
     lowghost && return s
+    if iscore(I, g)
+        @unroll for j in i32:Int32(D)
+            s += fluxi(j, i, l, u, g, λ, ν)
+            s -= fluxi(j, i, l+g.s[j], u, g, λ, ν)
+        end
+        return s
+    end
     @unroll for j in i32:Int32(D)
         if I[j] <= g.n[j]-i32
             s += flux(j, i, I, l, u, g, λ, ν, per)
@@ -141,6 +169,16 @@ end
 #                                   out = ½(uin + u⁰+Δt·r(uin)) (corrector)
 function k_mom!(lo, hi, out, uin, u0, g::Grid{D}, dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool) where {D,T,F,A}
     I, ok = cellidx(lo, hi); ok || return
+    mom_cell!(I, out, uin, u0, g, dt, ν, λ, per, acc, t, corr)
+    return nothing
+end
+# same on a one-cell-thick slab normal to j
+function k_momf!(lo, hi, j, out, uin, u0, g::Grid{D}, dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool) where {D,T,F,A}
+    I, ok = faceidx(lo, hi, j); ok || return
+    mom_cell!(I, out, uin, u0, g, dt, ν, λ, per, acc, t, corr)
+    return nothing
+end
+@inline function mom_cell!(I, out, uin, u0, g::Grid{D}, dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool) where {D,T,F,A}
     l = lin(g, I)
     @unroll for i in i32:Int32(D)
         li = l + (i-1)*g.nc
@@ -150,36 +188,167 @@ function k_mom!(lo, hi, out, uin, u0, g::Grid{D}, dt::T, ν::T, λ::F, per, acc:
     end
     nothing
 end
-# Full BDIM update on the band faces
+# 3D interior update marching in z: every face flux is evaluated once. x/y fluxes of
+# the 32×8 plane tile go through shared memory, the z flux is carried in registers.
+const MOM_NZ = 16
+function k_mom3!(lo, hi, out, uin, u0, g::Grid{3}, dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool) where {T,F,A}
+    fx = CuStaticSharedArray(T, (33, 8, 3))
+    fy = CuStaticSharedArray(T, (32, 9, 3))
+    tx, ty = threadIdx().x, threadIdx().y
+    x = lo[1] + (blockIdx().x - i32)*Int32(32) + tx - i32
+    y = lo[2] + (blockIdx().y - i32)*Int32(8) + ty - i32
+    z0 = lo[3] + (blockIdx().z - i32)*Int32(MOM_NZ)
+    z1 = min(z0 + Int32(MOM_NZ) - i32, hi[3])
+    ok = x <= hi[1] && y <= hi[2]
+    s2, s3 = g.s[2], g.s[3]
+    I = (x, y, z0); l = lin(g, I)
+    zl1 = zl2 = zl3 = zero(T)
+    if ok
+        zl1 = fluxi(3, 1, l, uin, g, λ, ν)
+        zl2 = fluxi(3, 2, l, uin, g, λ, ν)
+        zl3 = fluxi(3, 3, l, uin, g, λ, ν)
+    end
+    xe = tx == Int32(32) || x == hi[1]
+    ye = ty == Int32(8) || y == hi[2]
+    for z in z0:z1
+        I = (x, y, z); l = lin(g, I)
+        zh1 = zh2 = zh3 = zero(T)
+        if ok
+            @unroll for i in i32:Int32(3)
+                @inbounds fx[tx, ty, i] = fluxi(1, i, l, uin, g, λ, ν)
+                @inbounds fy[tx, ty, i] = fluxi(2, i, l, uin, g, λ, ν)
+            end
+            if xe
+                Ip = (x+i32, y, z)
+                @unroll for i in i32:Int32(3)
+                    @inbounds fx[tx+i32, ty, i] = fluxi(1, i, l+i32, uin, g, λ, ν)
+                end
+            end
+            if ye
+                Ip = (x, y+i32, z)
+                @unroll for i in i32:Int32(3)
+                    @inbounds fy[tx, ty+i32, i] = fluxi(2, i, l+s2, uin, g, λ, ν)
+                end
+            end
+            Ip = (x, y, z+i32)
+            zh1 = fluxi(3, 1, l+s3, uin, g, λ, ν)
+            zh2 = fluxi(3, 2, l+s3, uin, g, λ, ν)
+            zh3 = fluxi(3, 3, l+s3, uin, g, λ, ν)
+        end
+        sync_threads()
+        if ok
+            zl = (zl1, zl2, zl3); zh = (zh1, zh2, zh3)
+            @unroll for i in i32:Int32(3)
+                r = zero(T)
+                @inbounds r += fx[tx, ty, i]; @inbounds r -= fx[tx+i32, ty, i]
+                @inbounds r += fy[tx, ty, i]; @inbounds r -= fy[tx, ty+i32, i]
+                r += zl[i]; r -= zh[i]
+                r += accel(acc, i, I, t, T)
+                li = l + (i-i32)*g.nc
+                @fastmath v = @inbounds(u0[li]) + dt*r
+                @inbounds out[li] = corr ? T(0.5)*(uin[li] + v) : v
+            end
+            zl1, zl2, zl3 = zh1, zh2, zh3
+        end
+        sync_threads()
+    end
+    return nothing
+end
+# core cells (all faces interior) + the one-cell shell next to the domain boundary
+function core_and_shell(g::Grid{D}) where D
+    lo, hi = inside_lo(g), inside_hi(g)
+    clo, chi = lo .+ 1, hi .- 1
+    slabs = Tuple{NTuple{D,Int},NTuple{D,Int}}[]
+    for j in 1:D   # slab j: Iⱼ ∈ {2, n-1}, dims < j restricted to the core, dims > j full
+        l1 = ntuple(d-> d < j ? clo[d] : lo[d], D); h1 = ntuple(d-> d < j ? chi[d] : d == j ? lo[d] : hi[d], D)
+        l2 = ntuple(d-> d < j ? clo[d] : d == j ? hi[d] : lo[d], D); h2 = ntuple(d-> d < j ? chi[d] : hi[d], D)
+        push!(slabs, (l1,h1), (l2,h2))
+    end
+    return (clo, chi), slabs
+end
+function k_momi!(lo, hi, out, uin, u0, g::Grid{D}, dt::T, ν::T, λ::F, acc::A, t::T, corr::Bool) where {D,T,F,A}
+    I, ok = cellidx(lo, hi); ok || return
+    l = lin(g, I)
+    @unroll for i in i32:Int32(D)
+        r = zero(T)
+        @unroll for j in i32:Int32(D)
+            r += fluxi(j, i, l, uin, g, λ, ν)
+            r -= fluxi(j, i, l+g.s[j], uin, g, λ, ν)
+        end
+        r += accel(acc, i, I, t, T)
+        li = l + (i-i32)*g.nc
+        @fastmath v = @inbounds(u0[li]) + dt*r
+        @inbounds out[li] = corr ? T(0.5)*(uin[li] + v) : v
+    end
+    return nothing
+end
+function launch_core!(a::TFlow{3,T}, lo, hi, out, uin, t, corr) where T
+    g, dt = a.grid, a.Δt[end]
+    ext = hi .- lo .+ 1
+    any(ext .<= 0) && return
+    bl = (cld(ext[1],32), cld(ext[2],8), cld(ext[3],MOM_NZ))
+    @cuda threads=(32,8,1) blocks=bl k_mom3!(Int32.(lo), Int32.(hi), out, uin, a.u⁰, g, dt, a.ν, a.λ, a.per, a.acc, T(t), corr)
+end
+launch_core!(a::TFlow{D,T}, lo, hi, out, uin, t, corr) where {D,T} =
+    launch(k_momi!, lo, hi, out, uin, a.u⁰, a.grid, a.Δt[end], a.ν, a.λ, a.acc, T(t), corr)
+function launch_mom!(a::TFlow{D,T}, out, uin, t, corr) where {D,T}
+    (clo, chi), slabs = core_and_shell(a.grid)
+    launch_core!(a, clo, chi, out, uin, t, corr)
+    for (k, (lo, hi)) in enumerate(slabs)
+        launch_face(k_momf!, lo, hi, cld(k,2), out, uin, a.u⁰, a.grid, a.Δt[end], a.ν, a.λ, a.per, a.acc, T(t), corr)
+    end
+end
+
+# Full BDIM update on the listed faces; `shell=false` lists have μ₁=0.
 @inline function ftilde(i, I, l, uin, u0, V, g::Grid, dt::T, ν, λ, per, acc, t) where T
-    li = l + (i-1)*g.nc
+    li = l + (i-i32)*g.nc
     r = rconv(i, I, l, uin, g, λ, ν, per) + accel(acc, i, I, t, T)
     @fastmath @inbounds u0[li] + dt*r - V[li]
 end
-function k_band!(n, band, out, uin, u0, V, μ₀, μ₁, g::Grid{D}, dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool) where {D,T,F,A}
+function k_band!(n, band, out, uin, u0, V, μ₀, μ₁, g::Grid{D}, dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool, shell::Bool) where {D,T,F,A}
     k = tid1(); k <= n || return
     li = @inbounds band[k]
-    i = (li - i32) ÷ g.nc + i32
-    l = li - (i-i32)*g.nc
-    I = coords(g, l)
-    f0 = ftilde(i, I, l, uin, u0, V, g, dt, ν, λ, per, acc, t)
-    m = zero(T)
-    @unroll for j in i32:Int32(D)
-        μ = @inbounds μ₁[li + (j-1)*D*g.nc]
-        if μ != 0
-            fp = ftilde(i, shift(I,j,1), l+g.s[j], uin, u0, V, g, dt, ν, λ, per, acc, t)
-            fm = ftilde(i, shift(I,j,-1), l-g.s[j], uin, u0, V, g, dt, ν, λ, per, acc, t)
-            m += μ*(fp-fm)
-        end
+    iv = (li - i32) ÷ g.nc + i32
+    # compile-time component index so that tuple indexing by i stays in registers
+    args = (li, out, uin, u0, V, μ₀, μ₁, g, dt, ν, λ, per, acc, t, corr, shell)
+    if iv == 1
+        band_face!(Val(Int32(1)), args...)
+    elseif iv == 2
+        band_face!(Val(Int32(2)), args...)
+    elseif D == 3
+        band_face!(Val(Int32(3)), args...)
     end
-    @fastmath v = m*T(0.5) + @inbounds(V[li]) + @inbounds(μ₀[li])*f0
+    return nothing
+end
+@inline function band_face!(::Val{i}, li, out, uin, u0, V, μ₀, μ₁, g::Grid{D}, dt::T, ν, λ, per, acc, t, corr, shell) where {i,D,T}
+    l = li - (i-i32)*g.nc
+    μ0 = @inbounds μ₀[li]
+    if !shell && μ0 == 0        # u = V exactly (μ₀ = μ₁ = 0)
+        v = @inbounds V[li]
+    else
+        I = coords(g, l)
+        f0 = ftilde(i, I, l, uin, u0, V, g, dt, ν, λ, per, acc, t)
+        m = zero(T)
+        if shell
+            @unroll for j in i32:Int32(D)
+                μ = @inbounds μ₁[li + (j-i32)*D*g.nc]
+                if μ != 0
+                    fp = ftilde(i, shift(I,j,1), l+g.s[j], uin, u0, V, g, dt, ν, λ, per, acc, t)
+                    fm = ftilde(i, shift(I,j,-1), l-g.s[j], uin, u0, V, g, dt, ν, λ, per, acc, t)
+                    m += μ*(fp-fm)
+                end
+            end
+        end
+        @fastmath v = m*T(0.5) + @inbounds(V[li]) + μ0*f0
+    end
     @inbounds out[li] = corr ? T(0.5)*(uin[li] + v) : v
-    nothing
+    return nothing
 end
 function mom_update!(a::TFlow{D,T}, out, uin, t, corr) where {D,T}
     g, dt = a.grid, a.Δt[end]
-    launch(k_mom!, inside_lo(g), inside_hi(g), out, uin, a.u⁰, g, dt, a.ν, a.λ, a.per, a.acc, T(t), corr)
-    launch1(k_band!, length(a.band), a.band, out, uin, a.u⁰, a.V, a.μ₀, a.μ₁, g, dt, a.ν, a.λ, a.per, a.acc, T(t), corr)
+    launch_mom!(a, out, uin, t, corr)
+    launch1(k_band!, length(a.band), a.band, out, uin, a.u⁰, a.V, a.μ₀, a.μ₁, g, dt, a.ν, a.λ, a.per, a.acc, T(t), corr, false)
+    launch1(k_band!, length(a.shell), a.shell, out, uin, a.u⁰, a.V, a.μ₀, a.μ₁, g, dt, a.ν, a.λ, a.per, a.acc, T(t), corr, true)
 end
 
 # ---------------------------------------------------------------- boundary conditions

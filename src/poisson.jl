@@ -166,7 +166,7 @@ function k_fixres!(lo, hi, ps, pm, r, sums, op::Op, nsolve, tiny)
     a = 0f0
     if ok
         l = lin(op.g, I)
-        s = Float32(@inbounds(sums[1]) / nsolve)
+        s = Float32(@inbounds(sums[1])) / nsolve
         v = @inbounds r[l]
         if abs(s) > tiny
             v = getiD(op, l) == 0 ? 0f0 : v - s
@@ -290,7 +290,7 @@ end
 function residual!(p::TPoisson{T}) where T
     lv = p.levels[1]; op = lv.op; g = op.g; b = p.red
     red_launch(k_residual!, inside_lo(g), inside_hi(g), b, 1, lv.r, lv.z, lv.x, op)
-    red_launch(k_fixres!, inside_lo(g), inside_hi(g), b, 2, lv.r, b.s, op, Float64(p.nsolve[]), 2eps(T))
+    red_launch(k_fixres!, inside_lo(g), inside_hi(g), b, 2, lv.r, b.s, op, Float32(p.nsolve[]), 2eps(T))
 end
 function jacobi!(lv::Level)
     g = lv.op.g

@@ -215,13 +215,13 @@ function k_mom3!(lo, hi, out, uin, u0, g::Grid{3}, dt::T, ν::T, λ::F, per, acc
         zh1 = zh2 = zh3 = zero(T)
         if ok
             @unroll for i in i32:Int32(3)
-                @inbounds fx[tx, ty, i] = fluxi(1, i, l, uin, g, λ, ν)
+                @inbounds fx[tx, ty, i] = x == 2i32 ? flux(1, i, I, l, uin, g, λ, ν, per) : fluxi(1, i, l, uin, g, λ, ν)
                 @inbounds fy[tx, ty, i] = fluxi(2, i, l, uin, g, λ, ν)
             end
             if xe
                 Ip = (x+i32, y, z)
                 @unroll for i in i32:Int32(3)
-                    @inbounds fx[tx+i32, ty, i] = fluxi(1, i, l+i32, uin, g, λ, ν)
+                    @inbounds fx[tx+i32, ty, i] = x+i32 == g.n[1] ? flux(1, i, Ip, l+i32, uin, g, λ, ν, per) : fluxi(1, i, l+i32, uin, g, λ, ν)
                 end
             end
             if ye
@@ -255,11 +255,14 @@ function k_mom3!(lo, hi, out, uin, u0, g::Grid{3}, dt::T, ν::T, λ::F, per, acc
     return nothing
 end
 # core cells (all faces interior) + the one-cell shell next to the domain boundary
-function core_and_shell(g::Grid{D}) where D
+function core_and_shell(g::Grid{D}, fullx=false) where D
     lo, hi = inside_lo(g), inside_hi(g)
     clo, chi = lo .+ 1, hi .- 1
+    if fullx
+        clo = (lo[1], Base.tail(clo)...); chi = (hi[1], Base.tail(chi)...)
+    end
     slabs = Tuple{NTuple{D,Int},NTuple{D,Int}}[]
-    for j in 1:D   # slab j: Iⱼ ∈ {2, n-1}, dims < j restricted to the core, dims > j full
+    for j in (fullx ? 2 : 1):D   # slab j: Iⱼ ∈ {2, n-1}, dims < j restricted to the core, dims > j full
         l1 = ntuple(d-> d < j ? clo[d] : lo[d], D); h1 = ntuple(d-> d < j ? chi[d] : d == j ? lo[d] : hi[d], D)
         l2 = ntuple(d-> d < j ? clo[d] : d == j ? hi[d] : lo[d], D); h2 = ntuple(d-> d < j ? chi[d] : hi[d], D)
         push!(slabs, (l1,h1), (l2,h2))
@@ -292,10 +295,11 @@ end
 launch_core!(a::TFlow{D,T}, lo, hi, out, uin, t, corr) where {D,T} =
     launch(k_momi!, lo, hi, out, uin, a.u⁰, a.grid, a.Δt[end], a.ν, a.λ, a.acc, T(t), corr)
 function launch_mom!(a::TFlow{D,T}, out, uin, t, corr) where {D,T}
-    (clo, chi), slabs = core_and_shell(a.grid)
+    fullx = D == 3
+    (clo, chi), slabs = core_and_shell(a.grid, fullx)
     launch_core!(a, clo, chi, out, uin, t, corr)
     for (k, (lo, hi)) in enumerate(slabs)
-        launch_face(k_momf!, lo, hi, cld(k,2), out, uin, a.u⁰, a.grid, a.Δt[end], a.ν, a.λ, a.per, a.acc, T(t), corr)
+        launch_face(k_momf!, lo, hi, cld(k,2) + fullx, out, uin, a.u⁰, a.grid, a.Δt[end], a.ν, a.λ, a.per, a.acc, T(t), corr)
     end
 end
 

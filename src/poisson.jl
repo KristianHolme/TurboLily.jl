@@ -150,13 +150,13 @@ end
 # Jacobi: ϵ=r·iD, r ← r-Aϵ (written to rn), x += ϵ
 struct RiD{S,O}; r::S; op::O; end
 @inline (f::RiD)(I, l) = @inbounds(f.r[l])*getiD(f.op, l)
-function k_jacobi!(lo, hi, rn, r, x, op::Op)
+function k_jacobi!(lo, hi, rn, r, x, op::Op, assign::Bool=false)
     I, ok = cellidx(lo, hi); ok || return
     l = lin(op.g, I)
     f = RiD(r, op)
     e = f(I, l)
     @inbounds rn[l] = r[l] - mult_f(op, I, l, f)
-    @inbounds x[l] += e
+    @inbounds x[l] = assign ? e : x[l] + e
     return nothing
 end
 # restriction: coarse r = Σ fine r over the 2ᵈ block (semi-coarsening mask c)
@@ -199,17 +199,17 @@ function k_prol_incr!(lo, hi, r, x, op::Op, cx, gc::Grid, c, ω)
     return nothing
 end
 # increment with stored ϵ (optionally the block partials of Σ|r|, max|r|)
-function k_incr!(lo, hi, ps, pm, r, x, ϵ, op::Op, ω, norms::Bool)
+function k_incr!(lo, hi, ps, pm, r, x, ϵ, op::Op, ω, norms::Bool, sq::Bool=false)
     I, ok = cellidx(lo, hi)
-    a = 0f0
+    a = 0f0; m = 0f0
     if ok
         l = lin(op.g, I)
         v = @inbounds(r[l]) - ω*mult(op, I, l, ϵ)
         @inbounds r[l] = v
         @inbounds x[l] += ω*ϵ[l]
-        a = abs(v)
+        m = abs(v); a = sq ? v*v : m
     end
-    norms && block_partial!(ps, pm, a, a)
+    norms && block_partial!(ps, pm, a, m)
     return nothing
 end
 # red-black Gauss-Seidel half sweep on ϵ (WaterLily.gauss_rb indexing over half_rangek).
@@ -287,30 +287,30 @@ function k_jacobi_fix!(lo, hi, ps, pm, rn, r, x, op::Op, sums, nsolve, tiny)
 end
 
 # ---------------------------------------------------------------- solver pieces
-function jacobi!(lv::Level)
+function jacobi!(lv::Level, assign::Bool=false)
     g = lv.op.g
-    launch(k_jacobi!, inside_lo(g), inside_hi(g), lv.ϵ, lv.r, lv.x, lv.op)
+    launch(k_jacobi!, inside_lo(g), inside_hi(g), lv.ϵ, lv.r, lv.x, lv.op, assign)
     lv.r, lv.ϵ = lv.ϵ, lv.r
 end
 gs_range(g::Grid{D}) where D = (inside_lo(g), ntuple(d-> d==D ? Int(g.n[d])÷2 : Int(g.n[d])-1, D))
-function smooth!(lv::Level{D,T}, ω, red::RedBuf, norms::Bool=false; it=4) where {D,T}
+function smooth!(lv::Level{D,T}, ω, red::RedBuf, norms::Bool=false; it=4, sq=false) where {D,T}
     g = lv.op.g
     lo, hi = gs_range(g)
     for i in 1:it
         launch(k_gs!, lo, hi, lv.ϵ, lv.r, lv.op, Int32(i), i==1)
     end
     if norms
-        red_launch(k_incr!, inside_lo(g), inside_hi(g), red, 3, lv.r, lv.x, lv.ϵ, lv.op, T(ω), true)
+        red_launch(k_incr!, inside_lo(g), inside_hi(g), red, 3, lv.r, lv.x, lv.ϵ, lv.op, T(ω), true, sq)
     else
         launch(k_incr!, inside_lo(g), inside_hi(g), red.ps, red.pm, lv.r, lv.x, lv.ϵ, lv.op, T(ω), false)
     end
 end
 # V-cycle below level l; `fix` = (nsolve, tiny): the fine residual still needs the
 # global correction, which is applied inside the fine Jacobi (norms into slot 2)
-function vcycle!(p::TPoisson{T}, l, ω, fix=nothing) where T
+function vcycle!(p::TPoisson{T}, l, ω, fix=nothing; assign=false) where T
     fine, coarse = p.levels[l], p.levels[l+1]
     if fix === nothing
-        jacobi!(fine)
+        jacobi!(fine, assign)
     else
         g = fine.op.g
         red_launch(k_jacobi_fix!, inside_lo(g), inside_hi(g), p.red, 2, fine.ϵ, fine.r, fine.x, fine.op, p.red.s, fix...)

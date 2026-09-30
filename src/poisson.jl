@@ -147,36 +147,6 @@ function WaterLily.update!(p::TPoisson)
 end
 
 # ---------------------------------------------------------------- kernels
-# residual: r = iD==0 ? 0 : z-Ax ; partial Σr
-function k_residual!(lo, hi, ps, pm, r, z, x, op::Op)
-    I, ok = cellidx(lo, hi)
-    s = 0f0
-    if ok
-        l = lin(op.g, I)
-        v = getiD(op, l) == 0 ? 0f0 : @inbounds(z[l]) - mult(op, I, l, x)
-        @inbounds r[l] = v
-        s = v
-    end
-    block_partial!(ps, pm, s, 0f0)
-    return nothing
-end
-# global correction r -= s (only if |s|>tiny), partial Σ|r|, max|r|
-function k_fixres!(lo, hi, ps, pm, r, sums, op::Op, nsolve, tiny)
-    I, ok = cellidx(lo, hi)
-    a = 0f0
-    if ok
-        l = lin(op.g, I)
-        s = Float32(@inbounds(sums[1])) / nsolve
-        v = @inbounds r[l]
-        if abs(s) > tiny
-            v = getiD(op, l) == 0 ? 0f0 : v - s
-            @inbounds r[l] = v
-        end
-        a = abs(v)
-    end
-    block_partial!(ps, pm, a, a)
-    return nothing
-end
 # Jacobi: ϵ=r·iD, r ← r-Aϵ (written to rn), x += ϵ
 struct RiD{S,O}; r::S; op::O; end
 @inline (f::RiD)(I, l) = @inbounds(f.r[l])*getiD(f.op, l)
@@ -286,12 +256,37 @@ function perBC!(a, g::Grid{D}, per) where D
     end
 end
 
-# ---------------------------------------------------------------- solver pieces
-function residual!(p::TPoisson{T}) where T
-    lv = p.levels[1]; op = lv.op; g = op.g; b = p.red
-    red_launch(k_residual!, inside_lo(g), inside_hi(g), b, 1, lv.r, lv.z, lv.x, op)
-    red_launch(k_fixres!, inside_lo(g), inside_hi(g), b, 2, lv.r, b.s, op, Float32(p.nsolve[]), 2eps(T))
+# ---------------------------------------------------------------- lazily corrected residual
+# rc = iD==0 ? 0 : r-s, with s = Σr/nsolve applied only when |s|>tiny (WaterLily.residual!)
+struct Rc{S,O}; r::S; op::O; s::Float32; apply::Bool; end
+@inline function (f::Rc)(I, l)
+    v = @inbounds f.r[l]
+    return f.apply ? (getiD(f.op, l) == 0 ? 0f0 : v - f.s) : v
 end
+struct RcD{S,O}; rc::Rc{S,O}; end
+@inline (f::RcD)(I, l) = f.rc(I, l)*getiD(f.rc.op, l)
+@inline function make_rc(r, op, sums, nsolve, tiny)
+    s = Float32(@inbounds(sums[1])) / nsolve
+    return Rc(r, op, s, abs(s) > tiny)
+end
+# Jacobi on the corrected residual; partial Σ|rc|, max|rc| (the initial residual norms)
+function k_jacobi_fix!(lo, hi, ps, pm, rn, r, x, op::Op, sums, nsolve, tiny)
+    I, ok = cellidx(lo, hi)
+    a = 0f0
+    if ok
+        l = lin(op.g, I)
+        rc = make_rc(r, op, sums, nsolve, tiny)
+        v = rc(I, l)
+        f = RcD(rc)
+        @inbounds rn[l] = v - mult_f(op, I, l, f)
+        @inbounds x[l] += v*getiD(op, l)
+        a = abs(v)
+    end
+    block_partial!(ps, pm, a, a)
+    return nothing
+end
+
+# ---------------------------------------------------------------- solver pieces
 function jacobi!(lv::Level)
     g = lv.op.g
     launch(k_jacobi!, inside_lo(g), inside_hi(g), lv.ϵ, lv.r, lv.x, lv.op)
@@ -305,14 +300,22 @@ function smooth!(lv::Level{D,T}, ω, red::RedBuf, norms::Bool=false; it=4) where
         launch(k_gs!, lo, hi, lv.ϵ, lv.r, lv.op, Int32(i), i==1)
     end
     if norms
-        red_launch(k_incr!, inside_lo(g), inside_hi(g), red, 2, lv.r, lv.x, lv.ϵ, lv.op, T(ω), true)
+        red_launch(k_incr!, inside_lo(g), inside_hi(g), red, 3, lv.r, lv.x, lv.ϵ, lv.op, T(ω), true)
     else
         launch(k_incr!, inside_lo(g), inside_hi(g), red.ps, red.pm, lv.r, lv.x, lv.ϵ, lv.op, T(ω), false)
     end
 end
-function vcycle!(p::TPoisson{T}, l, ω) where T
+# V-cycle below level l; `fix` = (nsolve, tiny): the fine residual still needs the
+# global correction, which is applied inside the fine Jacobi (norms into slot 2)
+function vcycle!(p::TPoisson{T}, l, ω, fix=nothing) where T
     fine, coarse = p.levels[l], p.levels[l+1]
-    jacobi!(fine)
+    if fix === nothing
+        jacobi!(fine)
+    else
+        g = fine.op.g
+        red_launch(k_jacobi_fix!, inside_lo(g), inside_hi(g), p.red, 2, fine.ϵ, fine.r, fine.x, fine.op, p.red.s, fix...)
+        fine.r, fine.ϵ = fine.ϵ, fine.r
+    end
     gc = coarse.op.g
     launch(k_restrict!, inside_lo(gc), inside_hi(gc), coarse.r, gc, fine.r, fine.op.g, fine.c)
     fill!(coarse.x, 0)
@@ -321,18 +324,26 @@ function vcycle!(p::TPoisson{T}, l, ω) where T
     g = fine.op.g
     launch(k_prol_incr!, inside_lo(g), inside_hi(g), fine.r, fine.x, fine.op, coarse.x, gc, fine.c, T(ω))
 end
-norms!(b::RedBuf) = (fetch!(b); (getsum(b,2), getmax(b,2)))
 
-function WaterLily.solver!(p::TPoisson{T}; tol=2e-3, itmx=32) where T
+"""
+    solve!(p::TPoisson, scale; tol=2e-3, itmx=32)
+
+Multigrid iterations on `A x = z` where the level-1 residual `r` (uncorrected, with its
+sum in `p.red.s[1]`) was set by the caller. Convergence is tested on `scale·r`, so a
+caller solving for `p = x/Δt` passes `scale = Δt` and WaterLily's tolerances keep their meaning.
+"""
+function solve!(p::TPoisson{T}, scale; tol=2e-3, itmx=32) where T
     top = p.levels[1]
-    r₁tol = WaterLily.l1n_tol(p.ml.levels[1], tol); r∞tol = tol
-    residual!(p); r₁, r∞ = norms!(p.red); ω = T(1)
-    nᵖ = 0; @log ", $nᵖ, $r∞, $r₁, $ω\n"
+    r₁tol = WaterLily.l1n_tol(p.ml.levels[1], tol)/scale; r∞tol = tol/scale
+    fix = (Float32(p.nsolve[]), T(2eps(T)/scale))
+    ω = T(1); nᵖ = 0; r₁ = Inf
     while nᵖ < itmx
-        vcycle!(p, 1, ω)
+        vcycle!(p, 1, ω, nᵖ == 0 ? fix : nothing)
         smooth!(top, ω, p.red, true)
-        rnew, r∞ = norms!(p.red); nᵖ += 1
-        @log ", $nᵖ, $r∞, $rnew, $ω\n"
+        fetch!(p.red)
+        nᵖ == 0 && (r₁ = getsum(p.red,2); @log ", 0, $(getmax(p.red,2)*scale), $(r₁*scale), $ω\n")
+        rnew, r∞ = getsum(p.red,3), getmax(p.red,3); nᵖ += 1
+        @log ", $nᵖ, $(r∞*scale), $(rnew*scale), $ω\n"
         ω = rnew ≥ r₁ ? T(max(0.2, 0.9ω)) : T(min(1.0, 1.02ω))
         r₁ = rnew
         (r₁ < r₁tol && r∞ < r∞tol) && break
@@ -340,24 +351,50 @@ function WaterLily.solver!(p::TPoisson{T}; tol=2e-3, itmx=32) where T
     perBC!(top.x, top.op.g, p.per)
     push!(p.n, nᵖ)
 end
-
-# ---------------------------------------------------------------- projection
-function k_src!(lo, hi, z, x, u, V, op::Op{D}, dt, useV::Bool) where D
-    I, ok = cellidx(lo, hi); ok || return
-    g = op.g
-    l = lin(g, I)
-    @inbounds x[l] *= dt
-    all(ntuple(d->I[d]>i32 && I[d]<g.n[d], Val(D))) || return
-    du = 0f0; dv = 0f0
-    @unroll for i in i32:Int32(D)
-        ci = (i-i32)*g.nc
-        @inbounds du += u[l+g.s[i]+ci] - u[l+ci]
-        useV && (@inbounds dv += V[l+g.s[i]+ci] - V[l+ci])
+function k_residual!(lo, hi, ps, pm, r, z, x, op::Op)
+    I, ok = cellidx(lo, hi)
+    s = 0f0
+    if ok
+        l = lin(op.g, I)
+        v = getiD(op, l) == 0 ? 0f0 : @inbounds(z[l]) - mult(op, I, l, x)
+        @inbounds r[l] = v
+        s = v
     end
-    @inbounds z[l] = useV ? du - (1 + (isreg(op,l) ? op.Dreg : op.Dg[l])/(2D))*dv : du
+    block_partial!(ps, pm, s, 0f0)
     return nothing
 end
-function k_proj!(lo, hi, u, x, op::Op{D}) where D
+function WaterLily.solver!(p::TPoisson; tol=2e-3, itmx=32)
+    lv = p.levels[1]; g = lv.op.g
+    red_launch(k_residual!, inside_lo(g), inside_hi(g), p.red, 1, lv.r, lv.z, lv.x, lv.op)
+    solve!(p, 1; tol, itmx)
+end
+
+# ---------------------------------------------------------------- projection
+# r = iD==0 ? 0 : (div u - δv·div V)/Δt - A p, partial Σr
+function k_resid_src!(lo, hi, ps, pm, r, x, u, V, op::Op{D}, idt, useV::Bool) where D
+    I, ok = cellidx(lo, hi)
+    s = 0f0
+    if ok
+        g = op.g
+        l = lin(g, I)
+        v = 0f0
+        if getiD(op, l) != 0
+            du = 0f0; dv = 0f0
+            @unroll for i in i32:Int32(D)
+                ci = (i-i32)*g.nc
+                @inbounds du += u[l+g.s[i]+ci] - u[l+ci]
+                useV && (@inbounds dv += V[l+g.s[i]+ci] - V[l+ci])
+            end
+            z = useV ? du - (1 + (isreg(op,l) ? op.Dreg : @inbounds(op.Dg[l]))/(2D))*dv : du
+            v = z*idt - mult(op, I, l, x)
+        end
+        @inbounds r[l] = v
+        s = v
+    end
+    block_partial!(ps, pm, s, 0f0)
+    return nothing
+end
+function k_proj!(lo, hi, u, x, op::Op{D}, dt) where D
     I, ok = cellidx(lo, hi); ok || return
     g = op.g
     l = lin(g, I)
@@ -365,15 +402,14 @@ function k_proj!(lo, hi, u, x, op::Op{D}) where D
     @unroll for i in i32:Int32(D)
         ci = (i-i32)*g.nc
         L = r ? op.Lreg : @inbounds(op.L[l+ci])
-        @inbounds u[l+ci] -= L*(x[l]-x[l-g.s[i]])
+        @inbounds u[l+ci] -= dt*L*(x[l]-x[l-g.s[i]])
     end
     return nothing
 end
 function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w, t) where {D,T}
-    dt = T(w)*a.Δt[end]; g = a.grid; op = b.levels[1].op
-    launch(k_src!, ntuple(_->1,D), size(a.p), b.z, b.x, a.u, a.V, op, dt, !a.Vzero)
-    WaterLily.solver!(b)
-    launch(k_proj!, inside_lo(g), inside_hi(g), a.u, b.x, op)
-    b.x ./= dt
+    dt = T(w)*a.Δt[end]; g = a.grid; lv = b.levels[1]
+    red_launch(k_resid_src!, inside_lo(g), inside_hi(g), b.red, 1, lv.r, lv.x, a.u, a.V, lv.op, inv(dt), !a.Vzero)
+    solve!(b, dt)
+    launch(k_proj!, inside_lo(g), inside_hi(g), a.u, b.x, lv.op, dt)
     BC!(a, a.u, t)
 end

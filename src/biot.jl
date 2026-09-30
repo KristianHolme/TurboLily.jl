@@ -27,6 +27,7 @@ struct TBiotPoisson{T,S,V,D,P<:TPoisson,W,G} <: AbstractPoisson{T,S,V}
     perdir :: NTuple
     fmm :: Bool
     red :: RedBuf
+    lists :: Vector{CuVector{Int32}}  # [A1, A2, B]: affected layer cells, affected level-2 cells, boundary-adjacent cells
 end
 function TBiotPoisson(flow::TFlow{D,T}; nonbiotfaces=(), fmm=true) where {D,T}
     isempty(flow.perdir) || @warn "BiotSavart BCs ignore perdir" maxlog=1
@@ -37,23 +38,92 @@ function TBiotPoisson(flow::TFlow{D,T}; nonbiotfaces=(), fmm=true) where {D,T}
     tars = BiotSavartBCs.collect_targets(ml, nonbiotfaces)
     tar = [CuVector{Int32}(Int32.(LinearIndices(size(ml[l]))[tars[l]])) for l in eachindex(ml)]
     p = copy(flow.p)
-    TBiotPoisson{T,typeof(flow.p),typeof(flow.μ₀),D,typeof(pois),typeof(ω),typeof(g)}(
-        pois, pois.x, pois.L, pois.z, ω, g, tar, p, pois.n, flow.perdir, fmm, pois.red)
+    B = unique(vcat([Int32[let I = CartesianIndex(Tuple(Ti)[1:D]), i = Tuple(Ti)[D+1]
+            LinearIndices(size(flow.p))[I[i] == 1 ? I + CartesianIndex(ntuple(d->d==i, D)) : I - CartesianIndex(ntuple(d->d==i, D))]
+        end for Ti in tars[1]]]...))
+    b = TBiotPoisson{T,typeof(flow.p),typeof(flow.μ₀),D,typeof(pois),typeof(ω),typeof(g)}(
+        pois, pois.x, pois.L, pois.z, ω, g, tar, p, pois.n, flow.perdir, fmm, pois.red,
+        [CuVector{Int32}(undef,0), CuVector{Int32}(undef,0), CuVector{Int32}(B)])
+    affected_lists!(b)
+    return b
 end
-WaterLily.update!(b::TBiotPoisson) = WaterLily.update!(b.pois)
+WaterLily.update!(b::TBiotPoisson) = (WaterLily.update!(b.pois); affected_lists!(b))
+
+# Cells whose centred-curl stencil reads a face with L≠1: there the curl of Δt·L∇p is not
+# zero, so ω must be recomputed when p changes. Elsewhere curl(L∇p) ≡ 0 exactly.
+function k_affected!(lo, hi, m, L, g::Grid{D}, w) where D
+    I, ok = cellidx(lo, hi); ok || return
+    l = lin(g, I)
+    aff = false
+    @unroll for a in i32:Int32(D)
+        ca = (a-i32)*g.nc
+        @unroll for b in i32:Int32(D)
+            if a != b
+                sb, sa = g.s[b], g.s[a]
+                @inbounds aff |= (L[l+sb+ca] != 1) | (L[l-sb+ca] != 1) | (L[l+sb+sa+ca] != 1) | (L[l-sb+sa+ca] != 1)
+            end
+        end
+    end
+    near = false
+    @unroll for d in i32:Int32(D)
+        near |= (I[d] <= w) | (I[d] >= g.n[d] - w + i32)
+    end
+    @inbounds m[l] = aff ? (near ? 0x03 : 0x01) : 0x00
+    return nothing
+end
+function k_affected2!(lo, hi, m2, g2::Grid{D}, m, g::Grid{D}) where D
+    I, ok = cellidx(lo, hi); ok || return
+    J0 = lin(g, ntuple(d-> Int32(2)*I[d] - Int32(2), Val(D)))
+    aff = false
+    if D == 3
+        for dz in 0:1, dy in 0:1, dx in 0:1
+            @inbounds aff |= m[J0 + dx + dy*g.s[2] + dz*g.s[D]] != 0
+        end
+    else
+        for dy in 0:1, dx in 0:1
+            @inbounds aff |= m[J0 + dx + dy*g.s[2]] != 0
+        end
+    end
+    @inbounds m2[lin(g2, I)] = aff
+    return nothing
+end
+function affected_lists!(b::TBiotPoisson{T,S,V,D}) where {T,S,V,D}
+    g = b.g; L = b.L
+    m = CUDA.zeros(UInt8, Int.(g[1].n))
+    launch(k_affected!, ntuple(_->3,D), ntuple(d->Int(g[1].n[d])-2,D), m, L, g[1], Int32(layer_width(Val(D))))
+    m2 = CUDA.zeros(Bool, Int.(g[2].n))
+    launch(k_affected2!, inside_lo(g[2]), inside_hi(g[2]), m2, g[2], m, g[1])
+    b.lists[1] = CuVector{Int32}(findall(==(0x03), vec(m)))
+    b.lists[2] = CuVector{Int32}(findall(vec(m2)))
+    CUDA.unsafe_free!(m); CUDA.unsafe_free!(m2)
+    return b
+end
 Base.getproperty(b::TBiotPoisson, s::Symbol) = s === :levels ? getfield(b, :pois).levels : getfield(b, s)
 
 # ---------------------------------------------------------------- vorticity
+# velocity accessors: plain u, or the projected u - Δt·L∇p (without writing it)
+struct UA{A}; u::A; nc::Int32; end
+@inline (f::UA)(l, a) = @inbounds f.u[l + (a-i32)*f.nc]
+struct UC{A,P,O,T}; u::A; p::P; op::O; dt::T; end
+Adapt.@adapt_structure UA
+Adapt.@adapt_structure UC
+@inline function (f::UC)(l, a)
+    op = f.op; ca = (a-i32)*op.g.nc
+    L = isreg(op, l) ? op.Lreg : @inbounds(op.L[l+ca])
+    @inbounds return f.u[l+ca] - f.dt*L*(f.p[l] - f.p[l-op.g.s[a]])
+end
 # centred curl at cell I (BiotSavartBCs.centered_curl): 3D all components, 2D ω₃ in slot 1
-@inline function dcross(i, j, l, u, g::Grid)   # ∂uᵢ/∂xⱼ at the cell centre, i ≠ j
-    ci = (i-i32)*g.nc; sj, si = g.s[j], g.s[i]
-    @inbounds return (u[l+sj+ci] + u[l+sj+si+ci] - u[l-sj+ci] - u[l-sj+si+ci])*0.25f0
+@inline function dcross(i, j, l, U::F, g::Grid) where F   # ∂uᵢ/∂xⱼ at the cell centre, i ≠ j
+    sj, si = g.s[j], g.s[i]
+    return (U(l+sj, i) + U(l+sj+si, i) - U(l-sj, i) - U(l-sj+si, i))*0.25f0
 end
-@inline function curl_c(i, l, u, g::Grid{3})
+@inline function curl_c(i, l, U::F, g::Grid{3}) where F
     j = i % Int32(3) + i32; k = (i + i32) % Int32(3) + i32
-    return dcross(k, j, l, u, g) - dcross(j, k, l, u, g)
+    return dcross(k, j, l, U, g) - dcross(j, k, l, U, g)
 end
-@inline curl_c(i, l, u, g::Grid{2}) = i == i32 ? dcross(Int32(2), i32, l, u, g) - dcross(i32, Int32(2), l, u, g) : 0f0
+@inline curl_c(i, l, U::F, g::Grid{2}) where F = i == i32 ? dcross(Int32(2), i32, l, U, g) - dcross(i32, Int32(2), l, U, g) : 0f0
+@inline curl_c(i, l, u::AbstractArray, g::Grid{3}) = curl_c(i, l, UA(u, g.nc), g)
+@inline curl_c(i, l, u::AbstractArray, g::Grid{2}) = curl_c(i, l, UA(u, g.nc), g)
 
 # level-1 vorticity in the boundary layer read by the level-1 interactions
 function k_curl_layer!(lo, hi, ω, u, g::Grid{D}, w) where D
@@ -381,47 +451,147 @@ function pflowBC!(u, g::Grid{D}) where D
     end
 end
 
+# ---------------------------------------------------------------- incremental vorticity
+# recompute ω on the affected cells from u - Δt·L∇p
+function k_curl_corr1!(n, list, ω, U::F, g::Grid{D}) where {D,F}
+    k = tid1(); k <= n || return
+    l = @inbounds list[k]
+    @unroll for i in i32:Int32(D)
+        @inbounds ω[l + (i-i32)*g.nc] = curl_c(i, l, U, g)
+    end
+    return nothing
+end
+function k_curl_corr2!(n, list, ω2, g2::Grid{D}, U::F, g::Grid{D}) where {D,F}
+    k = tid1(); k <= n || return
+    l2 = @inbounds list[k]
+    I = coords(g2, l2)
+    J0 = ntuple(d-> Int32(2)*I[d] - Int32(2), Val(D))
+    @unroll for i in i32:Int32(D)
+        s = 0f0
+        if D == 3
+            for dz in 0:1, dy in 0:1, dx in 0:1
+                J = (J0[1]+Int32(dx), J0[2]+Int32(dy), J0[D]+Int32(dz))
+                inb = true
+                @unroll for d in i32:Int32(D)
+                    inb &= (J[d] >= Int32(3)) & (J[d] <= g.n[d] - Int32(2))
+                end
+                inb && (s += curl_c(i, lin(g, J), U, g))
+            end
+        else
+            for dy in 0:1, dx in 0:1
+                J = (J0[1]+Int32(dx), J0[2]+Int32(dy))
+                inb = (J[1] >= Int32(3)) & (J[1] <= g.n[1] - Int32(2)) & (J[2] >= Int32(3)) & (J[2] <= g.n[2] - Int32(2))
+                inb && (s += curl_c(i, lin(g, J), U, g))
+            end
+        end
+        @inbounds ω2[l2 + (i-i32)*g2.nc] = s
+    end
+    return nothing
+end
+function correct_ω!(b::TBiotPoisson, ω1, u, p, dt)
+    g = b.g; op = b.levels[1].op
+    U = UC(u, p, op, dt)
+    launch1(k_curl_corr1!, length(b.lists[1]), b.lists[1], ω1, U, g[1])
+    launch1(k_curl_corr2!, length(b.lists[2]), b.lists[2], b.ω[1], g[2], U, g[1])
+    for l in 3:length(g)
+        launch(k_vrestrict!, inside_lo(g[l]), inside_hi(g[l]), b.ω[l-1], g[l], b.ω[l-2], g[l-1])
+    end
+end
+# Σr² over a cell list (block partials)
+function k_listsq!(n, ps, pm, list, r)
+    k = tid1()
+    v = k <= n ? @inbounds(r[list[k]]) : 0f0
+    block_partial!(ps, pm, v*v, abs(v))
+    return nothing
+end
+function list_sumsq!(b::TBiotPoisson, list, r, slot)
+    n = length(list); red = b.red
+    nb = cld(n, 256)
+    @cuda threads=256 blocks=nb k_listsq!(Int32(n), red.ps, red.pm, list, r)
+    @cuda threads=1024 k_finish!(red.ps, red.pm, Int32(nb), red.s, red.m, Int32(slot))
+end
+# boundary velocity u = U + uᵥ; r[adjacent] += Δuₙ·sgn·scale; partial Σ Δuₙ·sgn (net flux change)
+function k_biotbc2!(n, ps, pm, tar, u, uv, r, U, g::Grid, scale)
+    k = tid1()
+    d = 0f0
+    if k <= n
+        li = @inbounds tar[k]
+        i, l, lower = face_of(li, g)
+        lu = (lower ? l + g.s[i] : l) + (i-i32)*g.nc
+        un = @inbounds U[i] + uv[li]
+        d = (un - @inbounds(u[lu]))*(lower ? -1f0 : 1f0)
+        CUDA.@atomic r[lower ? l + g.s[i] : l - g.s[i]] += d*scale
+        @inbounds u[lu] = un
+    end
+    block_partial!(ps, pm, d, 0f0)
+    return nothing
+end
+# global flux fix with fix = sums[slot]·fscale/n: u[face] += fix·(lower ? 1 : -1), r[adjacent] -= fix·rscale
+function k_fixresid2!(n, tar, u, r, sums, slot::Int32, fscale, rscale, g::Grid)
+    k = tid1(); k <= n || return
+    fix = Float32(@inbounds(sums[slot]))*fscale / Float32(n)
+    li = @inbounds tar[k]
+    i, l, lower = face_of(li, g)
+    lu = (lower ? l + g.s[i] : l) + (i-i32)*g.nc
+    @inbounds u[lu] += fix*(lower ? 1f0 : -1f0)
+    CUDA.@atomic r[lower ? l + g.s[i] : l - g.s[i]] -= fix*rscale
+    return nothing
+end
+
 # ---------------------------------------------------------------- projection
 bctuple(f::Function, t::T, N) where T = ntuple(i->f(i, zero(SVector{N,T}), t), N)
 bctuple(f::Tuple, t, N) = f
-function biot_update!(b::TBiotPoisson, a::TFlow, U, r)
-    fill_ω!(b, a.f, a.u)
-    b.fmm ? fmm!(b, a.f) : error("TurboLily: fmm=false (tree sum) is not implemented")
-    launch1(k_biotbc!, length(b.tar[1]), b.tar[1], a.u, a.f, r, U, b.g[1], r !== nothing)
-end
+"""
+    mom_project!(a::TFlow, b::TBiotPoisson, w, t; tol=1e-4, itmx=32)
+
+BiotSavartBCs projection, rearranged to avoid full-grid passes per Biot iteration:
+the pressure `p` is solved for directly and kept cumulative, `u` is only projected once at
+the end, the vorticity of the projected field is recomputed only where `curl(L∇p)≠0`,
+and the global flux fix and `Σr²` are updated from the boundary cells.
+"""
 function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w, t; tol=1e-4, itmx=32) where {D,T}
-    dt = T(w)*a.Δt[end]; a.p .*= dt
+    dt = T(w)*a.Δt[end]; idt = inv(dt)
     U = T.(bctuple(a.uBC, T(t), D))
-    top = b.levels[1]; op = top.op; g = op.g
-    fill!(b.p, 0); fill!(b.pois.ωd, 1)
-    launch(k_projupd!, inside_lo(g), inside_hi(g), a.u, a.p, b.p, op)
-    fill_ω!(b, a.f, a.u); fmm!(b, a.f)
-    launch1(k_biotbc!, length(b.tar[1]), b.tar[1], a.u, a.f, top.r, U, g, false)
-    launch(k_divres!, (1,1,1)[1:D], Int.(g.n), top.r, a.u, op)
-    fix_resid!(b, a.u, top.r)
-    r₂, r∞ = L₂!(b, top.r)
-    nᵖ, nᵇ = 0, 0; xzero = true
-    @log ", $nᵖ, $r∞, $r₂, $nᵇ\n"
+    top = b.levels[1]; op = top.op; g = op.g; red = b.red
+    tar1 = b.tar[1]; nt = length(tar1)
+    fill!(b.pois.ωd, 1)
+    # vorticity of u - Δt·L∇p, Biot-Savart boundary velocity
+    fill_ω!(b, a.f, a.u)
+    correct_ω!(b, a.f, a.u, a.p, dt)
+    fmm!(b, a.f)
+    launch1(k_biotbc!, nt, tar1, a.u, a.f, top.r, U, g, false)
+    # residual r = div(u)/Δt - A p (Σr in slot 1), global flux fix, Σr²
+    red_launch(k_resid_src!, inside_lo(g), inside_hi(g), red, 1, top.r, a.p, a.u, a.V, op, idt, false)
+    launch1(k_fixresid2!, nt, tar1, a.u, top.r, red.s, Int32(1), dt, idt, g)
+    r₂, r∞ = L₂!(b, top.r); r₂ *= dt^2
+    nᵖ, nᵇ = 0, 0
+    @log ", $nᵖ, $(r∞*dt), $r₂, $nᵇ\n"
     while nᵖ < itmx
         rtol = max(tol, 0.1r₂)
         while nᵖ < itmx
-            iteration!(b.pois; assign=xzero, sq=true, adapt=false); xzero = false
-            fetch!(b.red); r₂ = getsum(b.red, 3); nᵖ += 1
+            iteration!(b.pois; sq=true, adapt=false)
+            fetch!(red); r₂ = getsum(red, 3)*dt^2; nᵖ += 1
             r₂ < rtol && break
         end
-        launch(k_projupd!, inside_lo(g), inside_hi(g), a.u, top.x, b.p, op); xzero = true
-        fill_ω!(b, a.f, a.u); fmm!(b, a.f)
-        launch1(k_biotbc!, length(b.tar[1]), b.tar[1], a.u, a.f, top.r, U, g, true)
-        fix_resid!(b, a.u, top.r)
-        r₂, r∞ = L₂!(b, top.r); nᵇ += 1
-        @log ", $nᵖ, $r∞, $r₂, $nᵇ\n"
+        r₂p = getsum(red, 3)
+        # Biot-Savart update of the boundary velocity with the current p
+        correct_ω!(b, a.f, a.u, a.p, dt)
+        fmm!(b, a.f)
+        list_sumsq!(b, b.lists[3], top.r, 5)
+        nb = cld(nt, 256)
+        @cuda threads=256 blocks=nb k_biotbc2!(Int32(nt), red.ps, red.pm, tar1, a.u, a.f, top.r, U, g, idt)
+        @cuda threads=1024 k_finish!(red.ps, red.pm, Int32(nb), red.s, red.m, Int32(6))
+        launch1(k_fixresid2!, nt, tar1, a.u, top.r, red.s, Int32(6), 1f0, idt, g)
+        list_sumsq!(b, b.lists[3], top.r, 7)
+        fetch!(red)
+        r₂ = (r₂p - getsum(red, 5) + getsum(red, 7))*dt^2; nᵇ += 1
+        @log ", $nᵖ, $(getmax(red,7)*dt), $r₂, $nᵇ\n"
         r₂ < tol && break
     end
     push!(b.n, nᵖ)
+    launch(k_proj!, inside_lo(g), inside_hi(g), a.u, a.p, op, dt)
     pflowBC!(a.u, g)
-    a.p .= b.p ./ dt
 end
-
 """
     TurboLily.BiotSimulation(dims, uBC, L; nonbiotfaces=(), fmm=true, kwargs...)
 

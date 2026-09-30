@@ -57,7 +57,7 @@ end
 # ---------------------------------------------------------------- operators
 @inline function mult(I, l, g::Grid{D}, L, Dg, x, per) where D
     s = @inbounds x[l]*Dg[l]
-    for j in i32:Int32(D)
+    @unroll for j in i32:Int32(D)
         cj = (j-1)*g.nc
         @inbounds s += x[nbm(g,I,l,j,per)]*L[l+cj] + x[nbp(g,I,l,j,per)]*L[l+g.s[j]+cj]
     end
@@ -66,7 +66,7 @@ end
 # A applied to ϵ=r·iD computed on the fly
 @inline function mult_riD(I, l, g::Grid{D}, L, Dg, r, iD, per) where D
     s = @inbounds r[l]*iD[l]*Dg[l]
-    for j in i32:Int32(D)
+    @unroll for j in i32:Int32(D)
         cj = (j-1)*g.nc
         lm, lp = nbm(g,I,l,j,per), nbp(g,I,l,j,per)
         @inbounds s += r[lm]*iD[lm]*L[l+cj] + r[lp]*iD[lp]*L[l+g.s[j]+cj]
@@ -85,7 +85,7 @@ end
 @inline prol(g, I, per, cx, gc, c) = @inbounds cx[lin(gc, down(wrapI(g,I,per), c))]
 @inline function mult_prol(I, l, g::Grid{D}, L, Dg, cx, gc, c, per) where D
     s = prol(g, I, per, cx, gc, c)*@inbounds(Dg[l])
-    for j in i32:Int32(D)
+    @unroll for j in i32:Int32(D)
         cj = (j-1)*g.nc
         @inbounds s += prol(g, shift(I,j,-1), per, cx, gc, c)*L[l+cj] +
                        prol(g, shift(I,j,1), per, cx, gc, c)*L[l+g.s[j]+cj]
@@ -178,7 +178,7 @@ end
 # `init`: first sweep, also sets ϵ=r·iD on the partner cell and reads neighbours as r·iD.
 @inline function gauss(I, l, g::Grid{D}, r, L, iD, x, per) where D
     s = @inbounds r[l]
-    for j in i32:Int32(D)
+    @unroll for j in i32:Int32(D)
         cj = (j-1)*g.nc
         @inbounds s -= x[nbm(g,I,l,j,per)]*L[l+cj] + x[nbp(g,I,l,j,per)]*L[l+g.s[j]+cj]
     end
@@ -186,7 +186,7 @@ end
 end
 @inline function gauss_init(I, l, g::Grid{D}, r, L, iD, per) where D
     s = @inbounds r[l]
-    for j in i32:Int32(D)
+    @unroll for j in i32:Int32(D)
         cj = (j-1)*g.nc
         lm, lp = nbm(g,I,l,j,per), nbp(g,I,l,j,per)
         @inbounds s -= r[lm]*iD[lm]*L[l+cj] + r[lp]*iD[lp]*L[l+g.s[j]+cj]
@@ -196,7 +196,7 @@ end
 function k_gs!(lo, hi, ϵ, r, L, iD, g::Grid{D}, per, k0::Int32, init::Bool) where D
     Iv, ok = cellidx(lo, hi); ok || return
     fs = Int32(0)
-    for d in i32:Int32(D-1)
+    @unroll for d in i32:Int32(D-1)
         fs += Iv[d]
     end
     p = (fs + k0) % Int32(2)
@@ -297,7 +297,7 @@ function k_src!(lo, hi, z, x, u, V, Dg, g::Grid{D}, dt, useV::Bool) where D
     @inbounds x[l] *= dt
     all(ntuple(d->I[d]>i32 && I[d]<g.n[d], Val(D))) || return
     du = 0f0; dv = 0f0
-    for i in i32:Int32(D)
+    @unroll for i in i32:Int32(D)
         ci = (i-1)*g.nc
         @inbounds du += u[l+g.s[i]+ci] - u[l+ci]
         useV && (@inbounds dv += V[l+g.s[i]+ci] - V[l+ci])
@@ -308,7 +308,7 @@ end
 function k_proj!(lo, hi, u, L, x, g::Grid{D}) where D
     I, ok = cellidx(lo, hi); ok || return
     l = lin(g, I)
-    for i in i32:Int32(D)
+    @unroll for i in i32:Int32(D)
         ci = (i-1)*g.nc
         @inbounds u[l+ci] -= L[l+ci]*(x[l]-x[l-g.s[i]])
     end

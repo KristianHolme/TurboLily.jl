@@ -74,10 +74,10 @@ WaterLily.measure!(a::TFlow, ::NoBody; kwargs...) = nothing
 function k_bandmask!(lo, hi, m, μ₀, μ₁, g::Grid{D}) where D
     I, ok = cellidx(lo, hi); ok || return
     l = lin(g, I)
-    for i in i32:Int32(D)
+    @unroll for i in i32:Int32(D)
         li = l + (i-1)*g.nc
         b = @inbounds μ₀[li] != 1
-        for j in i32:Int32(D)
+        @unroll for j in i32:Int32(D)
             b |= @inbounds μ₁[li + (j-1)*D*g.nc] != 0
         end
         @inbounds m[li] = b
@@ -122,11 +122,11 @@ end
 @inline function rconv(i, I::NTuple{D,Int32}, l, u, g::Grid{D}, λ::F, ν::T, per) where {D,F,T}
     s = zero(T)
     lowghost = false
-    for j in i32:Int32(D)
+    @unroll for j in i32:Int32(D)
         lowghost |= I[j] == i32
     end
     lowghost && return s
-    for j in i32:Int32(D)
+    @unroll for j in i32:Int32(D)
         if I[j] <= g.n[j]-i32
             s += flux(j, i, I, l, u, g, λ, ν, per)
             s -= flux(j, i, shift(I,j,1), l+g.s[j], u, g, λ, ν, per)
@@ -142,7 +142,7 @@ end
 function k_mom!(lo, hi, out, uin, u0, g::Grid{D}, dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool) where {D,T,F,A}
     I, ok = cellidx(lo, hi); ok || return
     l = lin(g, I)
-    for i in i32:Int32(D)
+    @unroll for i in i32:Int32(D)
         li = l + (i-1)*g.nc
         r = rconv(i, I, l, uin, g, λ, ν, per) + accel(acc, i, I, t, T)
         @fastmath v = @inbounds(u0[li]) + dt*r
@@ -164,7 +164,7 @@ function k_band!(n, band, out, uin, u0, V, μ₀, μ₁, g::Grid{D}, dt::T, ν::
     I = coords(g, l)
     f0 = ftilde(i, I, l, uin, u0, V, g, dt, ν, λ, per, acc, t)
     m = zero(T)
-    for j in i32:Int32(D)
+    @unroll for j in i32:Int32(D)
         μ = @inbounds μ₁[li + (j-1)*D*g.nc]
         if μ != 0
             fp = ftilde(i, shift(I,j,1), l+g.s[j], uin, u0, V, g, dt, ν, λ, per, acc, t)
@@ -190,7 +190,7 @@ function k_bc!(lo, hi, a, g::Grid{D}, j, bc::B, t::T, saveexit::Bool, perj::Bool
     l1 = lin(g, I)                 # I[j]==1
     sj = g.s[j]
     ln = l1 + (nj-i32)*sj
-    for i in i32:Int32(D)
+    @unroll for i in i32:Int32(D)
         ci = (i-1)*g.nc
         if perj
             @inbounds a[l1+ci] = a[l1+(nj-Int32(2))*sj+ci]
@@ -218,13 +218,13 @@ end
 function k_exit!(u, u0, g::Grid{D}, dt::T) where {D,T}
     # plane of cells with I[1] fixed, others 2:n-1
     np = Int32(1)
-    for d in i32:Int32(D)
+    @unroll for d in i32:Int32(D)
         d > 1 && (np *= g.n[d]-Int32(2))
     end
     sh = CuStaticSharedArray(Float32, 32)
     function planeI(k)   # k ∈ 0:np-1 → offset with I[1]=1
         o = Int32(0); r = k
-        for d in i32:Int32(D)
+        @unroll for d in i32:Int32(D)
             if d > 1
                 m = g.n[d]-Int32(2)
                 o += (r % m + i32)*g.s[d]; r ÷= m
@@ -284,7 +284,7 @@ function k_cfl!(lo, hi, outs, outm, u, g::Grid{D}) where D
     m = 0f0
     if ok
         l = lin(g, I)
-        for i in i32:Int32(D)
+        @unroll for i in i32:Int32(D)
             ci = (i-1)*g.nc
             @inbounds m += max(0f0, u[l+g.s[i]+ci]) + max(0f0, -u[l+ci])
         end

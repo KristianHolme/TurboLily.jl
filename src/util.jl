@@ -31,8 +31,18 @@ end
 @inline loc(i, I::NTuple{D,Int32}, ::Type{T}) where {D,T} =
     SVector{D,T}(ntuple(d-> T(I[d]) - T(1.5) - (d==i ? T(0.5) : zero(T)), Val(D)))
 
-# compile-time unrolled loop over 1:N
-@inline unroll(f::F, ::Val{N}) where {F,N} = (ntuple(i->(f(i); nothing), Val(N)); nothing)
+"""
+    @unroll for i in a:b ... end
+
+Request full unrolling of a loop with compile-time constant bounds (LLVM loop metadata),
+so tuple indexing by the loop variable becomes static.
+"""
+macro unroll(ex)
+    (ex isa Expr && ex.head == :for) || error("@unroll expects a for loop")
+    body = ex.args[2]
+    ex.args[2] = Expr(:block, body, Expr(:loopinfo, (Symbol("llvm.loop.unroll.full"), 1)))
+    return esc(ex)
+end
 
 @inline function tid3()
     x = (blockIdx().x-i32)*blockDim().x + threadIdx().x

@@ -39,8 +39,8 @@ below show 4.8× and 5.4× over a developed flow.
 ## Validation
 
 Every configuration is stepped side by side with the reference implementation, and the results
-must agree to rounding: `test/runtests.jl` contains 49 checks. These cover 2D and 3D, `exitBC`,
-periodic directions, `uBC(i,x,t)`, `g`, a moving body with `remeasure=true`, `udf` (body force
+must agree to rounding: `test/runtests.jl` contains 52 checks. These cover 2D and 3D, `exitBC`,
+periodic directions (including a fully periodic Taylor-Green vortex), `uBC(i,x,t)`, `g`, a moving body with `remeasure=true`, `udf` (body force
 and the Smagorinsky `sgs!`), Biot-Savart with `nonbiotfaces`, and the BiotSavartBCs
 potential-flow test. The pressure-iteration counts are identical.
 
@@ -117,8 +117,13 @@ NVLink):
 - Independent simulations, one per GPU from one Julia process, work as they are: see
   `examples/multigpu_sweep.jl`, started with `julia -t 4`.
 
-## Tests
+## Setup and tests
+
+The environment in `../bench` (`Project.toml`) develops `../dev/WL`, `../dev/BSBC` and this
+package together with CUDA. All benchmark and validation scripts live there.
 
 ```
-julia --project=<env with WaterLily, BiotSavartBCs, CUDA, TurboLily> test/runtests.jl
+cd ../bench
+julia --project=. ../TurboLily/test/runtests.jl     # 52 equivalence tests, about 4 min
+julia --project=. bench.jl                          # WHICH=WL,T,B,TB  N=128
 ```

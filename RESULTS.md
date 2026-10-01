@@ -20,6 +20,36 @@ and has the same pressure-iteration counts as this stack. One RTX 2080 Ti, ms pe
 | Biot-Savart, sphere | 320×128×128 | 32.34 | 9.59 | 3.4× |
 | Biot-Savart, sphere | 480×192×192 | 98.86 | 30.80 | 3.2× |
 
+Size sweep (`bench_stack/sweep.jl`), sphere Re=3700, ms per step (peak GPU memory):
+
+| WaterLily grid | cells | stack | TurboLily | speedup |
+|---|---|---|---|---|
+| 64×32×32 | 0.07M | 4.38 | 0.92 | 4.8× |
+| 128×64×64 | 0.52M | 4.64 | 1.32 | 3.5× |
+| 192×96×96 | 1.8M | 8.76 | 2.69 | 3.3× |
+| 256×128×128 | 4.2M | 18.57 | 5.68 | 3.3× |
+| 384×192×192 | 14.2M | 58.32 | 18.66 | 3.1× |
+| 512×256×256 | 33.6M | 142.9 | 41.0 | 3.5× |
+| 576×288×288 | 47.8M | 219.2 | 58.7 | 3.7× |
+| 640×320×320 | 65.5M (8.7 GB) | 299.3 | 79.7 | 3.8× |
+
+| Biot-Savart grid | cells | stack | TurboLily | speedup |
+|---|---|---|---|---|
+| 80×32×32 | 0.08M | 4.68 | 1.81 | 2.6× |
+| 120×48×48 | 0.28M | 4.42 | 1.71 | 2.6× |
+| 160×64×64 | 0.66M | 6.67 | 2.53 | 2.6× |
+| 240×96×96 | 2.2M | 15.13 | 4.81 | 3.1× |
+| 320×128×128 | 5.2M | 31.80 | 9.80 | 3.2× |
+| 400×160×160 | 10.2M | 62.56 | 20.28 | 3.1× |
+| 480×192×192 | 17.7M | 101.98 | 34.52 | 3.0× |
+| 560×224×224 | 28.1M | 173.4 | 48.6 | 3.6× |
+| 640×256×256 | 41.9M (6.8 GB) | 258.2 | 74.3 | 3.5× |
+
+Below about 1M cells both codes are limited by launch and synchronisation overhead, not by
+the GPU. The reference stays at a floor of about 4.4 ms/step, TurboLily at about 0.9 ms
+(plain) and 1.7 ms (Biot-Savart). Above about 2M cells both run near memory bandwidth, so the
+ratio levels off at 3.1-3.8×. TurboLily needs the same memory as the reference (+2-6 %).
+
 Long runs, sphere Re=3700, 192×96×96, t = 0…20:
 
 | | wall | steps | mean C_d (t>10) |

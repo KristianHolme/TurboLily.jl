@@ -353,9 +353,20 @@ function graphed!(f::F, p::TPoisson, key) where F
     if ex !== nothing
         CUDA.launch(ex); swap_levels!(p)
     elseif k in p.seen
-        ex = CUDA.instantiate(CUDA.capture(f))
-        p.graphs[k] = ex
-        CUDA.launch(ex)
+        state = [(lv.r, lv.ϵ) for lv in p.levels]
+        g = try
+            CUDA.capture(f; flags=CUDA.STREAM_CAPTURE_MODE_THREAD_LOCAL, throw_error=false)
+        catch
+            nothing
+        end
+        if g === nothing   # capture failed: restore the buffers and run normally
+            for (lv, (r, ϵ)) in zip(p.levels, state); lv.r, lv.ϵ = r, ϵ; end
+            f()
+        else
+            ex = CUDA.instantiate(g)
+            p.graphs[k] = ex
+            CUDA.launch(ex)
+        end
     else
         push!(p.seen, k); f()
     end

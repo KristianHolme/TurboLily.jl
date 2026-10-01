@@ -21,17 +21,19 @@ The arrays always live on the current CUDA device (`mem` is ignored) and `T` mus
 ## Speed
 
 All results are from one RTX 2080 Ti, Float32, in ms per time step. The flow is a sphere at
-Re=3700 (`D = N/2`, 256×128×128, 4.2M cells) unless noted. The comparison is against WaterLily
-`main` and BiotSavartBCs `master` on the same GPU. See `RESULTS.md` for the full tables.
+Re=3700 (`D = N/2`, 256×128×128, 4.2M cells) unless noted. The comparison is against
+WaterLily#337 + BiotSavartBCs#13+#14 on the same GPU. See `RESULTS.md` for the full tables,
+including the earlier comparison against WaterLily master / BiotSavartBCs main.
 
-| case | reference | TurboLily | speedup |
+| case | stack | TurboLily | speedup |
 |---|---|---|---|
-| WaterLily, static body | 19.3 | 6.1 | 3.2× |
-| WaterLily, moving body (`remeasure=true`) | 23.0 | 8.2 | 2.8× |
-| WaterLily, 512×256×256 (33.6M cells) | 147.6 | 41.0 | 3.6× |
-| Biot-Savart, static body | 53.9 | 10.8 | 5.0× |
-| Biot-Savart, moving body | 66.8 | 14.4 | 4.6× |
-| Biot-Savart, 480×192×192 (17.7M cells) | 179.0 | 34.1 | 5.2× |
+| WaterLily, static body | 18.9 | 6.0 | 3.2× |
+| WaterLily, moving body (`remeasure=true`) | 22.8 | 8.4 | 2.7× |
+| WaterLily, 512×256×256 (33.6M cells) | 143.0 | 41.4 | 3.5× |
+| WaterLily, TGV 256³ | 74.0 | 20.1 | 3.7× |
+| Biot-Savart, static body | 26.7 | 8.7 | 3.1× |
+| Biot-Savart, moving body | 29.8 | 10.8 | 2.8× |
+| Biot-Savart, 480×192×192 (17.7M cells) | 98.9 | 30.8 | 3.2× |
 
 The speedup grows with problem size, and it is largest for Biot-Savart BCs. The long runs
 below show 4.8× and 5.4× over a developed flow.

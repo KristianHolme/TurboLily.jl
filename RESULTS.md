@@ -1,5 +1,39 @@
 # Benchmarks
 
+## Against WaterLily#337 + BiotSavartBCs#13+#14 (`bench_stack/`)
+
+Reference: WaterLily PR #337 (3f1de92, on 55b2f5d) and BiotSavartBCs PR #14 (5aeb5c5, which
+contains #13). TurboLily follows #13's stopping criterion (`max|r| < 2e-3`, `Σ|r|/N < 2e-4`)
+and has the same pressure-iteration counts as this stack. One RTX 2080 Ti, ms per step.
+
+| case | grid | stack | TurboLily | speedup |
+|---|---|---|---|---|
+| WaterLily, sphere | 256×128×128 | 18.86 | 5.97 | 3.2× |
+| WaterLily, moving sphere (`remeasure=true`) | 256×128×128 | 22.78 | 8.39 | 2.7× |
+| WaterLily, 2D circle | 1024×512 | 3.32 | 1.26 | 2.6× |
+| WaterLily, sphere | 512×256×256 | 143.0 | 41.4 | 3.5× |
+| WaterLily, TGV | 256³ | 73.97 | 20.09 | 3.7× |
+| Biot-Savart, sphere | 256×128×128 | 26.65 | 8.66 | 3.1× |
+| Biot-Savart, moving sphere | 256×128×128 | 29.82 | 10.78 | 2.8× |
+| Biot-Savart, 2D circle | 1024×512 | 4.63 | 2.25 | 2.1× |
+| Biot-Savart, sphere | 160×64×64 | 8.18 | 2.56 | 3.2× |
+| Biot-Savart, sphere | 320×128×128 | 32.34 | 9.59 | 3.4× |
+| Biot-Savart, sphere | 480×192×192 | 98.86 | 30.80 | 3.2× |
+
+Long runs, sphere Re=3700, 192×96×96, t = 0…20:
+
+| | wall | steps | mean C_d (t>10) |
+|---|---|---|---|
+| BiotSavartBCs#14 | 21.2 s | 1165 | 0.3890 |
+| TurboLily.BiotSimulation | 5.2 s (4.1×) | 1165 | 0.3892 |
+| WaterLily#337 | 13.1 s | 852 | 0.4141 |
+| TurboLily.Simulation | 2.5 s (5.2×) | 852 | 0.4141 |
+
+## Against WaterLily master + BiotSavartBCs main (earlier runs, `bench/`)
+
+These used BiotSavartBCs' old stopping criterion (`Σr² < 1e-4`), so the Biot-Savart iteration
+counts differ from the stack above.
+
 The hardware is one NVIDIA RTX 2080 Ti (11 GB, sm_75) with Julia 1.13.1, CUDA.jl 6.4 and Float32.
 The references are WaterLily `main` (4da089f, with the GPU fix for `mom_project!`, see below)
 and BiotSavartBCs `master` (6ffe945), run on the same GPU. Timings are wall-clock ms per time
@@ -49,9 +83,23 @@ TurboLily 20.4 ms/step (3.8×).
   (≈ 0.45 ms each), 3 incremental FMM updates (≈ 0.1 ms each), vorticity (≈ 0.3 ms per
   projection), and the boundary updates.
 
-## WaterLily GPU fix
+## WaterLily master does not run on GPUs
 
-WaterLily `main` at 4da089f (PR #328, "deforming body source") no longer runs on GPUs. The
-call `δv(b,I)` inside `@inside` passes the `MultiLevelPoisson` struct into a kernel. The local
-checkout in `dev/WL` has a 3-line fix that reads the diagonal array instead. TurboLily does not
-depend on this fix.
+WaterLily `master` at 4da089f (merge of PR #328, "deforming body source", 2026-09-30) fails
+in the first `sim_step!` of every GPU simulation, with or without a body:
+
+```
+KernelError: passing non-bitstype argument
+Argument 5 to your kernel function is of type MultiLevelPoisson{Float32, CuArray{…}, …}, which is not a bitstype
+```
+
+`mom_project!` now does `@inside b.z[I] = div(I,a.u)-δv(b,I)*div(I,a.V)`. `@loop` passes
+every symbol in the expression to the kernel, including `b` (the `MultiLevelPoisson`). That
+struct holds `CuArray`s and a `Vector`, and it has no Adapt rule, so CUDA cannot convert it.
+On the CPU the KA backend accepts any argument, so the CPU tests pass. The example scripts
+default to `mem=Array`, so they also run.
+
+The fix: take the array outside the loop, `Dp = levels[1].D`, and use
+`(1+Dp[I]/2D)` in the kernel. The checkout in `dev/WL` has this 3-line fix; it is the
+WaterLily used in `bench/`. WaterLily#337 is based on 55b2f5d, before #328, so it is not
+affected. BiotSavartBCs and TurboLily replace `mom_project!` and never hit this code.

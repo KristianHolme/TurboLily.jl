@@ -33,7 +33,10 @@ oscillating(which; n=96, m=48, R=6f0) = (c = SA[m/2f0, m/2f0]; z = 0f0;
 Ufun(i,x,t) = i==1 ? 1f0 - exp(-t/5f0) : 0f0
 function tgv(which; L=32, Re=1600)
     κ = Float32(2π/L)
-    uλ(i, xyz) = (x, y, z = @. (xyz - 1)*κ; i == 1 ? -sin(x)*cos(y)*cos(z) : i == 2 ? cos(x)*sin(y)*cos(z) : zero(eltype(xyz)))
+    function uλ(i, xyz)
+        x, y, z = @. (xyz - 1)*κ
+        return i == 1 ? -sin(x)*cos(y)*cos(z) : i == 2 ? cos(x)*sin(y)*cos(z) : zero(eltype(xyz))
+    end
     ctor(which)((L,L,L), (0,0,0), 1/κ; U=1, u0=uλ, ν=1/(κ*Re), T, perdir=(1,2,3))
 end
 

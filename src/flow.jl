@@ -59,6 +59,7 @@ mutable struct TFlow{D,T,Sf<:AbstractArray{T},Vf<:AbstractArray{T},Tf<:AbstractA
 end
 
 function TFlow(N::NTuple{D}, uBC; T=Float32, mem=CuArray, kw...) where D
+    T === Float32 || throw(ArgumentError("TurboLily supports T=Float32 only (got T=$T)"))
     f = WaterLily.Flow(N, uBC; T, mem=CuArray, kw...)
     bc = f.uBC isa Function ? f.uBC : ConstBC{D,T}(T.(f.uBC))
     acc = make_acc(f.g, f.uBC)

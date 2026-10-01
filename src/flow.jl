@@ -53,6 +53,7 @@ mutable struct TFlow{D,T,Sf<:AbstractArray{T},Vf<:AbstractArray{T},Tf<:AbstractA
     nshell :: Int
     Vzero :: Bool               # true when V ≡ 0 (skip div(V) source)
     red :: RedBuf
+    aux :: Union{Nothing,Vf}    # extra vector buffer for the udf path (allocated on first use)
     near :: CuArray{UInt8,D}    # cells inside the measure band at the last measure!
     mstat :: CuVector{Int32}    # [nband, nshell, V≠0] from the last measure!
 end
@@ -65,7 +66,7 @@ function TFlow(N::NTuple{D}, uBC; T=Float32, mem=CuArray, kw...) where D
     a = TFlow{D,T,typeof(f.p),typeof(f.u),typeof(f.μ₁),typeof(f.λ),typeof(bc),typeof(acc)}(
         f.u, f.u⁰, f.f, f.p, f.σ, f.V, f.μ₀, f.μ₁, f.uBC, f.Δt, f.ν, f.g, f.exitBC, f.perdir, f.λ,
         bc, acc, Grid(f.p), per, CuVector{Int32}(undef,1024), CuVector{Int32}(undef,1024), 0, 0, true,
-        RedBuf(Grid(f.p)), (n = similar(f.p, UInt8); fill!(n, 0x01); n), CUDA.zeros(Int32, 4))
+        RedBuf(Grid(f.p)), nothing, (n = similar(f.p, UInt8); fill!(n, 0x01); n), CUDA.zeros(Int32, 4))
     return a
 end
 
@@ -481,7 +482,84 @@ function WaterLily.mom_step!(a::TFlow{D,T}, b::AbstractPoisson; udf=nothing, kwa
     push!(a.Δt, WaterLily.CFL(a))
 end
 
-# udf path: materialize r in `f` so the user function can modify it (WaterLily semantics)
+# ---------------------------------------------------------------- udf path
+# The user function modifies `flow.f` between the convective RHS and the BDIM update
+# (WaterLily.mom_predict!/mom_correct! semantics), so r is materialised in `f`.
+function k_rhs!(lo, hi, f, u, g::Grid{D}, λ::F, ν::T, per) where {D,T,F}
+    I, ok = cellidx(lo, hi); ok || return
+    l = lin(g, I)
+    @unroll for i in i32:Int32(D)
+        @inbounds f[l + (i-i32)*g.nc] = rconv(i, I, l, u, g, λ, ν, per)
+    end
+    return nothing
+end
+# f̃ = u⁰ + Δt(f + acc) - V from the stored RHS
+@inline ftilde_f(i, I, l, f, u0, V, g::Grid, dt::T, acc, t) where T =
+    @fastmath @inbounds u0[l+(i-i32)*g.nc] + dt*(f[l+(i-i32)*g.nc] + accel(acc, i, I, t, T)) - V[l+(i-i32)*g.nc]
+function k_bdim_plain!(lo, hi, out, uin, f, u0, V, g::Grid{D}, dt::T, acc::A, t::T, corr::Bool) where {D,T,A}
+    I, ok = cellidx(lo, hi); ok || return
+    l = lin(g, I)
+    @unroll for i in i32:Int32(D)
+        li = l + (i-i32)*g.nc
+        v = ftilde_f(i, I, l, f, u0, V, g, dt, acc, t) + @inbounds(V[li])
+        @inbounds out[li] = corr ? T(0.5)*(uin[li] + v) : v
+    end
+    return nothing
+end
+function k_bdim_list!(n, list, out, uin, f, u0, V, μ₀, μ₁, g::Grid{D}, dt::T, acc::A, t::T, corr::Bool) where {D,T,A}
+    k = tid1(); k <= n || return
+    li = @inbounds list[k]
+    iv = (li - i32) ÷ g.nc + i32
+    args = (li, out, uin, f, u0, V, μ₀, μ₁, g, dt, acc, t, corr)
+    if iv == 1
+        bdim_face!(Val(Int32(1)), args...)
+    elseif iv == 2
+        bdim_face!(Val(Int32(2)), args...)
+    elseif D == 3
+        bdim_face!(Val(Int32(3)), args...)
+    end
+    return nothing
+end
+@inline function bdim_face!(::Val{i}, li, out, uin, f, u0, V, μ₀, μ₁, g::Grid{D}, dt::T, acc, t, corr) where {i,D,T}
+    l = li - (i-i32)*g.nc
+    I = coords(g, l)
+    f0 = ftilde_f(i, I, l, f, u0, V, g, dt, acc, t)
+    m = zero(T)
+    @unroll for j in i32:Int32(D)
+        μ = @inbounds μ₁[li + (j-i32)*D*g.nc]
+        if μ != 0
+            m += μ*(ftilde_f(i, shift(I,j,1), l+g.s[j], f, u0, V, g, dt, acc, t) -
+                    ftilde_f(i, shift(I,j,-1), l-g.s[j], f, u0, V, g, dt, acc, t))
+        end
+    end
+    @fastmath v = m*T(0.5) + @inbounds(V[li]) + @inbounds(μ₀[li])*f0
+    @inbounds out[li] = corr ? T(0.5)*(uin[li] + v) : v
+    return nothing
+end
+function udf_update!(a::TFlow{D,T}, out, uin, t, corr, udf; kwargs...) where {D,T}
+    g, dt = a.grid, a.Δt[end]
+    launch(k_rhs!, ntuple(_->1,D), Int.(g.n), a.f, uin, g, a.λ, a.ν, a.per)
+    WaterLily.udf!(a, udf, uin, t; kwargs...)
+    launch(k_bdim_plain!, inside_lo(g), inside_hi(g), out, uin, a.f, a.u⁰, a.V, g, dt, a.acc, T(t), corr)
+    for (n, list) in ((a.nband, a.band), (a.nshell, a.shell))
+        launch1(k_bdim_list!, n, list, out, uin, a.f, a.u⁰, a.V, a.μ₀, a.μ₁, g, dt, a.acc, T(t), corr)
+    end
+end
 function mom_step_udf!(a::TFlow{D,T}, b::AbstractPoisson; udf, kwargs...) where {D,T}
-    error("TurboLily: udf is not supported yet")
+    a.aux === nothing && (a.aux = similar(a.u))
+    a.u, a.u⁰ = a.u⁰, a.u
+    copy_exit!(a, a.u, a.u⁰)
+    t₁ = sum(a.Δt); t₀ = t₁ - a.Δt[end]
+    @log "p"
+    udf_update!(a, a.u, a.u⁰, t₀, false, udf; kwargs...)
+    BC!(a, a.u, t₁)
+    a.exitBC && exitBC!(a, a.u, a.u⁰, a.Δt[end])
+    WaterLily.mom_project!(a, b, 1, t₁)
+    @log "c"
+    udf_update!(a, a.aux, a.u, t₁, true, udf; kwargs...)
+    copy_exit!(a, a.aux, a.u)
+    a.u, a.aux = a.aux, a.u
+    BC!(a, a.u, t₁)
+    WaterLily.mom_project!(a, b, 0.5, t₁)
+    push!(a.Δt, WaterLily.CFL(a))
 end

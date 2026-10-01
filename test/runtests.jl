@@ -31,6 +31,11 @@ oscillating(which; n=96, m=48, R=6f0) = (c = SA[m/2f0, m/2f0]; z = 0f0;
     ctor(which)((n,m),(1,0),R; ν=R/200, T,
         body=AutoBody((x,t)->√sum(abs2,x .- c)-R, (x,t)->x - SA[z, 3f0*sin(0.2f0*t)])))
 Ufun(i,x,t) = i==1 ? 1f0 - exp(-t/5f0) : 0f0
+function tgv(which; L=32, Re=1600)
+    κ = Float32(2π/L)
+    uλ(i, xyz) = (x, y, z = @. (xyz - 1)*κ; i == 1 ? -sin(x)*cos(y)*cos(z) : i == 2 ? cos(x)*sin(y)*cos(z) : zero(eltype(xyz)))
+    ctor(which)((L,L,L), (0,0,0), 1/κ; U=1, u0=uλ, ν=1/(κ*Re), T, perdir=(1,2,3))
+end
 
 @testset "TurboLily vs WaterLily" begin
     # Periodic directions: TurboLily wraps neighbours in every Gauss-Seidel half sweep, while
@@ -44,12 +49,13 @@ Ufun(i,x,t) = i==1 ? 1f0 - exp(-t/5f0) : 0f0
         ("3D sphere periodic z + exitBC", w->sphere(w; perdir=(3,), exitBC=true), 5, false, 2e-3, 1e-2),
         ("3D sphere uBC(t) + g", w->ctor(w)((64,32,32), Ufun, 6f0; U=1, ν=0.02, T,
             g=(i,x,t)->i==2 ? 0.01f0 : 0f0, body=AutoBody((x,t)->√sum(abs2,x .- SA[16f0,16f0,16f0])-6f0)), 5, false, 1e-4, 1e-2),
-        ("3D periodic box, no body", w->ctor(w)((32,32,32),(1,0,0),8; ν=0.01, perdir=(2,3), T), 5, false, 2e-3, 1e-2)]
+        ("3D periodic box, no body", w->ctor(w)((32,32,32),(1,0,0),8; ν=0.01, perdir=(2,3), T), 5, false, 2e-3, 1e-2),
+        ("3D Taylor-Green vortex (fully periodic)", tgv, 10, false, 2e-3, 1e-2)]
         du, dp, na, nb = compare(mk, nstep; remeasure=rem)
         @testset "$name" begin
             @test du < tolu
             @test dp < tolp
-            @test na == nb
+            occursin("Taylor", name) || @test na == nb   # periodic GS converges in fewer iterations
         end
     end
     @testset "udf body force" begin

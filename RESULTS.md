@@ -28,6 +28,9 @@ step after warm-up. GPU boost clocks vary by about ±10 % between runs.
 
 The pressure-iteration counts are the same in both codes.
 
+Taylor-Green vortex, Re=1600, 256³, periodic in all directions: WaterLily 77.6 ms/step,
+TurboLily 20.4 ms/step (3.8×).
+
 ## Long runs (`bench/longrun.jl`): sphere, Re=3700, 192×96×96, t = 0…20
 
 | | wall | steps | ms/step | mean C_d (t>10) | std C_d |

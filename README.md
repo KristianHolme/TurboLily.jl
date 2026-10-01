@@ -59,49 +59,106 @@ Long runs of a sphere at Re=3700, 192×96×96, t = 0…20:
 | WaterLily | 13.0 s | 852 | 0.4140 |
 | TurboLily.Simulation | 2.7 s (4.8×) | 852 | 0.4142 |
 
-## How it is faster
+## What changed relative to the reference
 
-The discretisation and the solvers are WaterLily's (QUICK/CDS convection, BDIM, the
-predictor-corrector step, the multigrid V-cycle with Jacobi pre-smoothing, the red-black
-Gauss-Seidel post-smoother and adaptive ω, the tolerances, and BiotSavartBCs' FMℓM). The
-changes are in how the step runs on the GPU:
+The discretisation and the solvers are WaterLily's and BiotSavartBCs': QUICK/CDS convection,
+BDIM, the predictor-corrector step, the multigrid V-cycle with Jacobi pre-smoothing, red-black
+Gauss-Seidel post-smoothing and adaptive ω, the stopping criteria (BiotSavartBCs#13), and the
+FMℓM Biot-Savart sum. The changes fall into three groups.
 
-- **Momentum.** One kernel per phase computes conv-diff, acceleration and the BDIM
-  update for all components. Each convective flux evaluates its upwind stencil once
-  (selected before `λ`) through a branch-free interior path. BDIM runs only on precomputed
-  lists of the body-band faces. `u⁰ ← u` is a pointer swap, not a copy.
-- **Pressure.**
-  - Cells where all faces have L=1 are flagged in a 1-byte array. The stencil there is
-    implied, which cuts the memory traffic of every multigrid operator.
-  - Fused kernels: Jacobi; prolongation and increment; residual with the global correction
-    applied lazily; norms inside the increment. The pressure is solved for directly in
-    physical units, so there are no `x .*= Δt` passes.
-  - One host synchronisation per V-cycle. ω and the solver state live on the device, and
-    each V-cycle is a cached CUDA graph.
-- **Biot-Savart BCs.**
-  - Within one projection the pressure is cumulative and `u` is projected only once at the
-    end.
-  - The vorticity of the projected field is updated only where `curl(L∇p) ≠ 0`. The centred
-    curl of a discrete gradient is exactly zero wherever L=1, so this is only next to the body.
-  - After the first FMM of each projection, the FMM is evaluated only on Δω, clipped to the
-    body's bounding box on each level.
-  - The global flux fix and Σr² are updated from the boundary cells, because Σr is invariant
-    under the multigrid iterations.
-  - Level-2 vorticity is summed straight from the curl of `u`. Level-1 vorticity is computed
-    only in the boundary layer that the level-1 interactions read.
-- **measure!.** One fused kernel measures the sdf everywhere but only rewrites cells that are,
-  or were, in the body band. Band lists are built with warp-aggregated atomics, and the
-  Poisson coefficients are updated on the device. A static body remeasured every step (the
-  `sim_step!` default) costs about 1.5 ms at 4.2M cells.
+### 1. Algorithmic changes (same result in exact arithmetic, less work)
 
-## Differences from the reference
+These skip work that provably cannot change the result. Each relies on a property of the
+discrete operators, and the property must be preserved by future changes to those operators.
 
-- Periodic directions: the Gauss-Seidel sweeps wrap periodic neighbours in every half sweep.
-  WaterLily refreshes the periodic ghost cells only between smoother calls. The results agree
-  to the solver tolerance, not to rounding.
-- `fmm=false` (the tree sum) is not implemented, and overriding `BiotSavartBCs.symmetry` has
-  no effect.
-- Float32 and CUDA only.
+- **Vorticity only near the body (Biot-Savart).** During a projection `u = u* − Δt·L∇p`. The
+  centred curl of a discrete gradient is identically zero, so ω changes only in cells whose
+  curl stencil reads a face with L ≠ 1, that is, next to the body. Only those cells, and their
+  level-2 parents, are recomputed after each pressure update.
+  *Relies on:* this exact curl stencil and velocity update; μ₀ being exactly 1 away from the
+  body; interior `u` not changing between Biot updates.
+  `bench_stack/check_vort.jl` compares this against the direct computation.
+- **Incremental FMM.** The Biot-Savart sum is linear in ω. After the first full evaluation in
+  a projection, later updates sum only Δω, clipped to the bounding box of the changed cells on
+  each level.
+- **Level-1 vorticity only in the boundary layer.** The level-1 interactions read sources at
+  most 6 cells (3D) or 10 cells (2D) from the boundary, and level 2 is summed directly from the
+  curl. *Relies on:* the layer width matching the FMM near-field radius (`close`), with one
+  cell of margin.
+- **Cumulative pressure, one projection at the end.** The multigrid continues on the total p
+  instead of resetting x = 0 each Biot iteration, and `u` is projected once at the end. The
+  residual `z − A·p` is the same in both forms.
+- **Boundary-only residual updates (Biot-Savart).** A Biot update changes the residual only in
+  the cells next to the boundary. So Σ|r| and max|r| are updated from those cells: the
+  multigrid reports the max over all other cells. Σr is invariant under multigrid (Σ(Aϵ) = 0 by
+  telescoping, with L = 0 on the domain faces), so the global flux fix needs only the net
+  boundary flux change.
+- **Pressure solved in physical units.** `A p = z/Δt` with the tolerances scaled by Δt,
+  instead of solving for `x = Δt·p`. This removes two scaling passes per projection.
+- **Lazy residual correction.** WaterLily's `residual!` subtracts the mean residual from the
+  solved rows. TurboLily applies that correction inside the first Jacobi kernel, instead of
+  in a separate pass.
+- **`measure!` touches only the body band.** Cells far from the body keep μ₀ ∈ {0,1}, μ₁ = 0
+  and V = 0, so only cells that are in the band now or were in it at the last measure are
+  rewritten. WaterLily resets μ₀, μ₁ and V everywhere. *Relies on:* the assumption listed
+  in group 3.
+
+### 2. Computational changes (same arithmetic, faster execution)
+
+- **Fused kernels.**
+  - Momentum: one kernel per phase computes conv-diff, acceleration and the update for all
+    components. BDIM runs only on precomputed lists of band faces, and faces inside the body
+    reduce to `u = V`.
+  - Multigrid: Jacobi in one kernel; prolongation fused with the increment; the first
+    Gauss-Seidel half sweep fused with ϵ = r·iD; norms computed inside the increment.
+  - Biot-Savart: residual and source in one kernel; vorticity curl and restriction in one.
+- **Compressed Poisson stencil.** A 1-byte flag marks cells whose faces all have L = 1, so
+  L, D and iD are not read from memory there. This cuts the traffic of every multigrid operator.
+- **Branch-free fast paths.**
+  - Convective fluxes: the upwind stencil is selected before `λ`, so `λ` is evaluated once
+    per face. The general boundary-face code runs only on the domain-boundary faces.
+  - FMM: x-lines are split around the near-field hole, with a compile-time component
+    (from BiotSavartBCs#14).
+  - BDIM: compile-time component dispatch.
+- **Fewer copies and host synchronisations.**
+  - `u⁰ ← u` is a pointer swap.
+  - Reductions use per-block partials with no atomics, and are read by the host once per
+    V-cycle. The adaptive ω and the solver state live on the device.
+  - Each multigrid iteration is replayed as a CUDA graph.
+  - Band lists are built with warp-aggregated atomics instead of `findall`.
+- **GPU-specific details.** Int32 index arithmetic; loops over dimensions fully unrolled so
+  no tuple ends up in local memory; face kernels laid out over the two in-plane directions
+  (the same issue as WaterLily#337); FMM lanes split over sources on coarse levels with few
+  targets.
+
+### 3. Where results are not identical to the reference
+
+- **Floating-point rounding.** Groups 1 and 2 change the order of operations: reductions use
+  Float64 block sums, the FMM uses `rsqrt` and a different summation order, and vorticity
+  and pressure are accumulated incrementally. Velocities therefore agree with the reference
+  to rounding, not bit for bit. The 3D flows amplify these differences exactly as they
+  amplify a 1e-6 perturbation of the reference itself.
+  - The pressure in cells partly blocked by the body is ill-conditioned and can differ by
+    up to about 0.1 (it also differs between two runs of the reference).
+  - With Biot-Savart BCs the pressure can differ by a uniform constant of about 1e-3 (the
+    gauge). This does not change the velocity or the pressure force on a closed body.
+  - The incremental updates assume Σr stays zero through the multigrid instead of
+    recomputing it as BiotSavartBCs does; the difference in the flux fix is around 1e-9.
+- **Periodic directions use a slightly different smoother.** TurboLily's Gauss-Seidel wraps
+  periodic neighbours in every half sweep. WaterLily refreshes the periodic ghosts only
+  between smoother calls, so its sweeps read stale ghost values. Results agree to the
+  solver tolerance (about 2e-4) rather than to rounding. With a tight tolerance in both codes
+  they agree to 1e-6, and TurboLily needs one V-cycle fewer.
+- **Body motion assumption in `measure!`.** A cell is rewritten only if it is in the body
+  band (|d| < 2+ϵ) now or was at the previous measure. If a body moves more than about
+  3 cells between two measures (a jump, not CFL-limited motion), a cell could go from deep
+  inside to far outside without being rewritten, and would keep μ₀ = 0. WaterLily has no
+  such assumption.
+- **WaterLily version semantics.** TurboLily follows WaterLily master's `residual!` and
+  #328's deforming-body source term. WaterLily#337 is based on an older master without them.
+  For static bodies the source term is zero and the test suite agrees with both.
+- **Not implemented:** `fmm=false` (the tree sum), and overriding `BiotSavartBCs.symmetry`
+  for image vortices. Float32 and CUDA only.
 
 ## Multi-GPU
 

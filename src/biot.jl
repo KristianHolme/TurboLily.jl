@@ -392,28 +392,6 @@ function k_biotbc!(n, tar, u, uv, r, U, g::Grid, resid::Bool)
     @inbounds u[lu] = un
     return nothing
 end
-# global flux fix: u[face] += fix·(lower ? 1 : -1), r[adjacent] -= fix, fix = Σr/ntar
-function k_fixresid!(n, tar, u, r, sums, g::Grid)
-    k = tid1(); k <= n || return
-    fix = Float32(@inbounds(sums[1])) / Float32(n)
-    li = @inbounds tar[k]
-    i, l, lower = face_of(li, g)
-    lu = (lower ? l + g.s[i] : l) + (i-i32)*g.nc
-    @inbounds u[lu] += fix*(lower ? 1f0 : -1f0)
-    CUDA.@atomic r[lower ? l + g.s[i] : l - g.s[i]] -= fix
-    return nothing
-end
-function k_sum!(lo, hi, ps, pm, r, g::Grid)
-    I, ok = cellidx(lo, hi)
-    s = ok ? @inbounds(r[lin(g, I)]) : 0f0
-    block_partial!(ps, pm, s, 0f0)
-    return nothing
-end
-function fix_resid!(b::TBiotPoisson, u, r)
-    g = b.g[1]
-    red_launch(k_sum!, ntuple(_->1, length(g.n)), Int.(g.n), b.red, 1, r, g)
-    launch1(k_fixresid!, length(b.tar[1]), b.tar[1], u, r, b.red.s, g)
-end
 function k_sumsq!(lo, hi, ps, pm, r, g::Grid)
     I, ok = cellidx(lo, hi)
     v = ok ? @inbounds(r[lin(g, I)]) : 0f0
@@ -425,38 +403,6 @@ function L₂!(b::TBiotPoisson, r)
     red_launch(k_sumsq!, ntuple(_->1, length(g.n)), Int.(g.n), b.red, 4, r, g)
     fetch!(b.red)
     return getsum(b.red, 4), getmax(b.red, 4)
-end
-# r = iD==0 ? 0 : div(u) (interior), 0 on ghosts
-function k_divres!(lo, hi, r, u, op::Op{D}) where D
-    I, ok = cellidx(lo, hi); ok || return
-    g = op.g; l = lin(g, I)
-    interior = true
-    @unroll for d in i32:Int32(D)
-        interior &= (I[d] > i32) & (I[d] < g.n[d])
-    end
-    v = 0f0
-    if interior && getiD(op, l) != 0
-        @unroll for i in i32:Int32(D)
-            ci = (i-i32)*g.nc
-            @inbounds v += u[l+g.s[i]+ci] - u[l+ci]
-        end
-    end
-    @inbounds r[l] = v
-    return nothing
-end
-# u -= L∂x ; pacc += x   (BiotSavartBCs.project_update!, x is then logically zero)
-function k_projupd!(lo, hi, u, x, pacc, op::Op{D}) where D
-    I, ok = cellidx(lo, hi); ok || return
-    g = op.g
-    l = lin(g, I)
-    rg = isreg(op, l)
-    @unroll for i in i32:Int32(D)
-        ci = (i-i32)*g.nc
-        L = rg ? op.Lreg : @inbounds(op.L[l+ci])
-        @inbounds u[l+ci] -= L*(x[l]-x[l-g.s[i]])
-    end
-    @inbounds pacc[l] += x[l]
-    return nothing
 end
 
 # Incompressible & irrotational ghosts (BiotSavartBCs.pflowBC!), one pass per normal direction i

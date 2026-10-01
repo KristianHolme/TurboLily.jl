@@ -27,7 +27,7 @@ struct TBiotPoisson{T,S,V,D,P<:TPoisson,W,G,W1} <: AbstractPoisson{T,S,V}
     perdir :: NTuple
     fmm :: Bool
     red :: RedBuf
-    lists :: Vector{CuVector{Int32}}  # [A1, A2, B]: affected layer cells, affected level-2 cells, boundary-adjacent cells
+    lists :: Vector{CuVector{Int32}}  # [A1, A2, B]: affected layer cells, affected level-2 cells, cells next to the boundary
     dω :: W1                          # Δω on all levels (level 1 first) for incremental FMM updates
     boxes :: Vector{Any}              # per level (lo,hi) bounding box of Δω
     mask :: CuArray{UInt8,D}          # affected-cell mask on level 1
@@ -43,9 +43,9 @@ function TBiotPoisson(flow::TFlow{D,T}; nonbiotfaces=(), fmm=true) where {D,T}
     tars = BiotSavartBCs.collect_targets(ml, nonbiotfaces)
     tar = [CuVector{Int32}(Int32.(LinearIndices(size(ml[l]))[tars[l]])) for l in eachindex(ml)]
     p = copy(flow.p)
-    B = unique(vcat([Int32[let I = CartesianIndex(Tuple(Ti)[1:D]), i = Tuple(Ti)[D+1]
-            LinearIndices(size(flow.p))[I[i] == 1 ? I + CartesianIndex(ntuple(d->d==i, D)) : I - CartesianIndex(ntuple(d->d==i, D))]
-        end for Ti in tars[1]]]...))
+    # cells next to the domain boundary (the only cells whose residual a Biot update changes)
+    n = size(flow.p)
+    B = Int32[LinearIndices(n)[I] for I in CartesianIndices(map(m->2:m-1, n)) if any(d->I[d]==2 || I[d]==n[d]-1, 1:D)]
     dω = map(a->(z = similar(a); fill!(z, 0); z), Tuple(ml))
     b = TBiotPoisson{T,typeof(flow.p),typeof(flow.μ₀),D,typeof(pois),typeof(ω),typeof(g),typeof(dω)}(
         pois, pois.x, pois.L, pois.z, ω, g, tar, p, pois.n, flow.perdir, fmm, pois.red,
@@ -392,15 +392,16 @@ function k_biotbc!(n, tar, u, uv, r, U, g::Grid, resid::Bool)
     @inbounds u[lu] = un
     return nothing
 end
-function k_sumsq!(lo, hi, ps, pm, r, g::Grid)
+function k_norms!(lo, hi, ps, pm, r, g::Grid)
     I, ok = cellidx(lo, hi)
-    v = ok ? @inbounds(r[lin(g, I)]) : 0f0
-    block_partial!(ps, pm, v*v, abs(v))
+    v = ok ? abs(@inbounds(r[lin(g, I)])) : 0f0
+    block_partial!(ps, pm, v, v)
     return nothing
 end
-function L₂!(b::TBiotPoisson, r)
+"Σ|r| and max|r| over the whole level-1 residual."
+function norms!(b::TBiotPoisson, r)
     g = b.g[1]
-    red_launch(k_sumsq!, ntuple(_->1, length(g.n)), Int.(g.n), b.red, 4, r, g)
+    red_launch(k_norms!, ntuple(_->1, length(g.n)), Int.(g.n), b.red, 4, r, g)
     fetch!(b.red)
     return getsum(b.red, 4), getmax(b.red, 4)
 end
@@ -512,17 +513,17 @@ function k_addtar!(n, tar, a, d)
     @inbounds a[li] += d[li]
     return nothing
 end
-# Σr² over a cell list (block partials)
-function k_listsq!(n, ps, pm, list, r)
+# Σ|r| and max|r| over a cell list (block partials)
+function k_listnorms!(n, ps, pm, list, r)
     k = tid1()
-    v = k <= n ? @inbounds(r[list[k]]) : 0f0
-    block_partial!(ps, pm, v*v, abs(v))
+    v = k <= n ? abs(@inbounds(r[list[k]])) : 0f0
+    block_partial!(ps, pm, v, v)
     return nothing
 end
-function list_sumsq!(b::TBiotPoisson, list, r, slot)
+function list_norms!(b::TBiotPoisson, list, r, slot)
     n = length(list); red = b.red
     nb = cld(n, 256)
-    @cuda threads=256 blocks=nb k_listsq!(Int32(n), red.ps, red.pm, list, r)
+    @cuda threads=256 blocks=nb k_listnorms!(Int32(n), red.ps, red.pm, list, r)
     @cuda threads=1024 k_finish!(red.ps, red.pm, Int32(nb), red.s, red.m, Int32(slot))
 end
 # boundary velocity u = U + uᵥ; r[adjacent] += Δuₙ·sgn·scale; partial Σ Δuₙ·sgn (net flux change)
@@ -557,52 +558,57 @@ end
 bctuple(f::Function, t::T, N) where T = ntuple(i->f(i, zero(SVector{N,T}), t), N)
 bctuple(f::Tuple, t, N) = f
 """
-    mom_project!(a::TFlow, b::TBiotPoisson, w, t; tol=1e-4, itmx=32)
+    mom_project!(a::TFlow, b::TBiotPoisson, w, t; tol=2e-3, itmx=32)
 
 BiotSavartBCs projection, rearranged to avoid full-grid passes per Biot iteration:
 the pressure `p` is solved for directly and kept cumulative, `u` is only projected once at
 the end, the vorticity of the projected field is recomputed only where `curl(L∇p)≠0`,
-and the global flux fix and `Σr²` are updated from the boundary cells.
+and the global flux fix and the residual norms are updated from the boundary cells.
+Stopping criterion as BiotSavartBCs#13 / `WaterLily.solver!`: `max|r| < tol`, `Σ|r|/N < tol/10`.
 """
-function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w, t; tol=1e-4, itmx=32) where {D,T}
+function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w, t; tol=2e-3, itmx=32) where {D,T}
     dt = T(w)*a.Δt[end]; idt = inv(dt)
     U = T.(bctuple(a.uBC, T(t), D))
     top = b.levels[1]; op = top.op; g = op.g; red = b.red
     tar1 = b.tar[1]; nt = length(tar1)
     fill!(b.pois.ωd, 1)
+    # stopping criterion (BiotSavartBCs#13, as WaterLily.solver!): max|r| < tol and Σ|r|/N < tol/10,
+    # in units of Δt·r since r here is the residual of the equation for p
+    r₁tol = WaterLily.l1n_tol(b.pois.ml.levels[1], tol)/dt; r∞tol = tol/dt
     # vorticity of u - Δt·L∇p, Biot-Savart boundary velocity
     fill_ω!(b, a.f, a.u)
     correct_ω!(b, a.f, a.u, a.p, dt, false)
     fmm!(b, a.f)
     launch1(k_biotbc!, nt, tar1, a.u, a.f, top.r, U, g, false)
-    # residual r = div(u)/Δt - A p (Σr in slot 1), global flux fix, Σr²
+    # residual r = div(u)/Δt - A p (Σr in slot 1), global flux fix, norms
     red_launch(k_resid_src!, inside_lo(g), inside_hi(g), red, 1, top.r, a.p, a.u, a.V, op, idt, false)
     launch1(k_fixresid2!, nt, tar1, a.u, top.r, red.s, Int32(1), dt, idt, g)
-    r₂, r∞ = L₂!(b, top.r); r₂ *= dt^2
+    r₁, r∞ = norms!(b, top.r)
     nᵖ, nᵇ = 0, 0
-    @log ", $nᵖ, $(r∞*dt), $r₂, $nᵇ\n"
+    @log ", $nᵖ, $(r∞*dt), $(r₁*dt), $nᵇ\n"
     while nᵖ < itmx
-        rtol = max(tol, 0.1r₂)
+        # V-cycles with fixed BCs until Σ|r| drops >10x
+        rtol = max(r₁tol, 0.1r₁)
         while nᵖ < itmx
-            iteration!(b.pois; sq=true, adapt=false)
-            fetch!(red); r₂ = getsum(red, 3)*dt^2; nᵖ += 1
-            r₂ < rtol && break
+            iteration!(b.pois; exclb=true, adapt=false)
+            fetch!(red); r₁ = getsum(red, 3); nᵖ += 1
+            r₁ < rtol && break
         end
-        r₂p = getsum(red, 3)
+        r₁mg, r∞in = getsum(red, 3), getmax(red, 3)   # max over cells away from the boundary
         # Biot-Savart update of the boundary velocity with the current p
         correct_ω!(b, a.f, a.u, a.p, dt, true)
         fmm!(b, b.dω, b.boxes)
         launch1(k_addtar!, nt, tar1, a.f, b.dω[1])
-        list_sumsq!(b, b.lists[3], top.r, 5)
+        list_norms!(b, b.lists[3], top.r, 5)
         nb = cld(nt, 256)
         @cuda threads=256 blocks=nb k_biotbc2!(Int32(nt), red.ps, red.pm, tar1, a.u, a.f, top.r, U, g, idt)
         @cuda threads=1024 k_finish!(red.ps, red.pm, Int32(nb), red.s, red.m, Int32(6))
         launch1(k_fixresid2!, nt, tar1, a.u, top.r, red.s, Int32(6), 1f0, idt, g)
-        list_sumsq!(b, b.lists[3], top.r, 7)
+        list_norms!(b, b.lists[3], top.r, 7)
         fetch!(red)
-        r₂ = (r₂p - getsum(red, 5) + getsum(red, 7))*dt^2; nᵇ += 1
-        @log ", $nᵖ, $(getmax(red,7)*dt), $r₂, $nᵇ\n"
-        r₂ < tol && break
+        r₁ = r₁mg - getsum(red, 5) + getsum(red, 7); r∞ = max(r∞in, getmax(red, 7)); nᵇ += 1
+        @log ", $nᵖ, $(r∞*dt), $(r₁*dt), $nᵇ\n"
+        (r₁ < r₁tol && r∞ < r∞tol) && break
     end
     push!(b.n, nᵖ)
     launch(k_proj!, inside_lo(g), inside_hi(g), a.u, a.p, op, dt)

@@ -201,7 +201,9 @@ function k_prol_incr!(lo, hi, r, x, op::Op, cx, gc::Grid, c, ωd)
     return nothing
 end
 # increment with stored ϵ (optionally the block partials of Σ|r|, max|r|)
-function k_incr!(lo, hi, ps, pm, r, x, ϵ, op::Op, ωd, ::Val{norms}, ::Val{sq}) where {norms, sq}
+# increment with stored ϵ (optionally the block partials of Σ|r| and max|r|; with `exclb`
+# the max skips the cells next to the domain boundary, which a Biot-Savart update changes)
+function k_incr!(lo, hi, ps, pm, r, x, ϵ, op::Op{D}, ωd, ::Val{norms}, ::Val{exclb}) where {D, norms, exclb}
     I, ok = cellidx(lo, hi)
     ω = @inbounds ωd[1]
     a = 0f0; m = 0f0
@@ -210,7 +212,14 @@ function k_incr!(lo, hi, ps, pm, r, x, ϵ, op::Op, ωd, ::Val{norms}, ::Val{sq})
         v = @inbounds(r[l]) - ω*mult(op, I, l, ϵ)
         @inbounds r[l] = v
         @inbounds x[l] += ω*ϵ[l]
-        m = abs(v); a = sq ? v*v : m
+        a = abs(v)
+        edge = false
+        if exclb
+            @unroll for d in i32:Int32(D)
+                edge |= (I[d] == Int32(2)) | (I[d] == op.g.n[d] - i32)
+            end
+        end
+        m = edge ? 0f0 : a
     end
     norms && block_partial!(ps, pm, a, m)
     return nothing
@@ -296,14 +305,14 @@ function jacobi!(lv::Level, assign::Bool=false)
     lv.r, lv.ϵ = lv.ϵ, lv.r
 end
 gs_range(g::Grid{D}) where D = (inside_lo(g), ntuple(d-> d==D ? Int(g.n[d])÷2 : Int(g.n[d])-1, D))
-function smooth!(lv::Level{D,T}, ωd, red::RedBuf, norms::Bool=false; it=4, sq=false) where {D,T}
+function smooth!(lv::Level{D,T}, ωd, red::RedBuf, norms::Bool=false; it=4, exclb=false) where {D,T}
     g = lv.op.g
     lo, hi = gs_range(g)
     for i in 1:it
         launch(k_gs!, lo, hi, lv.ϵ, lv.r, lv.op, Int32(i), i==1)
     end
     if norms
-        red_launch(k_incr!, inside_lo(g), inside_hi(g), red, 3, lv.r, lv.x, lv.ϵ, lv.op, ωd, Val(true), Val(sq))
+        red_launch(k_incr!, inside_lo(g), inside_hi(g), red, 3, lv.r, lv.x, lv.ϵ, lv.op, ωd, Val(true), Val(exclb))
     else
         launch(k_incr!, inside_lo(g), inside_hi(g), red.ps, red.pm, lv.r, lv.x, lv.ϵ, lv.op, ωd, Val(false), Val(false))
     end
@@ -372,11 +381,11 @@ function graphed!(f::F, p::TPoisson, key) where F
     end
     return nothing
 end
-# one multigrid iteration: V-cycle, fine smoothing with norms into slot 3, ω update
-function iteration!(p::TPoisson; fix=false, assign=false, sq=false, adapt=true)
-    graphed!(p, (fix, assign, sq, adapt)) do
+# one multigrid iteration: V-cycle, fine smoothing with norms (Σ|r|, max|r|) into slot 3, ω update
+function iteration!(p::TPoisson; fix=false, assign=false, exclb=false, adapt=true)
+    graphed!(p, (fix, assign, exclb, adapt)) do
         vcycle!(p, 1, fix ? true : nothing; assign)
-        smooth!(p.levels[1], p.ωd, p.red, true; sq)
+        smooth!(p.levels[1], p.ωd, p.red, true; exclb)
         adapt && @cuda k_omega!(p.ωd, p.red.s, fix)
     end
 end

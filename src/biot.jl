@@ -268,6 +268,50 @@ end
         top ? min(v, g.n[d] - Int32(2)) : v
     end
 end
+# Sum over the source box olo:ohi minus the hole ilo:ihi (no hole on the top level). Each
+# x-line is split around the hole so the inner loop has no branch (BiotSavartBCs#14).
+# Lane p of P handles the outer rows p, p+P, …
+@inline function xline(::Val{i}, x::NTuple{3}, ω, g::Grid{3}, ls, a, b, r2, r3) where i
+    j = i % 3 + 1; k = (i + 1) % 3 + 1
+    cj = Int32(j-1)*g.nc; ck = Int32(k-1)*g.nc
+    s = 0f0
+    for s1 in a:b
+        r1 = x[1] - s1
+        r = (r1, r2, r3)
+        ir = CUDA.rsqrt(r1*r1 + r2*r2 + r3*r3)
+        @inbounds s += (ω[ls+s1+cj]*r[k] - ω[ls+s1+ck]*r[j])*(ir*ir*ir)
+    end
+    return s
+end
+@inline function xline(::Val{i}, x::NTuple{2}, ω, g::Grid{2}, ls, a, b, r2, r3) where i
+    s = 0f0
+    for s1 in a:b
+        r1 = x[1] - s1
+        @inbounds s += ω[ls+s1]*(i == 1 ? r2 : r1)*@fastmath(inv(r1*r1 + r2*r2))
+    end
+    return i == 1 ? -s : s
+end
+@inline function boxsum(vi::Val, x::NTuple{D}, ω, g::Grid{D}, olo, ohi, ilo, ihi, top, p, P) where D
+    s = 0f0
+    q = (D == 3 ? olo[3] : olo[2]) + p
+    qend = D == 3 ? ohi[3] : ohi[2]
+    while q <= qend
+        for s2 in (D == 3 ? olo[2] : q):(D == 3 ? ohi[2] : q)
+            s3 = D == 3 ? q : i32
+            ls = (s2 - i32)*g.s[2] + (D == 3 ? (s3 - i32)*g.s[D] : Int32(0))
+            r2 = x[2] - s2; r3 = D == 3 ? x[D] - s3 : 0f0
+            hole = !top & (ilo[2] <= s2 <= ihi[2]) & (D == 2 || (ilo[D] <= s3 <= ihi[D]))
+            if hole
+                s += xline(vi, x, ω, g, ls, olo[1], min(ohi[1], ilo[1]-i32), r2, r3)
+                s += xline(vi, x, ω, g, ls, max(olo[1], ihi[1]+i32), ohi[1], r2, r3)
+            else
+                s += xline(vi, x, ω, g, ls, olo[1], ohi[1], r2, r3)
+            end
+        end
+        q += P
+    end
+    return s
+end
 # Interaction sum at one target of one level (BiotSavartBCs.interaction).
 # P consecutive lanes share a target, splitting the outermost source loop; P ∈ {1,2,4,…,32}.
 function k_interact!(n, tar, ω, g::Grid{D}, top::Bool, bottom::Bool, P::Int32, blo, bhi) where D
@@ -288,32 +332,10 @@ function k_interact!(n, tar, ω, g::Grid{D}, top::Bool, bottom::Bool, P::Int32, 
     ihi = ntuple(d-> min(T[d] + c, g.n[d] - i32), Val(D))
     x = ntuple(d-> Float32(T[d]) + (d == i ? (T[d] == i32 ? 0.5f0 : -0.5f0) : 0f0), Val(D))
     val = 0f0
-    if valid
-        if D == 3
-            s3 = olo[3] + p
-            while s3 <= ohi[3]
-                for s2 in olo[2]:ohi[2], s1 in olo[1]:ohi[1]
-                    if !top
-                        (ilo[1] <= s1 <= ihi[1]) & (ilo[2] <= s2 <= ihi[2]) & (ilo[3] <= s3 <= ihi[3]) && continue
-                    end
-                    ls = s1 + (s2 - i32)*g.s[2] + (s3 - i32)*g.s[3]
-                    val += bs_weight(x[1]-s1, x[2]-s2, x[D]-s3, ω, ls, g, i)
-                end
-                s3 += P
-            end
-        else
-            s2 = olo[2] + p
-            while s2 <= ohi[2]
-                for s1 in olo[1]:ohi[1]
-                    if !top
-                        (ilo[1] <= s1 <= ihi[1]) & (ilo[2] <= s2 <= ihi[2]) && continue
-                    end
-                    ls = s1 + (s2 - i32)*g.s[2]
-                    val += bs_weight(x[1]-s1, x[2]-s2, 0f0, ω, ls, g, i)
-                end
-                s2 += P
-            end
-        end
+    if valid   # compile-time component: only the two vorticity components that enter are loaded
+        val = i == i32 ? boxsum(Val(1), x, ω, g, olo, ohi, ilo, ihi, top, p, P) :
+              i == 2i32 ? boxsum(Val(2), x, ω, g, olo, ohi, ilo, ihi, top, p, P) :
+                          boxsum(Val(3), x, ω, g, olo, ohi, ilo, ihi, top, p, P)
     end
     off = P ÷ Int32(2)
     while off > 0

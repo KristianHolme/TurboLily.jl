@@ -49,8 +49,12 @@ mutable struct TFlow{D,T,Sf<:AbstractArray{T},Vf<:AbstractArray{T},Tf<:AbstractA
     per :: NTuple{D,Bool}
     band :: CuVector{Int32}     # linear (I,i) indices of faces with μ₀≠1, μ₁=0 (u = V+μ₀f̃)
     shell :: CuVector{Int32}    # linear (I,i) indices of faces with μ₁≠0 (full BDIM update)
+    nband :: Int
+    nshell :: Int
     Vzero :: Bool               # true when V ≡ 0 (skip div(V) source)
     red :: RedBuf
+    near :: CuArray{UInt8,D}    # cells inside the measure band at the last measure!
+    mstat :: CuVector{Int32}    # [nband, nshell, V≠0] from the last measure!
 end
 
 function TFlow(N::NTuple{D}, uBC; T=Float32, mem=CuArray, kw...) where D
@@ -60,42 +64,9 @@ function TFlow(N::NTuple{D}, uBC; T=Float32, mem=CuArray, kw...) where D
     per = ntuple(j->j ∈ f.perdir, D)
     a = TFlow{D,T,typeof(f.p),typeof(f.u),typeof(f.μ₁),typeof(f.λ),typeof(bc),typeof(acc)}(
         f.u, f.u⁰, f.f, f.p, f.σ, f.V, f.μ₀, f.μ₁, f.uBC, f.Δt, f.ν, f.g, f.exitBC, f.perdir, f.λ,
-        bc, acc, Grid(f.p), per, CuVector{Int32}(undef,0), CuVector{Int32}(undef,0), true, RedBuf(Grid(f.p)))
-    update_band!(a)
-    a
-end
-
-# ---------------------------------------------------------------- measure
-function WaterLily.measure!(a::TFlow, body::AbstractBody; t=zero(eltype(a.p)), ϵ=1)
-    invoke(WaterLily.measure!, Tuple{AbstractFlow,AbstractBody}, a, body; t, ϵ)
-    update_band!(a)
-end
-WaterLily.measure!(a::TFlow, ::NoBody; kwargs...) = nothing
-
-# 0: regular face, 1: μ₀≠1 and μ₁=0, 2: μ₁≠0
-function k_bandmask!(lo, hi, m, μ₀, μ₁, g::Grid{D}) where D
-    I, ok = cellidx(lo, hi); ok || return
-    l = lin(g, I)
-    @unroll for i in i32:Int32(D)
-        li = l + (i-i32)*g.nc
-        sh = false
-        @unroll for j in i32:Int32(D)
-            sh |= @inbounds μ₁[li + (j-i32)*D*g.nc] != 0
-        end
-        @inbounds m[li] = sh ? 0x02 : μ₀[li] != 1 ? 0x01 : 0x00
-    end
-    return nothing
-end
-function update_band!(a::TFlow{D}) where D
-    g = a.grid
-    m = CUDA.zeros(UInt8, size(a.u))
-    launch(k_bandmask!, inside_lo(g), inside_hi(g), m, a.μ₀, a.μ₁, g)
-    mv = vec(m)
-    a.band = CuVector{Int32}(findall(==(0x01), mv))
-    a.shell = CuVector{Int32}(findall(==(0x02), mv))
-    a.Vzero = !any(!iszero, a.V)
-    CUDA.unsafe_free!(m)
-    return nothing
+        bc, acc, Grid(f.p), per, CuVector{Int32}(undef,1024), CuVector{Int32}(undef,1024), 0, 0, true,
+        RedBuf(Grid(f.p)), (n = similar(f.p, UInt8); fill!(n, 0x01); n), CUDA.zeros(Int32, 4))
+    return a
 end
 
 # ---------------------------------------------------------------- convection-diffusion
@@ -351,8 +322,8 @@ end
 function mom_update!(a::TFlow{D,T}, out, uin, t, corr) where {D,T}
     g, dt = a.grid, a.Δt[end]
     launch_mom!(a, out, uin, t, corr)
-    launch1(k_band!, length(a.band), a.band, out, uin, a.u⁰, a.V, a.μ₀, a.μ₁, g, dt, a.ν, a.λ, a.per, a.acc, T(t), corr, false)
-    launch1(k_band!, length(a.shell), a.shell, out, uin, a.u⁰, a.V, a.μ₀, a.μ₁, g, dt, a.ν, a.λ, a.per, a.acc, T(t), corr, true)
+    launch1(k_band!, a.nband, a.band, out, uin, a.u⁰, a.V, a.μ₀, a.μ₁, g, dt, a.ν, a.λ, a.per, a.acc, T(t), corr, false)
+    launch1(k_band!, a.nshell, a.shell, out, uin, a.u⁰, a.V, a.μ₀, a.μ₁, g, dt, a.ν, a.λ, a.per, a.acc, T(t), corr, true)
 end
 
 # ---------------------------------------------------------------- boundary conditions

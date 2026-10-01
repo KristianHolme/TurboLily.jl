@@ -127,7 +127,8 @@ struct TPoisson{T,S,V,D,R} <: AbstractPoisson{T,S,V}
     nsolve :: Base.RefValue{Int}     # number of solved rows (count(!iszero, iD))
     red :: RedBuf
     ωd :: CuVector{Float32}          # [ω, r₁]: relaxation and previous Σ|r| (device side)
-    fixd :: CuVector{Float32}        # [nsolve, tiny] for the lazy residual correction
+    fixd :: CuVector{Float32}        # [-, tiny] for the lazy residual correction
+    nsd :: CuVector{Float64}         # number of solved rows, count(iD≠0), on the device
     graphs :: Dict{Any,CuGraphExec}
     seen :: Set{Any}
 end
@@ -137,18 +138,13 @@ function TPoisson(x::AbstractArray{T,D}, L, z; perdir=()) where {T,D}
     per = ntuple(j->j ∈ perdir, D)
     levels = [Level(ml.levels[l], l < nl ? coarsen_mask(ml.levels[l].x, ml.levels[l+1].x) : ntuple(_->false,D), per) for l in 1:nl]
     p = TPoisson{T,typeof(x),typeof(L),D,typeof(levels[1].op.reg)}(x, L, z, ml, levels, per, Int16[], perdir, Ref(0), RedBuf(Grid(x)),
-        CUDA.ones(Float32, 2), CUDA.zeros(Float32, 2), Dict{Any,CuGraphExec}(), Set{Any}())
+        CUDA.ones(Float32, 2), CUDA.zeros(Float32, 2), CUDA.zeros(Float64, 1), Dict{Any,CuGraphExec}(), Set{Any}())
     finish_update!(p)
 end
 TPoisson(flow::AbstractFlow) = TPoisson(flow.p, flow.μ₀, flow.σ; perdir=flow.perdir)
 function finish_update!(p::TPoisson)
-    foreach(set_reg!, p.levels)
-    p.nsolve[] = count(!iszero, p.levels[1].op.iD)
-    return p
-end
-function WaterLily.update!(p::TPoisson)
-    WaterLily.update!(p.ml)
-    finish_update!(p)
+    foreach(set_reg!, p.levels)       # sets Lreg per level (the fluid value of L)
+    return WaterLily.update!(p)
 end
 
 # ---------------------------------------------------------------- kernels
@@ -272,17 +268,17 @@ struct Rc{S,O}; r::S; op::O; s::Float32; apply::Bool; end
 end
 struct RcD{S,O}; rc::Rc{S,O}; end
 @inline (f::RcD)(I, l) = f.rc(I, l)*getiD(f.rc.op, l)
-@inline function make_rc(r, op, sums, fixd)
-    s = Float32(@inbounds(sums[1])) / @inbounds(fixd[1])
+@inline function make_rc(r, op, sums, nsd, fixd)
+    s = Float32(@inbounds(sums[1]) / @inbounds(nsd[1]))
     return Rc(r, op, s, abs(s) > @inbounds(fixd[2]))
 end
 # Jacobi on the corrected residual; partial Σ|rc|, max|rc| (the initial residual norms)
-function k_jacobi_fix!(lo, hi, ps, pm, rn, r, x, op::Op, sums, fixd)
+function k_jacobi_fix!(lo, hi, ps, pm, rn, r, x, op::Op, sums, nsd, fixd)
     I, ok = cellidx(lo, hi)
     a = 0f0
     if ok
         l = lin(op.g, I)
-        rc = make_rc(r, op, sums, fixd)
+        rc = make_rc(r, op, sums, nsd, fixd)
         v = rc(I, l)
         f = RcD(rc)
         @inbounds rn[l] = v - mult_f(op, I, l, f)
@@ -320,7 +316,7 @@ function vcycle!(p::TPoisson{T}, l, fix=nothing; assign=false) where T
         jacobi!(fine, assign)
     else
         g = fine.op.g
-        red_launch(k_jacobi_fix!, inside_lo(g), inside_hi(g), p.red, 2, fine.ϵ, fine.r, fine.x, fine.op, p.red.s, p.fixd)
+        red_launch(k_jacobi_fix!, inside_lo(g), inside_hi(g), p.red, 2, fine.ϵ, fine.r, fine.x, fine.op, p.red.s, p.nsd, p.fixd)
         fine.r, fine.ϵ = fine.ϵ, fine.r
     end
     gc = coarse.op.g
@@ -384,7 +380,7 @@ caller solving for `p = x/Δt` passes `scale = Δt` and WaterLily's tolerances k
 function solve!(p::TPoisson{T}, scale; tol=2e-3, itmx=32) where T
     top = p.levels[1]
     r₁tol = WaterLily.l1n_tol(p.ml.levels[1], tol)/scale; r∞tol = tol/scale
-    copyto!(p.fixd, Float32[p.nsolve[], 2eps(T)/scale])
+    copyto!(p.fixd, Float32[0, 2eps(T)/scale])
     fill!(p.ωd, 1)
     nᵖ = 0
     while nᵖ < itmx

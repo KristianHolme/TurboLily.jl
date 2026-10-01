@@ -30,6 +30,9 @@ struct TBiotPoisson{T,S,V,D,P<:TPoisson,W,G,W1} <: AbstractPoisson{T,S,V}
     lists :: Vector{CuVector{Int32}}  # [A1, A2, B]: affected layer cells, affected level-2 cells, boundary-adjacent cells
     dω :: W1                          # Δω on all levels (level 1 first) for incremental FMM updates
     boxes :: Vector{Any}              # per level (lo,hi) bounding box of Δω
+    mask :: CuArray{UInt8,D}          # affected-cell mask on level 1
+    bst :: CuVector{Int32}            # [nA1, box1 lo/hi, nA2, box2 lo/hi]
+    nA :: Vector{Int}                 # host copies of the A1, A2 counts
 end
 function TBiotPoisson(flow::TFlow{D,T}; nonbiotfaces=(), fmm=true) where {D,T}
     isempty(flow.perdir) || @warn "BiotSavart BCs ignore perdir" maxlog=1
@@ -46,75 +49,101 @@ function TBiotPoisson(flow::TFlow{D,T}; nonbiotfaces=(), fmm=true) where {D,T}
     dω = map(a->(z = similar(a); fill!(z, 0); z), Tuple(ml))
     b = TBiotPoisson{T,typeof(flow.p),typeof(flow.μ₀),D,typeof(pois),typeof(ω),typeof(g),typeof(dω)}(
         pois, pois.x, pois.L, pois.z, ω, g, tar, p, pois.n, flow.perdir, fmm, pois.red,
-        [CuVector{Int32}(undef,0), CuVector{Int32}(undef,0), CuVector{Int32}(B)],
-        dω, Any[])
+        [CuVector{Int32}(undef,256), CuVector{Int32}(undef,256), CuVector{Int32}(B)],
+        dω, Any[], CUDA.zeros(UInt8, size(flow.p)), CUDA.zeros(Int32, 16), [0, 0])
     affected_lists!(b)
     return b
 end
 WaterLily.update!(b::TBiotPoisson) = (WaterLily.update!(b.pois); affected_lists!(b))
+Base.getproperty(b::TBiotPoisson, s::Symbol) = s === :levels ? getfield(b, :pois).levels : getfield(b, s)
 
 # Cells whose centred-curl stencil reads a face with L≠1: there the curl of Δt·L∇p is not
 # zero, so ω must be recomputed when p changes. Elsewhere curl(L∇p) ≡ 0 exactly.
-function k_affected!(lo, hi, m, L, g::Grid{D}, w) where D
-    I, ok = cellidx(lo, hi); ok || return
-    l = lin(g, I)
+# Writes the mask m (0x01 affected, 0x03 affected and in the level-1 layer) and appends
+# the layer cells to A1 (count bst[1], box bst[2:7]); level-2 list A2 uses bst[8:14].
+@inline function warp_box!(bst, off, pred::Bool, I::NTuple{D,Int32}) where D
+    @unroll for d in i32:Int32(D)
+        lo = pred ? I[d] : typemax(Int32); hi = pred ? I[d] : typemin(Int32)
+        o = Int32(16)
+        while o > 0
+            lo = min(lo, shfl_down_sync(0xffffffff, lo, o)); hi = max(hi, shfl_down_sync(0xffffffff, hi, o))
+            o >>= 1
+        end
+        if flat_tid() % Int32(32) == 0 && lo != typemax(Int32)
+            CUDA.atomic_min!(pointer(bst, off + d), lo)
+            CUDA.atomic_max!(pointer(bst, off + 3 + d), hi)
+        end
+    end
+    return nothing
+end
+function k_affected!(lo, hi, m, L, g::Grid{D}, w, A1, bst) where D
+    I, ok = cellidx(lo, hi)
+    aff = false; near = false
+    l = ok ? lin(g, I) : i32
+    if ok
+        @unroll for a in i32:Int32(D)
+            ca = (a-i32)*g.nc
+            @unroll for b in i32:Int32(D)
+                if a != b
+                    sb, sa = g.s[b], g.s[a]
+                    @inbounds aff |= (L[l+sb+ca] != 1) | (L[l-sb+ca] != 1) | (L[l+sb+sa+ca] != 1) | (L[l-sb+sa+ca] != 1)
+                end
+            end
+        end
+        @unroll for d in i32:Int32(D)
+            near |= (I[d] <= w) | (I[d] >= g.n[d] - w + i32)
+        end
+        @inbounds m[l] = aff ? (near ? 0x03 : 0x01) : 0x00
+    end
+    wappend!(A1, bst, 1, aff & near, l)
+    warp_box!(bst, 1, aff & near, I)
+    return nothing
+end
+function k_affected2!(lo, hi, m, g::Grid{D}, g2::Grid{D}, A2, bst) where D
+    I, ok = cellidx(lo, hi)
     aff = false
-    @unroll for a in i32:Int32(D)
-        ca = (a-i32)*g.nc
-        @unroll for b in i32:Int32(D)
-            if a != b
-                sb, sa = g.s[b], g.s[a]
-                @inbounds aff |= (L[l+sb+ca] != 1) | (L[l-sb+ca] != 1) | (L[l+sb+sa+ca] != 1) | (L[l-sb+sa+ca] != 1)
+    if ok
+        J0 = lin(g, ntuple(d-> Int32(2)*I[d] - Int32(2), Val(D)))
+        if D == 3
+            for dz in 0:1, dy in 0:1, dx in 0:1
+                @inbounds aff |= m[J0 + dx + dy*g.s[2] + dz*g.s[D]] != 0
+            end
+        else
+            for dy in 0:1, dx in 0:1
+                @inbounds aff |= m[J0 + dx + dy*g.s[2]] != 0
             end
         end
     end
-    near = false
-    @unroll for d in i32:Int32(D)
-        near |= (I[d] <= w) | (I[d] >= g.n[d] - w + i32)
-    end
-    @inbounds m[l] = aff ? (near ? 0x03 : 0x01) : 0x00
-    return nothing
-end
-function k_affected2!(lo, hi, m2, g2::Grid{D}, m, g::Grid{D}) where D
-    I, ok = cellidx(lo, hi); ok || return
-    J0 = lin(g, ntuple(d-> Int32(2)*I[d] - Int32(2), Val(D)))
-    aff = false
-    if D == 3
-        for dz in 0:1, dy in 0:1, dx in 0:1
-            @inbounds aff |= m[J0 + dx + dy*g.s[2] + dz*g.s[D]] != 0
-        end
-    else
-        for dy in 0:1, dx in 0:1
-            @inbounds aff |= m[J0 + dx + dy*g.s[2]] != 0
-        end
-    end
-    @inbounds m2[lin(g2, I)] = aff
+    wappend!(A2, bst, 8, aff, ok ? lin(g2, I) : i32)
+    warp_box!(bst, 8, aff, I)
     return nothing
 end
 function affected_lists!(b::TBiotPoisson{T,S,V,D}) where {T,S,V,D}
     g = b.g; L = b.L
-    m = CUDA.zeros(UInt8, Int.(g[1].n))
-    launch(k_affected!, ntuple(_->3,D), ntuple(d->Int(g[1].n[d])-2,D), m, L, g[1], Int32(layer_width(Val(D))))
-    m2 = CUDA.zeros(Bool, Int.(g[2].n))
-    launch(k_affected2!, inside_lo(g[2]), inside_hi(g[2]), m2, g[2], m, g[1])
-    A1 = findall(==(0x03), m); A2 = findall(m2)
-    b.lists[1] = CuVector{Int32}(LinearIndices(m)[Array(A1)])
-    b.lists[2] = CuVector{Int32}(LinearIndices(m2)[Array(A2)])
-    # bounding boxes of Δω per level (empty box: lo > hi)
-    bbox(A) = isempty(A) ? (ntuple(_->2,D), ntuple(_->1,D)) :
-        (ntuple(d->minimum(I->I[d], A), D), ntuple(d->maximum(I->I[d], A), D))
-    boxes = Any[bbox(Array(A1)), bbox(Array(A2))]
-    for l in 3:length(g)
-        lo, hi = boxes[end]
-        push!(boxes, lo[1] > hi[1] ? (lo, hi) : (map(i->(i+2)÷2, lo), map(i->(i+2)÷2, hi)))
+    while true
+        st0 = vcat(Int32[0], fill(typemax(Int32),3), fill(typemin(Int32),3), Int32[0], fill(typemax(Int32),3), fill(typemin(Int32),3), Int32[0, 0])
+        copyto!(b.bst, st0)
+        launch(k_affected!, ntuple(_->3,D), ntuple(d->Int(g[1].n[d])-2,D), b.mask, L, g[1], Int32(layer_width(Val(D))), b.lists[1], b.bst)
+        launch(k_affected2!, inside_lo(g[2]), inside_hi(g[2]), b.mask, g[1], g[2], b.lists[2], b.bst)
+        st = Array(b.bst)
+        b.nA[1], b.nA[2] = st[1], st[8]
+        if b.nA[1] > length(b.lists[1]) || b.nA[2] > length(b.lists[2])
+            b.lists[1] = CuVector{Int32}(undef, 2b.nA[1] + 256)
+            b.lists[2] = CuVector{Int32}(undef, 2b.nA[2] + 256)
+            continue
+        end
+        # bounding boxes of Δω per level (empty box: lo > hi)
+        box(o) = st[o+1] > st[o+4] ? (ntuple(_->2,D), ntuple(_->1,D)) : (Tuple(st[o+1:o+D]), Tuple(st[o+4:o+3+D]))
+        boxes = Any[box(1), box(8)]
+        for l in 3:length(g)
+            lo, hi = boxes[end]
+            push!(boxes, lo[1] > hi[1] ? (lo, hi) : (map(i->(i+2)÷2, lo), map(i->(i+2)÷2, hi)))
+        end
+        empty!(b.boxes); append!(b.boxes, boxes)
+        return b
     end
-    empty!(b.boxes); append!(b.boxes, boxes)
-    CUDA.unsafe_free!(m); CUDA.unsafe_free!(m2)
-    return b
 end
-Base.getproperty(b::TBiotPoisson, s::Symbol) = s === :levels ? getfield(b, :pois).levels : getfield(b, s)
 
-# ---------------------------------------------------------------- vorticity
 # velocity accessors: plain u, or the projected u - Δt·L∇p (without writing it)
 struct UA{A}; u::A; nc::Int32; end
 @inline (f::UA)(l, a) = @inbounds f.u[l + (a-i32)*f.nc]
@@ -523,8 +552,8 @@ Recompute ω of `u - Δt·L∇p` on the affected cells (levels 1 and 2), storing
 function correct_ω!(b::TBiotPoisson, ω1, u, p, dt, incremental::Bool)
     g = b.g; op = b.levels[1].op
     U = UC(u, p, op, dt)
-    launch1(k_curl_corr1!, length(b.lists[1]), b.lists[1], ω1, b.dω[1], U, g[1])
-    launch1(k_curl_corr2!, length(b.lists[2]), b.lists[2], b.ω[1], b.dω[2], g[2], U, g[1])
+    launch1(k_curl_corr1!, b.nA[1], b.lists[1], ω1, b.dω[1], U, g[1])
+    launch1(k_curl_corr2!, b.nA[2], b.lists[2], b.ω[1], b.dω[2], g[2], U, g[1])
     src = incremental ? b.dω : (ω1, b.ω...)
     for l in 3:length(g)
         launch(k_vrestrict!, inside_lo(g[l]), inside_hi(g[l]), src[l], g[l], src[l-1], g[l-1])

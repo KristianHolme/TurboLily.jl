@@ -13,6 +13,7 @@ using CUDA, StaticArrays, WaterLily
 include("util.jl")
 include("flow.jl")
 include("poisson.jl")
+include("measure.jl")
 include("biot.jl")
 
 function Simulation end

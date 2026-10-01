@@ -12,7 +12,9 @@ Grid(n::NTuple{D,<:Integer}) where D =
     Grid{D}(Int32.(n), ntuple(d->Int32(prod(n[1:d-1])), Val(D)), Int32(prod(n)))
 Grid(a::AbstractArray) = Grid(size(a))
 
-@inline lin(g::Grid{D}, I::NTuple{D,Int32}) where D = i32 + sum(ntuple(d->(I[d]-i32)*g.s[d], Val(D)))
+# (`sum` would widen Int32 to Int64)
+@inline lin(g::Grid{3}, I::NTuple{3,Int32}) = i32 + (I[1]-i32) + (I[2]-i32)*g.s[2] + (I[3]-i32)*g.s[3]
+@inline lin(g::Grid{2}, I::NTuple{2,Int32}) = i32 + (I[1]-i32) + (I[2]-i32)*g.s[2]
 @inline function coords(g::Grid{3}, l::Int32)
     l0 = l - i32
     k = l0 ÷ g.s[3]; r = l0 - k*g.s[3]

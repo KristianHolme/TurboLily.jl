@@ -287,7 +287,7 @@ end
     end
 end
 # Sum over the source box olo:ohi minus the hole ilo:ihi (no hole on the top level). Each
-# x-line is split around the hole so the inner loop has no branch (BiotSavartBCs#14).
+# x-line is split around the hole so the inner loop has no branch.
 # Lane p of P handles the outer rows p, p+P, …
 @inline function xline(::Val{i}, x::NTuple{3}, ω, g::Grid{3}, ls, a, b, r2, r3) where i
     j = i % 3 + 1; k = (i + 1) % 3 + 1

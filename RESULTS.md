@@ -1,5 +1,33 @@
 # Benchmarks
 
+## Against BiotSavartBCs 1.0 (`bench_release/`)
+
+BiotSavartBCs 1.0 is `main` (ce98bf2): #13's stopping criterion and the `fill_ω!` part of #14,
+but not #14's FMM `interaction` rewrite. WaterLily is #337 as in the stack below, because
+WaterLily master does not run on GPUs. One RTX 2080 Ti, ms per step, sphere Re=3700.
+
+| Biot-Savart grid | cells | BSBC#14 PR | BSBC 1.0 | TurboLily | speedup vs #14 PR | vs 1.0 |
+|---|---|---|---|---|---|---|
+| 80×32×32 | 0.08M | 4.68 | 5.93 | 1.64 | 2.6× | 3.6× |
+| 120×48×48 | 0.28M | 4.42 | 5.88 | 1.65 | 2.6× | 3.6× |
+| 160×64×64 | 0.66M | 6.67 | 10.26 | 2.51 | 2.6× | 4.1× |
+| 240×96×96 | 2.2M | 15.13 | 18.11 | 4.79 | 3.1× | 3.8× |
+| 320×128×128 | 5.2M | 31.80 | 36.34 | 9.67 | 3.2× | 3.8× |
+| 400×160×160 | 10.2M | 62.56 | 70.03 | 17.52 | 3.1× | 4.0× |
+| 480×192×192 | 17.7M | 101.98 | 108.65 | 30.18 | 3.0× | 3.6× |
+| 560×224×224 | 28.1M | 173.4 | 179.9 | 48.4 | 3.6× | 3.7× |
+| 640×256×256 | 41.9M | 258.2 | 273.3 | 72.4 | 3.5× | 3.8× |
+
+The #14-PR column and its speedup come from the `bench_stack` run; the 1.0 column and its
+speedup from the `bench_release` run (TurboLily is within ±10 % between the two runs). The
+three `bench_release` runs (sweep, standard case, long run) ran at the same time on three
+GPUs; the smallest grids are partly host-bound and may be affected by the shared CPU.
+
+Standard case, sphere 256×128×128: BSBC 1.0 30.52 ms/step, TurboLily 8.88 ms/step (3.4×).
+
+Long run, sphere Re=3700, 192×96×96, t = 0…20: BSBC 1.0 26.1 s, TurboLily 5.3 s (4.9×);
+mean C_d (t>10) 0.3893 and 0.3898.
+
 ## Against WaterLily#337 + BiotSavartBCs#13+#14 (`bench_stack/`)
 
 Reference: WaterLily PR #337 (3f1de92, on 55b2f5d) and BiotSavartBCs PR #14 (5aeb5c5, which

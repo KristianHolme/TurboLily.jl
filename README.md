@@ -50,6 +50,9 @@ including the earlier comparison against WaterLily master / BiotSavartBCs main.
 | Biot-Savart, moving body | 29.8 | 10.8 | 2.8× |
 | Biot-Savart, 480×192×192 (17.7M cells) | 98.9 | 30.8 | 3.2× |
 
+Against the released BiotSavartBCs 1.0, which did not merge #14's FMM rewrite, the
+Biot-Savart speedup is 3.6–4.1× across 0.08M–42M cells (3.4× on the sphere above).
+
 The speedup grows with problem size, and it is largest for Biot-Savart BCs. The long runs
 below show 4.8× and 5.4× over a developed flow.
 
@@ -86,7 +89,8 @@ FMℓM Biot-Savart sum. The changes fall into three groups:
 2. computational changes, which do the same arithmetic faster;
 3. places where the results are not identical to the reference.
 
-Below, "WL" means WaterLily (#337) and "BSBC" means BiotSavartBCs (#13+#14). N is the number of
+Below, "WL" means WaterLily (#337) and "BSBC" means BiotSavartBCs 1.0 (main, which contains
+#13 and the `fill_ω!` part of #14). N is the number of
 cells. A "pass" is one sweep over a full-grid array.
 
 ### 1. Algorithmic changes (same result in exact arithmetic, less work)
@@ -345,10 +349,14 @@ from about 6–7 values to about 2–3.
 
 #### 2.4 Biot-Savart kernels
 
-- **FMM interaction.** As BSBC#14, each source x-line is split around the near-field hole, so
-  the inner loop has no exclusion test, and the component is compile-time. TurboLily also
-  computes 1/r³ with `rsqrt`. On coarse levels, where there are few targets with large source
-  boxes, P = 2–32 threads share one target and reduce with warp shuffles.
+- **FMM interaction.** Each source x-line is split around the near-field hole, so the inner
+  loop has no exclusion test, and the target's velocity component is a compile-time constant,
+  so only the two vorticity components that enter are loaded. This idea was proposed in the
+  BiotSavartBCs#14 PR, but that part was not merged: BiotSavartBCs 1.0 keeps the per-source loop
+  with a `S ∉ Rinner` test. The split keeps the summation order, so the two differ only by
+  rounding. TurboLily also computes 1/r³ with `rsqrt`. On coarse levels, where there are few
+  targets with large source boxes, P = 2–32 threads share one target and reduce with warp
+  shuffles.
 - **Residual source and flux fix.** The residual kernel computes the source from `u` directly,
   so z is never stored. The boundary-velocity kernel also updates the residual next to the
   boundary and sums the net flux change.
@@ -450,6 +458,7 @@ Two environments develop this package together with CUDA and a reference stack:
 
 - `../bench_stack`: WaterLily#337 (`../dev/WL_337`) and BiotSavartBCs#14 (`../dev/BSBC_14`, which
   includes #13). All 59 tests apply here.
+- `../bench_release`: WaterLily#337 and BiotSavartBCs 1.0 (`../dev/BSBC_main`); all 59 tests apply.
 - `../bench`: WaterLily master with the GPU fix (`../dev/WL`) and BiotSavartBCs main
   (`../dev/BSBC`). The deforming-body tests need WaterLily#328 and run only here. The Biot-Savart
   step-by-step comparisons need BiotSavartBCs#13 and are skipped here.

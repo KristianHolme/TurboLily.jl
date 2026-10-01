@@ -17,6 +17,7 @@ sim_step!(bsim, 10; remeasure=false)
 ```
 
 The arrays always live on the current CUDA device (`mem` is ignored) and `T` must be `Float32`.
+Tested with Julia 1.13.1 and CUDA.jl 6.2.2 (GPUCompiler 1.23) and 6.4 (GPUCompiler 2.9).
 
 Symmetry planes with image vortices (BiotSavartBCs' `square_sym` example) are given as a
 keyword instead of by overriding `BiotSavartBCs.symmetry`:

@@ -11,6 +11,11 @@ WaterLily = "ed894a53-35f9-47f1-b17f-85db9237eebd"
 BiotSavartBCs = "ec5a6caf-bdf7-41d0-b8e1-5fafde84e19f"
 
 [compat]
+Adapt = "4"
+BiotSavartBCs = "1"
+CUDA = "6.2.2"
+StaticArrays = "1.9"
+WaterLily = "1.9"
 julia = "1.11"
 
 [extras]

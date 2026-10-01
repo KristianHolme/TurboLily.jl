@@ -98,12 +98,21 @@ function launch_face(k::K, lo::NTuple{D,<:Integer}, hi::NTuple{D,<:Integer}, j, 
     @cuda threads=th blocks=bl k(Int32.(lo), Int32.(hi), Int32(j), args...)
     return prod(bl)
 end
-@inline function faceidx(lo::NTuple{D,Int32}, hi::NTuple{D,Int32}, j) where D
+# Cell of this thread on a face normal to j: the thread's (x,y) map to the two other
+# directions. Written per dimension with literal tuple indices: with `j` known only at run
+# time, a generic `t[d-1]` (which would be t[0] for d=1) is not a static index and some
+# Julia/GPUCompiler versions reject it.
+@inline function faceidx(lo::NTuple{3,Int32}, hi::NTuple{3,Int32}, j)
     t = tid3()
-    I = ntuple(Val(D)) do d
-        d == j ? lo[d] : d < j ? lo[d] + t[d] - i32 : lo[d] + t[d-1] - i32
-    end
-    return I, all(ntuple(d->I[d]<=hi[d], Val(D)))
+    I = j == 1 ? (lo[1], lo[2] + t[1] - i32, lo[3] + t[2] - i32) :
+        j == 2 ? (lo[1] + t[1] - i32, lo[2], lo[3] + t[2] - i32) :
+                 (lo[1] + t[1] - i32, lo[2] + t[2] - i32, lo[3])
+    return I, (I[1] <= hi[1]) & (I[2] <= hi[2]) & (I[3] <= hi[3])
+end
+@inline function faceidx(lo::NTuple{2,Int32}, hi::NTuple{2,Int32}, j)
+    t = tid3()
+    I = j == 1 ? (lo[1], lo[2] + t[1] - i32) : (lo[1] + t[1] - i32, lo[2])
+    return I, (I[1] <= hi[1]) & (I[2] <= hi[2])
 end
 function launch1(k::K, n::Integer, args...; threads=256) where K
     n <= 0 && return nothing

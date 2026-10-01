@@ -53,8 +53,9 @@ including the earlier comparison against WaterLily master / BiotSavartBCs main.
 Against the released BiotSavartBCs 1.0, which did not merge #14's FMM rewrite, the
 Biot-Savart speedup is 3.6–4.1× across 0.08M–42M cells (3.4× on the sphere above).
 
-The speedup grows with problem size, and it is largest for Biot-Savart BCs. The long runs
-below show 4.8× and 5.4× over a developed flow.
+Above about 2M cells the speedup is roughly constant (3.1–3.8×), because both codes then run
+near memory bandwidth. Below 1M cells both are limited by per-step overhead. See the size sweeps
+in `RESULTS.md`.
 
 ## Validation
 

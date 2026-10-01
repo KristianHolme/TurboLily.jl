@@ -14,7 +14,7 @@ the residual converges.
 - Level-2 vorticity is summed directly from the curl of `u` (no full level-1 field).
 - FMM interactions run one kernel per level over that level's target faces.
 """
-struct TBiotPoisson{T,S,V,D,P<:TPoisson,W,G} <: AbstractPoisson{T,S,V}
+struct TBiotPoisson{T,S,V,D,P<:TPoisson,W,G,W1} <: AbstractPoisson{T,S,V}
     pois :: P
     x :: S
     L :: V
@@ -28,6 +28,8 @@ struct TBiotPoisson{T,S,V,D,P<:TPoisson,W,G} <: AbstractPoisson{T,S,V}
     fmm :: Bool
     red :: RedBuf
     lists :: Vector{CuVector{Int32}}  # [A1, A2, B]: affected layer cells, affected level-2 cells, boundary-adjacent cells
+    dω :: W1                          # Δω on all levels (level 1 first) for incremental FMM updates
+    boxes :: Vector{Any}              # per level (lo,hi) bounding box of Δω
 end
 function TBiotPoisson(flow::TFlow{D,T}; nonbiotfaces=(), fmm=true) where {D,T}
     isempty(flow.perdir) || @warn "BiotSavart BCs ignore perdir" maxlog=1
@@ -41,9 +43,11 @@ function TBiotPoisson(flow::TFlow{D,T}; nonbiotfaces=(), fmm=true) where {D,T}
     B = unique(vcat([Int32[let I = CartesianIndex(Tuple(Ti)[1:D]), i = Tuple(Ti)[D+1]
             LinearIndices(size(flow.p))[I[i] == 1 ? I + CartesianIndex(ntuple(d->d==i, D)) : I - CartesianIndex(ntuple(d->d==i, D))]
         end for Ti in tars[1]]]...))
-    b = TBiotPoisson{T,typeof(flow.p),typeof(flow.μ₀),D,typeof(pois),typeof(ω),typeof(g)}(
+    dω = map(a->(z = similar(a); fill!(z, 0); z), Tuple(ml))
+    b = TBiotPoisson{T,typeof(flow.p),typeof(flow.μ₀),D,typeof(pois),typeof(ω),typeof(g),typeof(dω)}(
         pois, pois.x, pois.L, pois.z, ω, g, tar, p, pois.n, flow.perdir, fmm, pois.red,
-        [CuVector{Int32}(undef,0), CuVector{Int32}(undef,0), CuVector{Int32}(B)])
+        [CuVector{Int32}(undef,0), CuVector{Int32}(undef,0), CuVector{Int32}(B)],
+        dω, Any[])
     affected_lists!(b)
     return b
 end
@@ -93,8 +97,18 @@ function affected_lists!(b::TBiotPoisson{T,S,V,D}) where {T,S,V,D}
     launch(k_affected!, ntuple(_->3,D), ntuple(d->Int(g[1].n[d])-2,D), m, L, g[1], Int32(layer_width(Val(D))))
     m2 = CUDA.zeros(Bool, Int.(g[2].n))
     launch(k_affected2!, inside_lo(g[2]), inside_hi(g[2]), m2, g[2], m, g[1])
-    b.lists[1] = CuVector{Int32}(findall(==(0x03), vec(m)))
-    b.lists[2] = CuVector{Int32}(findall(vec(m2)))
+    A1 = findall(==(0x03), m); A2 = findall(m2)
+    b.lists[1] = CuVector{Int32}(LinearIndices(m)[Array(A1)])
+    b.lists[2] = CuVector{Int32}(LinearIndices(m2)[Array(A2)])
+    # bounding boxes of Δω per level (empty box: lo > hi)
+    bbox(A) = isempty(A) ? (ntuple(_->2,D), ntuple(_->1,D)) :
+        (ntuple(d->minimum(I->I[d], A), D), ntuple(d->maximum(I->I[d], A), D))
+    boxes = Any[bbox(Array(A1)), bbox(Array(A2))]
+    for l in 3:length(g)
+        lo, hi = boxes[end]
+        push!(boxes, lo[1] > hi[1] ? (lo, hi) : (map(i->(i+2)÷2, lo), map(i->(i+2)÷2, hi)))
+    end
+    empty!(b.boxes); append!(b.boxes, boxes)
     CUDA.unsafe_free!(m); CUDA.unsafe_free!(m2)
     return b
 end
@@ -193,9 +207,6 @@ function fill_ω!(b::TBiotPoisson{T,S,V,D}, ω1, u) where {T,S,V,D}
     g = b.g
     launch(k_curl_layer!, ntuple(_->3,D), ntuple(d->Int(g[1].n[d])-2,D), ω1, u, g[1], Int32(layer_width(Val(D))))
     launch(k_curl_restrict!, inside_lo(g[2]), inside_hi(g[2]), b.ω[1], g[2], u, g[1])
-    for l in 3:length(g)
-        launch(k_vrestrict!, inside_lo(g[l]), inside_hi(g[l]), b.ω[l-1], g[l], b.ω[l-2], g[l-1])
-    end
 end
 
 # ---------------------------------------------------------------- FMM interactions
@@ -230,7 +241,7 @@ end
 end
 # Interaction sum at one target of one level (BiotSavartBCs.interaction).
 # P consecutive lanes share a target, splitting the outermost source loop; P ∈ {1,2,4,…,32}.
-function k_interact!(n, tar, ω, g::Grid{D}, top::Bool, bottom::Bool, P::Int32) where D
+function k_interact!(n, tar, ω, g::Grid{D}, top::Bool, bottom::Bool, P::Int32, blo, bhi) where D
     t = tid1() - i32
     k = t ÷ P + i32; p = t % P
     valid = k <= n
@@ -240,8 +251,10 @@ function k_interact!(n, tar, ω, g::Grid{D}, top::Bool, bottom::Bool, P::Int32) 
     l = li - (i-i32)*g.nc
     T = coords(g, l)
     c = closeR(Val(D))
-    olo = outer_lo(T, g, c, bottom, top)
-    ohi = outer_hi(T, g, c, bottom, top)
+    olo0 = outer_lo(T, g, c, bottom, top)
+    ohi0 = outer_hi(T, g, c, bottom, top)
+    olo = ntuple(d-> max(olo0[d], blo[d]), Val(D))
+    ohi = ntuple(d-> min(ohi0[d], bhi[d]), Val(D))
     ilo = ntuple(d-> max(T[d] - c, Int32(2)), Val(D))
     ihi = ntuple(d-> min(T[d] + c, g.n[d] - i32), Val(D))
     x = ntuple(d-> Float32(T[d]) + (d == i ? (T[d] == i32 ? 0.5f0 : -0.5f0) : 0f0), Val(D))
@@ -307,18 +320,26 @@ function k_project!(n, tar, a, g::Grid{D}, b, gc::Grid{D}) where D
     @inbounds a[li] += v
     return nothing
 end
-function fmm!(b::TBiotPoisson, ω1)
-    ωs = (ω1, b.ω...)
+"""
+    fmm!(b, ωs, boxes=nothing)
+
+Biot-Savart interactions on all levels of `ωs` (level-1 first, sources restricted to
+`boxes[l]` when given) and the coarse-to-fine projection; level-1 target slots of `ωs[1]`
+then hold the induced boundary velocity.
+"""
+function fmm!(b::TBiotPoisson{T,S,V,D}, ωs, boxes=nothing) where {T,S,V,D}
     nl = length(ωs)
     for l in 1:nl
         n = length(b.tar[l])
         P = clamp(prevpow(2, max(1, 65536 ÷ n)), 1, 32)
-        @cuda threads=256 blocks=cld(n*P, 256) k_interact!(Int32(n), b.tar[l], ωs[l], b.g[l], l == 1, l == nl, Int32(P))
+        blo, bhi = boxes === nothing ? (ntuple(_->1,D), Int.(b.g[l].n)) : boxes[l]
+        @cuda threads=256 blocks=cld(n*P, 256) k_interact!(Int32(n), b.tar[l], ωs[l], b.g[l], l == 1, l == nl, Int32(P), Int32.(blo), Int32.(bhi))
     end
     for l in nl-1:-1:1
         launch1(k_project!, length(b.tar[l]), b.tar[l], ωs[l], b.g[l], ωs[l+1], b.g[l+1])
     end
 end
+fmm!(b::TBiotPoisson, ω1::AbstractArray) = fmm!(b, (ω1, b.ω...))
 
 # ---------------------------------------------------------------- domain boundary updates
 # u at the boundary face of target (I,i): index 2 (low) or n (high)
@@ -453,15 +474,18 @@ end
 
 # ---------------------------------------------------------------- incremental vorticity
 # recompute ω on the affected cells from u - Δt·L∇p
-function k_curl_corr1!(n, list, ω, U::F, g::Grid{D}) where {D,F}
+function k_curl_corr1!(n, list, ω, dω, U::F, g::Grid{D}) where {D,F}
     k = tid1(); k <= n || return
     l = @inbounds list[k]
     @unroll for i in i32:Int32(D)
-        @inbounds ω[l + (i-i32)*g.nc] = curl_c(i, l, U, g)
+        li = l + (i-i32)*g.nc
+        v = curl_c(i, l, U, g)
+        @inbounds dω[li] = v - ω[li]
+        @inbounds ω[li] = v
     end
     return nothing
 end
-function k_curl_corr2!(n, list, ω2, g2::Grid{D}, U::F, g::Grid{D}) where {D,F}
+function k_curl_corr2!(n, list, ω2, dω2, g2::Grid{D}, U::F, g::Grid{D}) where {D,F}
     k = tid1(); k <= n || return
     l2 = @inbounds list[k]
     I = coords(g2, l2)
@@ -484,18 +508,34 @@ function k_curl_corr2!(n, list, ω2, g2::Grid{D}, U::F, g::Grid{D}) where {D,F}
                 inb && (s += curl_c(i, lin(g, J), U, g))
             end
         end
-        @inbounds ω2[l2 + (i-i32)*g2.nc] = s
+        li2 = l2 + (i-i32)*g2.nc
+        @inbounds dω2[li2] = s - ω2[li2]
+        @inbounds ω2[li2] = s
     end
     return nothing
 end
-function correct_ω!(b::TBiotPoisson, ω1, u, p, dt)
+"""
+    correct_ω!(b, ω1, u, p, dt, incremental)
+
+Recompute ω of `u - Δt·L∇p` on the affected cells (levels 1 and 2), storing the change in
+`b.dω`. Levels ≥3 are then restricted from ω (full update) or from Δω (incremental).
+"""
+function correct_ω!(b::TBiotPoisson, ω1, u, p, dt, incremental::Bool)
     g = b.g; op = b.levels[1].op
     U = UC(u, p, op, dt)
-    launch1(k_curl_corr1!, length(b.lists[1]), b.lists[1], ω1, U, g[1])
-    launch1(k_curl_corr2!, length(b.lists[2]), b.lists[2], b.ω[1], g[2], U, g[1])
+    launch1(k_curl_corr1!, length(b.lists[1]), b.lists[1], ω1, b.dω[1], U, g[1])
+    launch1(k_curl_corr2!, length(b.lists[2]), b.lists[2], b.ω[1], b.dω[2], g[2], U, g[1])
+    src = incremental ? b.dω : (ω1, b.ω...)
     for l in 3:length(g)
-        launch(k_vrestrict!, inside_lo(g[l]), inside_hi(g[l]), b.ω[l-1], g[l], b.ω[l-2], g[l-1])
+        launch(k_vrestrict!, inside_lo(g[l]), inside_hi(g[l]), src[l], g[l], src[l-1], g[l-1])
     end
+end
+# a[target] += d[target] on level 1 (incremental boundary velocity)
+function k_addtar!(n, tar, a, d)
+    k = tid1(); k <= n || return
+    li = @inbounds tar[k]
+    @inbounds a[li] += d[li]
+    return nothing
 end
 # Σr² over a cell list (block partials)
 function k_listsq!(n, ps, pm, list, r)
@@ -557,7 +597,7 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w, t; tol=1e-4, 
     fill!(b.pois.ωd, 1)
     # vorticity of u - Δt·L∇p, Biot-Savart boundary velocity
     fill_ω!(b, a.f, a.u)
-    correct_ω!(b, a.f, a.u, a.p, dt)
+    correct_ω!(b, a.f, a.u, a.p, dt, false)
     fmm!(b, a.f)
     launch1(k_biotbc!, nt, tar1, a.u, a.f, top.r, U, g, false)
     # residual r = div(u)/Δt - A p (Σr in slot 1), global flux fix, Σr²
@@ -575,8 +615,9 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w, t; tol=1e-4, 
         end
         r₂p = getsum(red, 3)
         # Biot-Savart update of the boundary velocity with the current p
-        correct_ω!(b, a.f, a.u, a.p, dt)
-        fmm!(b, a.f)
+        correct_ω!(b, a.f, a.u, a.p, dt, true)
+        fmm!(b, b.dω, b.boxes)
+        launch1(k_addtar!, nt, tar1, a.f, b.dω[1])
         list_sumsq!(b, b.lists[3], top.r, 5)
         nb = cld(nt, 256)
         @cuda threads=256 blocks=nb k_biotbc2!(Int32(nt), red.ps, red.pm, tar1, a.u, a.f, top.r, U, g, idt)

@@ -40,6 +40,11 @@ function tgv(which; L=32, Re=1600)
     ctor(which)((L,L,L), (0,0,0), 1/κ; U=1, u0=uλ, ν=1/(κ*Re), T, perdir=(1,2,3))
 end
 
+# WaterLily's deforming-body test: a circle pulsating through a scaling map (V ≠ 0)
+const Rd, εd, Tcd = 8f0, 0.25f0, 64f0
+sd(t) = 1-εd*(1-cospi(2t/Tcd))
+pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
+
 @testset "TurboLily vs WaterLily" begin
     # Periodic directions: TurboLily wraps neighbours in every Gauss-Seidel half sweep, while
     # WaterLily refreshes the periodic ghosts only between smoother calls, so periodic cases
@@ -53,7 +58,13 @@ end
         ("3D sphere uBC(t) + g", w->ctor(w)((64,32,32), Ufun, 6f0; U=1, ν=0.02, T,
             g=(i,x,t)->i==2 ? 0.01f0 : 0f0, body=AutoBody((x,t)->√sum(abs2,x .- SA[16f0,16f0,16f0])-6f0)), 5, false, 1e-4, 1e-2),
         ("3D periodic box, no body", w->ctor(w)((32,32,32),(1,0,0),8; ν=0.01, perdir=(2,3), T), 5, false, 2e-3, 1e-2),
-        ("3D Taylor-Green vortex (fully periodic)", tgv, 10, false, 2e-3, 1e-2)]
+        ("3D Taylor-Green vortex (fully periodic)", tgv, 10, false, 2e-3, 1e-2),
+        # TurboLily includes the deforming-body source term of WaterLily#328; compare only
+        # against a WaterLily that has it
+        (isdefined(WaterLily, :δv) ? [
+        ("2D deforming body", w->ctor(w)((64,64),(0,0),2Rd; ν=2Rd/250, T, body=pulsing(SA_F32[32,32], sd)), 8, true, 1e-4, 1e-2),
+        ("2D anti-phase deforming pair", w->ctor(w)((128,64),(0,0),2Rd; ν=2Rd/250, T,
+            body=pulsing(SA_F32[32,32], sd)+pulsing(SA_F32[96,32], t->√(2-sd(t)^2))), 8, true, 1e-4, 1e-2)] : [])...]
         du, dp, na, nb = compare(mk, nstep; remeasure=rem)
         @testset "$name" begin
             @test du < tolu
@@ -76,16 +87,35 @@ bmoving(which; m=48, D=24f0) = (c = SA[m/2f0, m/2f0, m/2f0]; z = 0f0;
     bctor(which)((2m,m,m),(1,0,0),D; ν=D/1f3, T,
         body=AutoBody((x,t)->√sum(abs2,x .- c)-D/2, (x,t)->x - SA[z, 3f0*sin(0.1f0*t), z])))
 
+# TurboLily uses the stopping criterion of BiotSavartBCs#13 (max|r| < tol, Σ|r|/N < tol/10);
+# step-by-step equivalence is only checked against a BiotSavartBCs that has it.
+const BSBC13 = occursin("l1n_tol", read(joinpath(dirname(pathof(BiotSavartBCs)), "BiotSavartPoisson.jl"), String))
+BSBC13 || @info "BiotSavartBCs predates #13 (stopping criterion): skipping the step-by-step Biot-Savart comparisons"
+
 @testset "TurboLily vs BiotSavartBCs" begin
-    for (name, mk, rem) in [("2D circle", w->bcircle(w), false), ("3D sphere", w->bsphere(w), false),
+    for (name, mk, rem) in (BSBC13 ? [("2D circle", w->bcircle(w), false), ("3D sphere", w->bsphere(w), false),
                             ("3D sphere nonbiotfaces", w->bsphere(w; nonbiotfaces=(-2,)), false),
-                            ("3D moving sphere", bmoving, true)]
+                            ("3D moving sphere", bmoving, true),
+                            ("3D deforming sphere", w->bctor(w)((96,48,48),(1,0,0),2Rd; ν=2Rd/250, T,
+                                body=pulsing(SA_F32[24,24,24], sd)), true)] : [])
         du, dp, na, nb = compare(mk, 5; remeasure=rem)
         @testset "$name" begin
             @test du < 1e-4
             @test dp < 1e-3
             @test na == nb
         end
+    end
+    @testset "symmetry images" begin
+        # BiotSavartBCs examples/square_sym.jl with image vortices across y and z; agreement with
+        # the `symmetry` override is checked in bench_stack/sym_ref.jl + sym_turbo.jl
+        plate(imgs) = TurboLily.BiotSimulation((64,32,32), (1,0,0), 16f0; ν=2*16f0/500, T,
+            nonbiotfaces=(-2,-3), images=imgs,
+            body=AutoBody(((x,y,z),t)->hypot(x-16f0, y-min(y,14f0), z-min(z,14f0))-2f0))
+        a = plate((-2,-3)); b = plate(())
+        for _ in 1:3; sim_step!(a; remeasure=false); sim_step!(b; remeasure=false); end
+        @test all(isfinite, Array(a.flow.u))
+        @test maxdiff(a.flow.u, b.flow.u) > 1e-2      # the images change the boundary velocity
+        @test_throws ArgumentError plate((-2,2))      # one plane per direction
     end
     @testset "potential flow around a circle" begin   # BiotSavartBCs test
         sim = TurboLily.BiotSimulation((512,512), (1,0), 256; T,

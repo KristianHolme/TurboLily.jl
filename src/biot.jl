@@ -14,7 +14,7 @@ the residual converges.
 - Level-2 vorticity is summed directly from the curl of `u` (no full level-1 field).
 - FMM interactions run one kernel per level over that level's target faces.
 """
-struct TBiotPoisson{T,S,V,D,P<:TPoisson,W,G,W1} <: AbstractPoisson{T,S,V}
+struct TBiotPoisson{T,S,V,D,P<:TPoisson,W,G,W1,K} <: AbstractPoisson{T,S,V}
     pois :: P
     x :: S
     L :: V
@@ -33,9 +33,14 @@ struct TBiotPoisson{T,S,V,D,P<:TPoisson,W,G,W1} <: AbstractPoisson{T,S,V}
     mask :: CuArray{UInt8,D}          # affected-cell mask on level 1
     bst :: CuVector{Int32}            # [nA1, box1 lo/hi, nA2, box2 lo/hi]
     nA :: Vector{Int}                 # host copies of the A1, A2 counts
+    images :: NTuple{K,Int32}         # symmetry planes (faces ±j) with image vortices
+    world :: Base.RefValue{UInt}      # world age of the last `symmetry` override check
 end
-function TBiotPoisson(flow::TFlow{D,T}; nonbiotfaces=(), fmm=true) where {D,T}
+function TBiotPoisson(flow::TFlow{D,T}; nonbiotfaces=(), fmm=true, images=()) where {D,T}
     isempty(flow.perdir) || @warn "BiotSavart BCs ignore perdir" maxlog=1
+    all(f -> f isa Integer && 1 <= abs(f) <= D, images) && allunique(images) && all(f -> -f ∉ images, images) ||
+        throw(ArgumentError("images must be distinct domain faces ±j, j ∈ 1:$D, with at most one per direction (got $images)"))
+    check_symmetry()
     pois = TPoisson(flow)
     ml = BiotSavartBCs.MLArray(flow.f)
     ω = Tuple(ml[2:end])
@@ -47,12 +52,25 @@ function TBiotPoisson(flow::TFlow{D,T}; nonbiotfaces=(), fmm=true) where {D,T}
     n = size(flow.p)
     B = Int32[LinearIndices(n)[I] for I in CartesianIndices(map(m->2:m-1, n)) if any(d->I[d]==2 || I[d]==n[d]-1, 1:D)]
     dω = map(a->(z = similar(a); fill!(z, 0); z), Tuple(ml))
-    b = TBiotPoisson{T,typeof(flow.p),typeof(flow.μ₀),D,typeof(pois),typeof(ω),typeof(g),typeof(dω)}(
+    b = TBiotPoisson{T,typeof(flow.p),typeof(flow.μ₀),D,typeof(pois),typeof(ω),typeof(g),typeof(dω),length(images)}(
         pois, pois.x, pois.L, pois.z, ω, g, tar, p, pois.n, flow.perdir, fmm, pois.red,
         [CuVector{Int32}(undef,256), CuVector{Int32}(undef,256), CuVector{Int32}(B)],
-        dω, Any[], CUDA.zeros(UInt8, size(flow.p)), CUDA.zeros(Int32, 16), [0, 0])
+        dω, Any[], CUDA.zeros(UInt8, size(flow.p)), CUDA.zeros(Int32, 16), [0, 0],
+        Int32.(Tuple(images)), Ref(Base.get_world_counter()))
     affected_lists!(b)
     return b
+end
+"""
+    check_symmetry()
+
+TurboLily's FMM does not call `BiotSavartBCs.symmetry`. Throw if a user method overrides it,
+pointing to the `images` keyword instead of silently ignoring the override.
+"""
+function check_symmetry()
+    any(m -> m.module !== BiotSavartBCs, methods(BiotSavartBCs.symmetry)) && throw(ErrorException(
+        "BiotSavartBCs.symmetry is overridden, but TurboLily does not call it. Pass the symmetry " *
+        "planes instead, e.g. TurboLily.BiotSimulation(...; nonbiotfaces=(-2,-3), images=(-2,-3))."))
+    return nothing
 end
 WaterLily.update!(b::TBiotPoisson) = (WaterLily.update!(b.pois); affected_lists!(b))
 Base.getproperty(b::TBiotPoisson, s::Symbol) = s === :levels ? getfield(b, :pois).levels : getfield(b, s)
@@ -314,15 +332,8 @@ end
 end
 # Interaction sum at one target of one level (BiotSavartBCs.interaction).
 # P consecutive lanes share a target, splitting the outermost source loop; P ∈ {1,2,4,…,32}.
-function k_interact!(n, tar, ω, g::Grid{D}, top::Bool, bottom::Bool, P::Int32, blo, bhi) where D
-    t = tid1() - i32
-    k = t ÷ P + i32; p = t % P
-    valid = k <= n
-    kk = valid ? k : n
-    li = @inbounds tar[kk]
-    i = (li - i32) ÷ g.nc + i32
-    l = li - (i-i32)*g.nc
-    T = coords(g, l)
+# Unscaled interaction sum at target cell T (component i), possibly an image outside the domain.
+@inline function target_sum(T::NTuple{D,Int32}, i, ω, g::Grid{D}, top, bottom, blo, bhi, p, P) where D
     c = closeR(Val(D))
     olo0 = outer_lo(T, g, c, bottom, top)
     ohi0 = outer_hi(T, g, c, bottom, top)
@@ -331,11 +342,45 @@ function k_interact!(n, tar, ω, g::Grid{D}, top::Bool, bottom::Bool, P::Int32, 
     ilo = ntuple(d-> max(T[d] - c, Int32(2)), Val(D))
     ihi = ntuple(d-> min(T[d] + c, g.n[d] - i32), Val(D))
     x = ntuple(d-> Float32(T[d]) + (d == i ? (T[d] == i32 ? 0.5f0 : -0.5f0) : 0f0), Val(D))
+    # compile-time component: only the two vorticity components that enter are loaded
+    return i == i32 ? boxsum(Val(1), x, ω, g, olo, ohi, ilo, ihi, top, p, P) :
+           i == 2i32 ? boxsum(Val(2), x, ω, g, olo, ohi, ilo, ihi, top, p, P) :
+                       boxsum(Val(3), x, ω, g, olo, ohi, ilo, ihi, top, p, P)
+end
+# Reflect target T across domain face `face` (BiotSavartBCs.image): ±j is the upper/lower face
+# normal to j. The normal velocity flips sign across the plane, the tangential ones do not.
+@inline function reflect(T::NTuple{D,Int32}, face::Int32, i, g::Grid{D}) where D
+    j = abs(face)
+    T2 = ntuple(Val(D)) do d
+        d == j ? (face > 0 ? Int32(2)*g.n[d] - T[d] - i32 : Int32(3) - T[d]) : T[d]
+    end
+    return T2, i == j ? -1f0 : 1f0
+end
+# Interaction sum at one target of one level (BiotSavartBCs.interaction), plus the image
+# targets of every non-empty subset of the symmetry planes `imgs` (BiotSavartBCs.symmetry).
+# P consecutive lanes share a target, splitting the outermost source loop; P ∈ {1,2,4,…,32}.
+function k_interact!(n, tar, ω, g::Grid{D}, top::Bool, bottom::Bool, P::Int32, blo, bhi, imgs::NTuple{K,Int32}) where {D,K}
+    t = tid1() - i32
+    k = t ÷ P + i32; p = t % P
+    valid = k <= n
+    kk = valid ? k : n
+    li = @inbounds tar[kk]
+    i = (li - i32) ÷ g.nc + i32
+    l = li - (i-i32)*g.nc
+    T = coords(g, l)
     val = 0f0
-    if valid   # compile-time component: only the two vorticity components that enter are loaded
-        val = i == i32 ? boxsum(Val(1), x, ω, g, olo, ohi, ilo, ihi, top, p, P) :
-              i == 2i32 ? boxsum(Val(2), x, ω, g, olo, ohi, ilo, ihi, top, p, P) :
-                          boxsum(Val(3), x, ω, g, olo, ohi, ilo, ihi, top, p, P)
+    if valid
+        val = target_sum(T, i, ω, g, top, bottom, blo, bhi, p, P)
+        @unroll for m in i32:Int32(2^K - 1)   # empty unless images are requested
+            Tm = T; sgn = 1f0
+            @unroll for b in i32:Int32(K)
+                if (m >> (b - i32)) & i32 == i32
+                    Tm, sb = reflect(Tm, imgs[b], i, g)
+                    sgn *= sb
+                end
+            end
+            val += sgn*target_sum(Tm, i, ω, g, top, bottom, blo, bhi, p, P)
+        end
     end
     off = P ÷ Int32(2)
     while off > 0
@@ -384,7 +429,7 @@ function fmm!(b::TBiotPoisson{T,S,V,D}, ωs, boxes=nothing) where {T,S,V,D}
         n = length(b.tar[l])
         P = clamp(prevpow(2, max(1, 65536 ÷ n)), 1, 32)
         blo, bhi = boxes === nothing ? (ntuple(_->1,D), Int.(b.g[l].n)) : boxes[l]
-        @cuda threads=256 blocks=cld(n*P, 256) k_interact!(Int32(n), b.tar[l], ωs[l], b.g[l], l == 1, l == nl, Int32(P), Int32.(blo), Int32.(bhi))
+        @cuda threads=256 blocks=cld(n*P, 256) k_interact!(Int32(n), b.tar[l], ωs[l], b.g[l], l == 1, l == nl, Int32(P), Int32.(blo), Int32.(bhi), b.images)
     end
     for l in nl-1:-1:1
         launch1(k_project!, length(b.tar[l]), b.tar[l], ωs[l], b.g[l], ωs[l+1], b.g[l+1])
@@ -589,6 +634,8 @@ and the global flux fix and the residual norms are updated from the boundary cel
 Stopping criterion as BiotSavartBCs#13 / `WaterLily.solver!`: `max|r| < tol`, `Σ|r|/N < tol/10`.
 """
 function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w, t; tol=2e-3, itmx=32) where {D,T}
+    w0 = Base.get_world_counter()
+    w0 == b.world[] || (check_symmetry(); b.world[] = w0)   # only after new method definitions
     dt = T(w)*a.Δt[end]; idt = inv(dt)
     U = T.(bctuple(a.uBC, T(t), D))
     top = b.levels[1]; op = top.op; g = op.g; red = b.red
@@ -637,13 +684,19 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w, t; tol=2e-3, 
     pflowBC!(a.u, g)
 end
 """
-    TurboLily.BiotSimulation(dims, uBC, L; nonbiotfaces=(), fmm=true, kwargs...)
+    TurboLily.BiotSimulation(dims, uBC, L; nonbiotfaces=(), images=(), fmm=true, kwargs...)
 
 Same signature as `BiotSavartBCs.BiotSimulation`; returns a `WaterLily.Simulation` with
 the CUDA flow and Biot-Savart pressure solver.
+
+`images` lists symmetry planes as domain faces (`-2` is the lower y face, `3` the upper z
+face, as in `BiotSavartBCs.image`). The Biot-Savart sum then also includes the image of the
+domain across every non-empty subset of these planes, which replaces overriding
+`BiotSavartBCs.symmetry` (see BiotSavartBCs' `square_sym` example). Usually combined with the
+same faces in `nonbiotfaces`, where the normal velocity stays zero.
 """
-function BiotSimulation(args...; nonbiotfaces=(), fmm=true, mem=CuArray, kwargs...)
+function BiotSimulation(args...; nonbiotfaces=(), fmm=true, images=(), mem=CuArray, kwargs...)
     WaterLily.Simulation(args...; mem=CuArray,
         flow_ctor=(dims,uBC;kw...)->TFlow(dims,uBC;kw...),
-        pois_ctor=flow->TBiotPoisson(flow; nonbiotfaces, fmm), kwargs...)
+        pois_ctor=flow->TBiotPoisson(flow; nonbiotfaces, fmm, images), kwargs...)
 end

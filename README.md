@@ -18,6 +18,21 @@ sim_step!(bsim, 10; remeasure=false)
 
 The arrays always live on the current CUDA device (`mem` is ignored) and `T` must be `Float32`.
 
+Symmetry planes with image vortices (BiotSavartBCs' `square_sym` example) are given as a
+keyword instead of by overriding `BiotSavartBCs.symmetry`:
+
+```julia
+# square plate on two slip/symmetry walls, images across the lower y and z faces
+sim = TurboLily.BiotSimulation((2N,N,N), (1,0,0), N/2; ν, body, nonbiotfaces=(-2,-3), images=(-2,-3))
+```
+
+`images` uses the face numbering of `BiotSavartBCs.image` (`-j` is the lower and `+j` the upper
+face normal to j). The Biot-Savart sum includes the reflection of the domain across every
+non-empty subset of the planes (for two planes: three images), with the normal velocity sign
+flipped across each plane. This matches the override to rounding. An overridden `symmetry` is
+detected and raises an error instead of being ignored. With no images the FMM kernel compiles
+as before. Two planes cost about 28 % more FMM time, about 3 % of a time step.
+
 ## Speed
 
 All results are from one RTX 2080 Ti, Float32, in ms per time step. The flow is a sphere at
@@ -41,9 +56,10 @@ below show 4.8× and 5.4× over a developed flow.
 ## Validation
 
 Every configuration is stepped side by side with the reference implementation, and the results
-must agree to rounding: `test/runtests.jl` contains 52 checks. These cover 2D and 3D, `exitBC`,
-periodic directions (including a fully periodic Taylor-Green vortex), `uBC(i,x,t)`, `g`, a moving body with `remeasure=true`, `udf` (body force
-and the Smagorinsky `sgs!`), Biot-Savart with `nonbiotfaces`, and the BiotSavartBCs
+must agree to rounding: `test/runtests.jl` contains 59 checks against the WaterLily#337 +
+BiotSavartBCs#13/#14 stack, plus the deforming-body checks against WaterLily master. These cover 2D and 3D, `exitBC`,
+periodic directions (including a fully periodic Taylor-Green vortex), `uBC(i,x,t)`, `g`, moving and deforming bodies (WaterLily's pulsating-circle test bodies) with `remeasure=true`, `udf` (body force
+and the Smagorinsky `sgs!`), Biot-Savart with `nonbiotfaces` and symmetry `images`, and the BiotSavartBCs
 potential-flow test. The pressure-iteration counts are identical.
 
 The velocity differences are of the same size as those between two runs of the reference code
@@ -408,7 +424,8 @@ zero, and the test suite agrees with both versions.
 #### 3.5 Not implemented
 
 - `fmm=false` (the tree sum).
-- Overriding `BiotSavartBCs.symmetry` for image vortices: it has no effect.
+- Arbitrary user `symmetry` overrides: only reflections across domain faces, through the
+  `images` keyword. An override raises an error.
 - `T=Float64` and non-CUDA arrays.
 
 ## Multi-GPU
@@ -429,11 +446,18 @@ NVLink):
 
 ## Setup and tests
 
-The environment in `../bench` (`Project.toml`) develops `../dev/WL`, `../dev/BSBC` and this
-package together with CUDA. All benchmark and validation scripts live there.
+Two environments develop this package together with CUDA and a reference stack:
+
+- `../bench_stack`: WaterLily#337 (`../dev/WL_337`) and BiotSavartBCs#14 (`../dev/BSBC_14`, which
+  includes #13). All 59 tests apply here.
+- `../bench`: WaterLily master with the GPU fix (`../dev/WL`) and BiotSavartBCs main
+  (`../dev/BSBC`). The deforming-body tests need WaterLily#328 and run only here. The Biot-Savart
+  step-by-step comparisons need BiotSavartBCs#13 and are skipped here.
+
+The benchmark and validation scripts live in both directories.
 
 ```
-cd ../bench
-julia --project=. ../TurboLily/test/runtests.jl     # 52 equivalence tests, about 4 min
+cd ../bench_stack
+julia --project=. ../TurboLily/test/runtests.jl     # equivalence tests, about 4 min
 julia --project=. bench.jl                          # WHICH=WL,T,B,TB  N=128
 ```

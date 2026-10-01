@@ -160,72 +160,6 @@ end
     end
     nothing
 end
-# 3D interior update marching in z: every face flux is evaluated once. x/y fluxes of
-# the 32×8 plane tile go through shared memory, the z flux is carried in registers.
-const MOM_NZ = 16
-function k_mom3!(lo, hi, out, uin, u0, g::Grid{3}, dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool) where {T,F,A}
-    fx = CuStaticSharedArray(T, (33, 8, 3))
-    fy = CuStaticSharedArray(T, (32, 9, 3))
-    tx, ty = threadIdx().x, threadIdx().y
-    x = lo[1] + (blockIdx().x - i32)*Int32(32) + tx - i32
-    y = lo[2] + (blockIdx().y - i32)*Int32(8) + ty - i32
-    z0 = lo[3] + (blockIdx().z - i32)*Int32(MOM_NZ)
-    z1 = min(z0 + Int32(MOM_NZ) - i32, hi[3])
-    ok = x <= hi[1] && y <= hi[2]
-    s2, s3 = g.s[2], g.s[3]
-    I = (x, y, z0); l = lin(g, I)
-    zl1 = zl2 = zl3 = zero(T)
-    if ok
-        zl1 = fluxi(3, 1, l, uin, g, λ, ν)
-        zl2 = fluxi(3, 2, l, uin, g, λ, ν)
-        zl3 = fluxi(3, 3, l, uin, g, λ, ν)
-    end
-    xe = tx == Int32(32) || x == hi[1]
-    ye = ty == Int32(8) || y == hi[2]
-    for z in z0:z1
-        I = (x, y, z); l = lin(g, I)
-        zh1 = zh2 = zh3 = zero(T)
-        if ok
-            @unroll for i in i32:Int32(3)
-                @inbounds fx[tx, ty, i] = x == 2i32 ? flux(1, i, I, l, uin, g, λ, ν, per) : fluxi(1, i, l, uin, g, λ, ν)
-                @inbounds fy[tx, ty, i] = fluxi(2, i, l, uin, g, λ, ν)
-            end
-            if xe
-                Ip = (x+i32, y, z)
-                @unroll for i in i32:Int32(3)
-                    @inbounds fx[tx+i32, ty, i] = x+i32 == g.n[1] ? flux(1, i, Ip, l+i32, uin, g, λ, ν, per) : fluxi(1, i, l+i32, uin, g, λ, ν)
-                end
-            end
-            if ye
-                Ip = (x, y+i32, z)
-                @unroll for i in i32:Int32(3)
-                    @inbounds fy[tx, ty+i32, i] = fluxi(2, i, l+s2, uin, g, λ, ν)
-                end
-            end
-            Ip = (x, y, z+i32)
-            zh1 = fluxi(3, 1, l+s3, uin, g, λ, ν)
-            zh2 = fluxi(3, 2, l+s3, uin, g, λ, ν)
-            zh3 = fluxi(3, 3, l+s3, uin, g, λ, ν)
-        end
-        sync_threads()
-        if ok
-            zl = (zl1, zl2, zl3); zh = (zh1, zh2, zh3)
-            @unroll for i in i32:Int32(3)
-                r = zero(T)
-                @inbounds r += fx[tx, ty, i]; @inbounds r -= fx[tx+i32, ty, i]
-                @inbounds r += fy[tx, ty, i]; @inbounds r -= fy[tx, ty+i32, i]
-                r += zl[i]; r -= zh[i]
-                r += accel(acc, i, I, t, T)
-                li = l + (i-i32)*g.nc
-                @fastmath v = @inbounds(u0[li]) + dt*r
-                @inbounds out[li] = corr ? T(0.5)*(uin[li] + v) : v
-            end
-            zl1, zl2, zl3 = zh1, zh2, zh3
-        end
-        sync_threads()
-    end
-    return nothing
-end
 # core cells (all faces interior) + the one-cell shell next to the domain boundary
 function core_and_shell(g::Grid{D}, fullx=false) where D
     lo, hi = inside_lo(g), inside_hi(g)
@@ -241,12 +175,17 @@ function core_and_shell(g::Grid{D}, fullx=false) where D
     end
     return (clo, chi), slabs
 end
-function k_momi!(lo, hi, out, uin, u0, g::Grid{D}, dt::T, ν::T, λ::F, acc::A, t::T, corr::Bool) where {D,T,F,A}
+# per-cell update with y/z faces interior and the full x range: the general flux is only
+# evaluated on the x faces at the domain boundary (x=2 lower, x=n-1 upper)
+function k_momc!(lo, hi, out, uin, u0, g::Grid{D}, dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool) where {D,T,F,A}
     I, ok = cellidx(lo, hi); ok || return
     l = lin(g, I)
+    xlo = I[1] == 2i32; xhi = I[1] == g.n[1] - i32
     @unroll for i in i32:Int32(D)
         r = zero(T)
-        @unroll for j in i32:Int32(D)
+        r += xlo ? flux(1, i, I, l, uin, g, λ, ν, per) : fluxi(1, i, l, uin, g, λ, ν)
+        r -= xhi ? flux(1, i, shift(I,1,1), l+i32, uin, g, λ, ν, per) : fluxi(1, i, l+i32, uin, g, λ, ν)
+        @unroll for j in Int32(2):Int32(D)
             r += fluxi(j, i, l, uin, g, λ, ν)
             r -= fluxi(j, i, l+g.s[j], uin, g, λ, ν)
         end
@@ -257,17 +196,10 @@ function k_momi!(lo, hi, out, uin, u0, g::Grid{D}, dt::T, ν::T, λ::F, acc::A, 
     end
     return nothing
 end
-function launch_core!(a::TFlow{3,T}, lo, hi, out, uin, t, corr) where T
-    g, dt = a.grid, a.Δt[end]
-    ext = hi .- lo .+ 1
-    any(ext .<= 0) && return
-    bl = (cld(ext[1],32), cld(ext[2],8), cld(ext[3],MOM_NZ))
-    @cuda threads=(32,8,1) blocks=bl k_mom3!(Int32.(lo), Int32.(hi), out, uin, a.u⁰, g, dt, a.ν, a.λ, a.per, a.acc, T(t), corr)
-end
 launch_core!(a::TFlow{D,T}, lo, hi, out, uin, t, corr) where {D,T} =
-    launch(k_momi!, lo, hi, out, uin, a.u⁰, a.grid, a.Δt[end], a.ν, a.λ, a.acc, T(t), corr)
+    launch(k_momc!, lo, hi, out, uin, a.u⁰, a.grid, a.Δt[end], a.ν, a.λ, a.per, a.acc, T(t), corr)
 function launch_mom!(a::TFlow{D,T}, out, uin, t, corr) where {D,T}
-    fullx = D == 3
+    fullx = true
     (clo, chi), slabs = core_and_shell(a.grid, fullx)
     launch_core!(a, clo, chi, out, uin, t, corr)
     for (k, (lo, hi)) in enumerate(slabs)

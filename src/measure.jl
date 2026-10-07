@@ -26,7 +26,7 @@ end
 # WaterLily.measure! for one cell, only touching cells that are or were near the body.
 # Appends the BDIM band faces (class 1: μ₀≠1, μ₁=0; class 2: μ₁≠0) and flags V≠0.
 function k_measure!(lo, hi, μ₀, μ₁, V, σ, near_prev, body::B, t::T, ϵ::T, d²::T, g::Grid{D},
-                    stat, band, shell) where {B,T,D}
+                    stat, band, shell, bdimlow::NTuple{D,Bool}) where {B,T,D}
     I, ok = cellidx(lo, hi)
     l = ok ? lin(g, I) : i32
     near = false
@@ -68,7 +68,10 @@ function k_measure!(lo, hi, μ₀, μ₁, V, σ, near_prev, body::B, t::T, ϵ::T
                 end
                 cls = m0 != 1 ? 1 : 0
             end
-            I[i] == 2i32 && (cls = 0)   # boundary normal face: BC! overwrites u there
+            # lower boundary face: BC! overwrites u there, except where `bdimlow` (an interior
+            # face in a periodic direction, or a non-Biot-Savart face of a Biot-Savart
+            # simulation, where μ₀ is zeroed after this kernel by vecBC0!)
+            I[i] == 2i32 && (cls = bdimlow[i] ? max(cls, 1) : 0)
         end
         wappend!(band, stat, 1, cls == 1, li)
         wappend!(shell, stat, 2, cls == 2, li)
@@ -92,7 +95,7 @@ function WaterLily.measure!(a::TFlow{D,T}, body::AbstractBody; t=zero(T), ϵ=1) 
     while true
         fill!(a.mstat, 0)
         launch(k_measure!, inside_lo(g), inside_hi(g), a.μ₀, a.μ₁, a.V, a.σ, a.near, body, T(t), T(ϵ),
-               T((2+ϵ)^2), g, a.mstat, a.band, a.shell)
+               T((2+ϵ)^2), g, a.mstat, a.band, a.shell, a.bdimlow)
         vecBC0!(a.μ₀, g, a.per, false)
         vecBC0!(a.V, g, a.per, a.exitBC)
         st = Array(a.mstat)

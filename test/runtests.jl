@@ -72,6 +72,19 @@ pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
             occursin("Taylor", name) || @test na == nb   # periodic GS converges in fewer iterations
         end
     end
+    @testset "update uBC with setproperties" begin   # WaterLily#340
+        swap!(sim, uBC) = (sim.flow = WaterLily.setproperties(sim.flow; uBC); nothing)
+        sim = TurboLily.Simulation((64,64), (1,0), 16; T)
+        swap!(sim, (1f0,0f0))   # compile
+        @test @allocated(swap!(sim, (2f0,0f0))) < sizeof(sim.flow.p)   # arrays are shared, not copied
+        sim_step!(sim)
+        @test all(Array(sim.flow.u)[2,2:end-1,1] .== 2)   # the kernels use the new uBC
+        swap!(sim, (3,0))   # an Int tuple is converted to the flow's eltype
+        @test sim.flow.uBC === (3f0,0f0)
+        swap!(sim, (i,x,t)->i==1 ? 1.5f0 : 0f0)   # a function uBC rebuilds the acceleration term too
+        sim_step!(sim)
+        @test all(Array(sim.flow.u)[2,2:end-1,1] .== 1.5f0)
+    end
     @testset "udf body force" begin
         grav!(flow, t; g=0.01f0) = (WaterLily.@loop flow.f[Ii] += g*(last(Ii)==2) over Ii in CartesianIndices(flow.f); nothing)
         du, dp, na, nb = compare(w->circle(w), 10; udf=grav!, g=0.02f0)
@@ -87,17 +100,20 @@ bmoving(which; m=48, D=24f0) = (c = SA[m/2f0, m/2f0, m/2f0]; z = 0f0;
     bctor(which)((2m,m,m),(1,0,0),D; ν=D/1f3, T,
         body=AutoBody((x,t)->√sum(abs2,x .- c)-D/2, (x,t)->x - SA[z, 3f0*sin(0.1f0*t), z])))
 
-# TurboLily uses the stopping criterion of BiotSavartBCs#13 (max|r| < tol, Σ|r|/N < tol/10);
-# step-by-step equivalence is only checked against a BiotSavartBCs that has it.
-const BSBC13 = occursin("l1n_tol", read(joinpath(dirname(pathof(BiotSavartBCs)), "BiotSavartPoisson.jl"), String))
-BSBC13 || @info "BiotSavartBCs predates #13 (stopping criterion): skipping the step-by-step Biot-Savart comparisons"
+# square plate on two symmetry planes (BiotSavartBCs README / former examples/square_sym.jl)
+bplate(which; sym=(-2,-3)) = bctor(which)((64,32,32), (1,0,0), 16f0; ν=2*16f0/500, T, symmetry=sym,
+    body=AutoBody(((x,y,z),t)->hypot(x-16f0, y-min(y,14f0), z-min(z,14f0))-2f0))
+bhalfcircle(which) = bctor(which)((128,64),(1,0),32f0; ν=32f0/1f3, T, symmetry=(-2,),
+    body=AutoBody((x,t)->√sum(abs2,x .- SA[64f0,0f0])-16f0))
 
 @testset "TurboLily vs BiotSavartBCs" begin
-    for (name, mk, rem) in (BSBC13 ? [("2D circle", w->bcircle(w), false), ("3D sphere", w->bsphere(w), false),
+    for (name, mk, rem) in [("2D circle", w->bcircle(w), false), ("3D sphere", w->bsphere(w), false),
                             ("3D sphere nonbiotfaces", w->bsphere(w; nonbiotfaces=(-2,)), false),
+                            ("2D half circle, symmetry plane", bhalfcircle, false),
+                            ("3D plate, two symmetry planes", w->bplate(w), false),
                             ("3D moving sphere", bmoving, true),
                             ("3D deforming sphere", w->bctor(w)((96,48,48),(1,0,0),2Rd; ν=2Rd/250, T,
-                                body=pulsing(SA_F32[24,24,24], sd)), true)] : [])
+                                body=pulsing(SA_F32[24,24,24], sd)), true)]
         du, dp, na, nb = compare(mk, 5; remeasure=rem)
         @testset "$name" begin
             @test du < 1e-4
@@ -105,17 +121,12 @@ BSBC13 || @info "BiotSavartBCs predates #13 (stopping criterion): skipping the s
             @test na == nb
         end
     end
-    @testset "symmetry images" begin
-        # BiotSavartBCs examples/square_sym.jl with image vortices across y and z; agreement with
-        # the `symmetry` override is checked in bench_stack/sym_ref.jl + sym_turbo.jl
-        plate(imgs) = TurboLily.BiotSimulation((64,32,32), (1,0,0), 16f0; ν=2*16f0/500, T,
-            nonbiotfaces=(-2,-3), images=imgs,
-            body=AutoBody(((x,y,z),t)->hypot(x-16f0, y-min(y,14f0), z-min(z,14f0))-2f0))
-        a = plate((-2,-3)); b = plate(())
-        for _ in 1:3; sim_step!(a; remeasure=false); sim_step!(b; remeasure=false); end
-        @test all(isfinite, Array(a.flow.u))
-        @test maxdiff(a.flow.u, b.flow.u) > 1e-2      # the images change the boundary velocity
-        @test_throws ArgumentError plate((-2,2))      # one plane per direction
+    @testset "argument checks" begin   # as BiotSavartBCs.BiotSavartPoisson
+        @test_throws ArgumentError bplate(:turbo; sym=(-2,2))   # one plane per direction
+        @test_throws ArgumentError bplate(:turbo; sym=(4,))
+        @test_throws ArgumentError TurboLily.BiotSimulation((64,32),(1,0),8f0; T, fmm=false, symmetry=(-2,))
+        @test_throws ArgumentError TurboLily.BiotSimulation((64,32),(1,0),8f0; T, exitBC=true)
+        @test_throws ArgumentError TurboLily.BiotSimulation((32,32,32),(1,0,0),8f0; T, perdir=(3,))
     end
     @testset "potential flow around a circle" begin   # BiotSavartBCs test
         sim = TurboLily.BiotSimulation((512,512), (1,0), 256; T,

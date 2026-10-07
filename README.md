@@ -17,22 +17,22 @@ sim_step!(bsim, 10; remeasure=false)
 ```
 
 The arrays always live on the current CUDA device (`mem` is ignored) and `T` must be `Float32`.
-Tested with Julia 1.13.1 and CUDA.jl 6.2.2 (GPUCompiler 1.23) and 6.4 (GPUCompiler 2.9).
+Requires WaterLily 1.9.1 or later (domain BCs applied in `mom_project!`); tested against
+WaterLily 1.9.1 and BiotSavartBCs 1.0.0, with Julia 1.13.1 and CUDA.jl 6.2.2 (GPUCompiler 1.23)
+and 6.4 (GPUCompiler 2.9). `WaterLily.setproperties(sim.flow; uBC)` works as for a WaterLily flow.
 
-Symmetry planes with image vortices (BiotSavartBCs' `square_sym` example) are given as a
-keyword instead of by overriding `BiotSavartBCs.symmetry`:
+Symmetry planes take the same `symmetry` keyword as `BiotSavartBCs.BiotSimulation`:
 
 ```julia
-# square plate on two slip/symmetry walls, images across the lower y and z faces
-sim = TurboLily.BiotSimulation((2N,N,N), (1,0,0), N/2; ν, body, nonbiotfaces=(-2,-3), images=(-2,-3))
+# square plate on two symmetry planes, the lower y and z faces
+sim = TurboLily.BiotSimulation((2N,N,N), (1,0,0), N/2; ν, body, symmetry=(-2,-3))
 ```
 
-`images` uses the face numbering of `BiotSavartBCs.image` (`-j` is the lower and `+j` the upper
-face normal to j). The Biot-Savart sum includes the reflection of the domain across every
-non-empty subset of the planes (for two planes: three images), with the normal velocity sign
-flipped across each plane. This matches the override to rounding. An overridden `symmetry` is
-detected and raises an error instead of being ignored. With no images the FMM kernel compiles
-as before. Two planes cost about 28 % more FMM time, about 3 % of a time step.
+`-j` is the lower and `+j` the upper face normal to j, at most one per direction. These faces
+get no Biot-Savart BCs, and the Biot-Savart sum includes the reflection of the domain across
+every non-empty subset of the planes (for two planes: three images), with the normal velocity
+sign flipped across each plane. Without `symmetry` the FMM kernel compiles as before. Two
+planes cost about 28 % more FMM time, about 3 % of a time step.
 
 ## Speed
 
@@ -61,11 +61,12 @@ in `RESULTS.md`.
 ## Validation
 
 Every configuration is stepped side by side with the reference implementation, and the results
-must agree to rounding: `test/runtests.jl` contains 59 checks against the WaterLily#337 +
-BiotSavartBCs#13/#14 stack, plus the deforming-body checks against WaterLily master. These cover 2D and 3D, `exitBC`,
+must agree to rounding: `test/runtests.jl` contains 81 checks against WaterLily 1.9.1 and
+BiotSavartBCs 1.0.0 (their main branches as of October 2026). These cover 2D and 3D, `exitBC`,
 periodic directions (including a fully periodic Taylor-Green vortex), `uBC(i,x,t)`, `g`, moving and deforming bodies (WaterLily's pulsating-circle test bodies) with `remeasure=true`, `udf` (body force
-and the Smagorinsky `sgs!`), Biot-Savart with `nonbiotfaces` and symmetry `images`, and the BiotSavartBCs
-potential-flow test. The pressure-iteration counts are identical.
+and the Smagorinsky `sgs!`), `setproperties(flow; uBC)`, Biot-Savart with `nonbiotfaces` and
+`symmetry` planes (2D and 3D), and the BiotSavartBCs potential-flow test. The pressure-iteration
+counts are identical.
 
 The velocity differences are of the same size as those between two runs of the reference code
 when one run gets a 1e-6 perturbation. The 3D flows amplify rounding differences in both codes
@@ -423,19 +424,11 @@ motion moves less than one cell per step. WL has no such assumption.
 
 #### 3.4 Version semantics
 
-TurboLily follows WaterLily master in two places:
-
-- `residual!` subtracts the mean residual only from solved rows, divided by their count;
-- the deforming-body source term from #328.
-
-WaterLily#337 is based on an older master without either. For static bodies the source term is
-zero, and the test suite agrees with both versions.
-
 #### 3.5 Not implemented
 
 - `fmm=false` (the tree sum).
-- Arbitrary user `symmetry` overrides: only reflections across domain faces, through the
-  `images` keyword. An override raises an error.
+- Periodic directions with Biot-Savart BCs (BiotSavartBCs#19). `TurboLily.BiotSimulation`
+  raises an error for `perdir`.
 - `T=Float64` and non-CUDA arrays.
 
 ## Multi-GPU
@@ -456,16 +449,18 @@ NVLink):
 
 ## Setup and tests
 
-Two environments develop this package together with CUDA and a reference stack:
+`../bench` develops this package together with the WaterLily and BiotSavartBCs main branches
+(`../dev/WL`, `../dev/BSBC`); all 81 tests run there:
 
-- `../bench_stack`: WaterLily#337 (`../dev/WL_337`) and BiotSavartBCs#14 (`../dev/BSBC_14`, which
-  includes #13). All 59 tests apply here.
-- `../bench_release`: WaterLily#337 and BiotSavartBCs 1.0 (`../dev/BSBC_main`); all 59 tests apply.
-- `../bench`: WaterLily master with the GPU fix (`../dev/WL`) and BiotSavartBCs main
-  (`../dev/BSBC`). The deforming-body tests need WaterLily#328 and run only here. The Biot-Savart
-  step-by-step comparisons need BiotSavartBCs#13 and are skipped here.
+```sh
+julia --project=../bench -e 'include("test/runtests.jl")'
+```
 
-The benchmark and validation scripts live in both directories.
+`../bench_stack` and `../bench_release` hold the WaterLily#337 + BiotSavartBCs#14 / 1.0 stacks
+used for the speed comparisons above. They predate WaterLily 1.9.1, which the current
+TurboLily requires.
+
+The benchmark and validation scripts live in `../bench`.
 
 ```
 cd ../bench_stack

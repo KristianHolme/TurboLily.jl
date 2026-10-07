@@ -356,6 +356,10 @@ Run `f()` (a fixed sequence of launches that swaps the level buffers like one V-
 through a cached CUDA graph: plain execution the first time a (key, buffer state) is
 seen, capture on the second, graph replay afterwards.
 """
+# (internal to CUDA.jl, looked up defensively)
+const CUFUNCTION_LOCK = isdefined(CUDA, :cufunction_lock) ? CUDA.cufunction_lock :
+    isdefined(CUDA, :CUDACore) && isdefined(CUDA.CUDACore, :cufunction_lock) ?
+    CUDA.CUDACore.cufunction_lock : ReentrantLock()
 function graphed!(f::F, p::TPoisson, key) where F
     k = (key, objectid(p.levels[1].r))
     ex = get(p.graphs, k, nothing)
@@ -363,10 +367,25 @@ function graphed!(f::F, p::TPoisson, key) where F
         CUDA.launch(ex); swap_levels!(p)
     elseif k in p.seen
         state = [(lv.r, lv.ϵ) for lv in p.levels]
+        # Capture on a private non-blocking stream in relaxed mode, so that CUDA calls of
+        # other tasks (possibly scheduled on this thread, possibly on the legacy stream)
+        # cannot touch or depend on the capturing stream. Nothing runs during a capture;
+        # the graph is launched on the task's stream. No GC during the capture: a
+        # finalizer freeing GPU memory would be captured too.
+        # CUDA.jl's kernel compile/load lock is held too: loading a module while a stream
+        # is capturing fails, and CUDA.jl's retry synchronizes the device.
+        cs = CuStream(; flags=CUDA.STREAM_NON_BLOCKING)
+        gc = GC.enable(false)
         g = try
-            CUDA.capture(f; flags=CUDA.STREAM_CAPTURE_MODE_THREAD_LOCAL, throw_error=false)
+            lock(CUFUNCTION_LOCK) do
+                CUDA.stream!(cs) do
+                    CUDA.capture(f; flags=CUDA.STREAM_CAPTURE_MODE_RELAXED, throw_error=false)
+                end
+            end
         catch
             nothing
+        finally
+            GC.enable(gc)
         end
         if g === nothing   # capture failed: restore the buffers and run normally
             for (lv, (r, ϵ)) in zip(p.levels, state); lv.r, lv.ϵ = r, ϵ; end
@@ -469,8 +488,12 @@ function k_proj!(lo, hi, u, x, op::Op{D}, dt) where D
     end
     return nothing
 end
-function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w, t) where {D,T}
-    dt = T(w)*a.Δt[end]; g = a.grid; lv = b.levels[1]
+# (WaterLily ≥ 1.9.1: domain BCs at t and the convective exit (predictor) are applied here,
+# and the step is Δt/w with w=1 in the predictor and w=2 in the corrector)
+function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t) where {D,T}
+    BC!(a, a.u, t)
+    w == 1 && a.exitBC && exitBC!(a, a.u, a.u⁰, a.Δt[end])
+    dt = a.Δt[end]/T(w); g = a.grid; lv = b.levels[1]
     red_launch(k_resid_src!, inside_lo(g), inside_hi(g), b.red, 1, lv.r, lv.x, a.u, a.V, lv.op, inv(dt), !a.Vzero)
     solve!(b, dt)
     launch(k_proj!, inside_lo(g), inside_hi(g), a.u, b.x, lv.op, dt)

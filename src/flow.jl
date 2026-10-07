@@ -47,6 +47,7 @@ mutable struct TFlow{D,T,Sf<:AbstractArray{T},Vf<:AbstractArray{T},Tf<:AbstractA
     acc :: Af                   # isbits acceleration or nothing
     grid :: Grid{D}
     per :: NTuple{D,Bool}
+    bdimlow :: NTuple{D,Bool}   # lower boundary faces normal to j get the BDIM update (no BC! overwrites them)
     band :: CuVector{Int32}     # linear (I,i) indices of faces with μ₀≠1, μ₁=0 (u = V+μ₀f̃)
     shell :: CuVector{Int32}    # linear (I,i) indices of faces with μ₁≠0 (full BDIM update)
     nband :: Int
@@ -58,17 +59,46 @@ mutable struct TFlow{D,T,Sf<:AbstractArray{T},Vf<:AbstractArray{T},Tf<:AbstractA
     mstat :: CuVector{Int32}    # [nband, nshell, V≠0] from the last measure!
 end
 
-function TFlow(N::NTuple{D}, uBC; T=Float32, mem=CuArray, kw...) where D
+"""
+    TFlow(N, uBC; bdimfaces=(), kwargs...)
+
+`bdimfaces`: lower domain faces (`-j`) whose normal velocity is not reset by `BC!` after the
+momentum update (non-Biot-Savart faces of a Biot-Savart simulation), so they get the BDIM
+update like any other face. Faces in periodic directions always do.
+"""
+function TFlow(N::NTuple{D}, uBC; T=Float32, mem=CuArray, bdimfaces=(), kw...) where D
     T === Float32 || throw(ArgumentError("TurboLily supports T=Float32 only (got T=$T)"))
     f = WaterLily.Flow(N, uBC; T, mem=CuArray, kw...)
+    # `f` is swapped into `u` by the corrector: start it with the ghost values of `u`, as
+    # cells that no BC writes (domain corners and edges) keep their initial values
+    copyto!(f.f, f.u)
     bc = f.uBC isa Function ? f.uBC : ConstBC{D,T}(T.(f.uBC))
     acc = make_acc(f.g, f.uBC)
     per = ntuple(j->j ∈ f.perdir, D)
+    bdimlow = ntuple(j->per[j] || -j ∈ bdimfaces, D)
     a = TFlow{D,T,typeof(f.p),typeof(f.u),typeof(f.μ₁),typeof(f.λ),typeof(bc),typeof(acc)}(
         f.u, f.u⁰, f.f, f.p, f.σ, f.V, f.μ₀, f.μ₁, f.uBC, f.Δt, f.ν, f.g, f.exitBC, f.perdir, f.λ,
-        bc, acc, Grid(f.p), per, CuVector{Int32}(undef,1024), CuVector{Int32}(undef,1024), 0, 0, true,
+        bc, acc, Grid(f.p), per, bdimlow, CuVector{Int32}(undef,1024), CuVector{Int32}(undef,1024), 0, 0, true,
         RedBuf(Grid(f.p)), nothing, (n = similar(f.p, UInt8); fill!(n, 0x01); n), CUDA.zeros(Int32, 4))
     return a
+end
+
+"""
+    setproperties(flow::TFlow, patch::NamedTuple)
+
+`WaterLily.setproperties(flow; uBC)` as for `WaterLily.Flow`: a new flow sharing all arrays,
+with the kernel-side boundary function and acceleration rebuilt from the new values.
+A tuple `uBC` is converted to the flow's eltype.
+"""
+function WaterLily.setproperties(a::TFlow{D,T}, patch::NamedTuple) where {D,T}
+    names = fieldnames(typeof(a))
+    all(n -> n in names, keys(patch)) || throw(ArgumentError("TFlow has no field(s) $(setdiff(keys(patch), names))"))
+    nt = merge(NamedTuple{names}(map(n -> getfield(a, n), names)), patch)
+    uBC = nt.uBC isa Tuple ? T.(nt.uBC) : nt.uBC
+    bc = uBC isa Function ? uBC : ConstBC{D,T}(uBC)
+    acc = make_acc(nt.g, uBC)
+    nt = merge(nt, (; uBC, bc, acc))
+    return TFlow{D,T,typeof(nt.p),typeof(nt.u),typeof(nt.μ₁),typeof(nt.λ),typeof(bc),typeof(acc)}(values(nt)...)
 end
 
 # ---------------------------------------------------------------- convection-diffusion
@@ -402,16 +432,13 @@ function WaterLily.mom_step!(a::TFlow{D,T}, b::AbstractPoisson; udf=nothing, kwa
     # predictor
     @log "p"
     mom_update!(a, a.u, a.u⁰, t₀, false)
-    BC!(a, a.u, t₁)
-    a.exitBC && exitBC!(a, a.u, a.u⁰, a.Δt[end])
     WaterLily.mom_project!(a, b, 1, t₁)
     # corrector
     @log "c"
     mom_update!(a, a.f, a.u, t₁, true)
     copy_exit!(a, a.f, a.u)
     a.u, a.f = a.f, a.u
-    BC!(a, a.u, t₁)
-    WaterLily.mom_project!(a, b, 0.5, t₁)
+    WaterLily.mom_project!(a, b, 2, t₁)
     push!(a.Δt, WaterLily.CFL(a))
 end
 
@@ -485,14 +512,11 @@ function mom_step_udf!(a::TFlow{D,T}, b::AbstractPoisson; udf, kwargs...) where 
     t₁ = sum(a.Δt); t₀ = t₁ - a.Δt[end]
     @log "p"
     udf_update!(a, a.u, a.u⁰, t₀, false, udf; kwargs...)
-    BC!(a, a.u, t₁)
-    a.exitBC && exitBC!(a, a.u, a.u⁰, a.Δt[end])
     WaterLily.mom_project!(a, b, 1, t₁)
     @log "c"
     udf_update!(a, a.aux, a.u, t₁, true, udf; kwargs...)
     copy_exit!(a, a.aux, a.u)
     a.u, a.aux = a.aux, a.u
-    BC!(a, a.u, t₁)
-    WaterLily.mom_project!(a, b, 0.5, t₁)
+    WaterLily.mom_project!(a, b, 2, t₁)
     push!(a.Δt, WaterLily.CFL(a))
 end

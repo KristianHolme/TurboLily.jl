@@ -1,11 +1,14 @@
 # Benchmarks
 
+The paths in parentheses, such as `bench/suite/`, name the benchmark scripts. These are kept
+outside this repository.
+
 ## WaterLily-Benchmarks cases on an A10, October 2026 (`bench/suite/`)
 
 These are the eight cases of [WaterLily-Benchmarks](https://github.com/WaterLily-jl/WaterLily-Benchmarks)
 (`src/cases.jl` at f6034df), on the GPU only, from the smallest default size up to the largest
 power of two that fits on the card. The references are WaterLily master eb1ace3 (1.9.1) and
-BiotSavartBCs main c7b6ffd (1.0.0). The machine is nam-shub-02, with 4× NVIDIA A10
+BiotSavartBCs main c7b6ffd (1.0.0). The machine has 4× NVIDIA A10
 (22.5 GB, 600 GB/s). Float32, Julia 1.13.1, CUDA.jl 6.4.
 
 The method is the suite's. Each case runs in its own process and starts from a developed-flow
@@ -156,7 +159,7 @@ changes. They are kept for the comparison against the PR branches.
 
 BiotSavartBCs 1.0 is `main` (ce98bf2): #13's stopping criterion and the `fill_ω!` part of #14,
 but not #14's FMM `interaction` rewrite. WaterLily is #337 as in the stack below, because
-WaterLily master does not run on GPUs. One RTX 2080 Ti, ms per step, sphere Re=3700.
+WaterLily master did not run on GPUs at that time (fixed in 1.9.1, see the last section). One RTX 2080 Ti, ms per step, sphere Re=3700.
 
 | Biot-Savart grid | cells | BSBC#14 PR | BSBC 1.0 | TurboLily | speedup vs #14 PR | vs 1.0 |
 |---|---|---|---|---|---|---|

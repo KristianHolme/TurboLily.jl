@@ -55,7 +55,7 @@ mutable struct TFlow{D,T,Sf<:AbstractArray{T},Vf<:AbstractArray{T},Tf<:AbstractA
     Vzero :: Bool               # true when V ≡ 0 (skip div(V) source)
     red :: RedBuf
     aux :: Union{Nothing,Vf}    # extra vector buffer for the udf path (allocated on first use)
-    near :: CuArray{UInt8,D}    # cells inside the measure band at the last measure!
+    near :: CuArray{UInt8,D}    # per cell at the last measure!: 0x01 near the body, else 0x00 outside / 0x02 inside
     mstat :: CuVector{Int32}    # [nband, nshell, V≠0] from the last measure!
 end
 

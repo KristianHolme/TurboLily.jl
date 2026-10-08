@@ -36,7 +36,7 @@ planes cost about 28 % more FMM time, about 3 % of a time step.
 
 ## Speed
 
-All results are from one RTX 2080 Ti, Float32, in ms per time step. The flow is a sphere at
+The table below is from one RTX 2080 Ti, Float32, in ms per time step. The flow is a sphere at
 Re=3700 (`D = N/2`, 256×128×128, 4.2M cells) unless noted. The reference is WaterLily master
 (1.9.1, eb1ace3) and BiotSavartBCs main (1.0.0, c7b6ffd) on the same GPU, October 2026. See
 `RESULTS.md` for the full tables and the earlier comparisons against the PR branches.
@@ -59,12 +59,34 @@ Above about 2M cells the speedup is roughly constant (3.3–4.2×), because both
 near memory bandwidth. Below 1M cells both are limited by per-step overhead. See the size sweeps
 in `RESULTS.md`.
 
+### WaterLily-Benchmarks cases (A10)
+
+These are the GPU cases of
+[WaterLily-Benchmarks](https://github.com/WaterLily-jl/WaterLily-Benchmarks) on an NVIDIA A10
+(22.5 GB), with the suite's method: developed-flow checkpoints and the minimum over 5 runs of
+25 steps. Each case goes up to the largest power of two that fits on the card. Times are in
+ms per step; the full table is in `RESULTS.md`.
+
+| case | largest grid | cells | reference | TurboLily | speedup |
+|---|---|---|---|---|---|
+| tgv | 512³ | 134M | 670 | 171 | 3.9× |
+| tgv-periodic | 512³ | 134M | 699 | 165 | 4.2× |
+| sphere | 1024×384×384 | 151M | 772 | 188 | 4.1× |
+| sphere-biotsavart | 1024×384×384 | 151M | 1021 | 231 | 4.4× |
+| cylinder (moving) | 576×384×128 | 28M | 161 | 46 | 3.5× |
+| donut | 512×256×256 | 34M | 159 | 44 | 3.6× |
+| jelly-biotsavart (moving) | 256×256×1024 | 67M | 547 | 171 | 3.2× |
+
+Over all sizes the speedup is 2.5–5.3×, and from 16M cells up 3.1–4.4×. The
+`cylinder-biotsavart` case is not supported, because the Biot-Savart BCs do not yet take
+periodic directions.
+
 ## Validation
 
 Every configuration is stepped side by side with the reference implementation, and the results
-must agree to rounding: `test/runtests.jl` contains 81 checks against WaterLily 1.9.1 and
+must agree to rounding: `test/runtests.jl` contains 88 checks against WaterLily 1.9.1 and
 BiotSavartBCs 1.0.0 (their main branches as of 8 October 2026). These cover 2D and 3D, `exitBC`,
-periodic directions (including a fully periodic Taylor-Green vortex), `uBC(i,x,t)`, `g`, moving and deforming bodies (WaterLily's pulsating-circle test bodies) with `remeasure=true`, `udf` (body force
+periodic directions (including a fully periodic Taylor-Green vortex), `uBC(i,x,t)`, `g`, moving and deforming bodies (WaterLily's pulsating-circle test bodies) with `remeasure=true`, `measure!` after a jump in time, `udf` (body force
 and the Smagorinsky `sgs!`), `setproperties(flow; uBC)`, Biot-Savart with `nonbiotfaces` and
 `symmetry` planes (2D and 3D), and the BiotSavartBCs potential-flow test. The pressure-iteration
 counts are identical.
@@ -451,7 +473,7 @@ NVLink):
 ## Setup and tests
 
 `../bench` develops this package together with the WaterLily and BiotSavartBCs main branches
-(`../dev/WL`, `../dev/BSBC`); all 81 tests run there:
+(`../dev/WL`, `../dev/BSBC`); all 88 tests run there:
 
 ```sh
 julia --project=../bench -e 'include("test/runtests.jl")'
@@ -467,4 +489,16 @@ current TurboLily requires.
 cd ../bench
 julia --project=. bench.jl                          # WHICH=WL,T,B,TB  N=128
 julia --project=. ../bench_stack/sweep.jl           # WHICH=wl or biot
+```
+
+The WaterLily-Benchmarks cases are in `../bench/suite`. They need a clone of WaterLily-Benchmarks
+with its git-LFS checkpoints in `../dev/WaterLily-Benchmarks`. `run.jl` times one case,
+`develop.jl` makes the larger checkpoints, `sweep.sh` queues jobs over the GPUs and `table.py`
+writes the table:
+
+```
+cd ../bench/suite
+julia --project=.. run.jl sphere 5 turbo             # <case> <log2p> <ref|turbo>
+julia -t 16 --project=.. develop.jl sphere 6         # upsample sphere_5 and develop it
+GPUS="0 1 2 3" ./sweep.sh jobs.txt
 ```

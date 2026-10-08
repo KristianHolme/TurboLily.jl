@@ -23,7 +23,9 @@ still grows, so the caller can detect the overflow and retry with a larger list)
     return nothing
 end
 
-# WaterLily.measure! for one cell, only touching cells that are or were near the body.
+# WaterLily.measure! for one cell, only touching cells that are or were near the body, or that
+# changed side since the last measure (a body that moved further than the band in between).
+# `near` holds 0x01 for a cell near the body, 0x00 / 0x02 for a cell away from it outside / inside.
 # Appends the BDIM band faces (class 1: μ₀≠1, μ₁=0; class 2: μ₁≠0) and flags V≠0.
 function k_measure!(lo, hi, μ₀, μ₁, V, σ, near_prev, body::B, t::T, ϵ::T, d²::T, g::Grid{D},
                     stat, band, shell, bdimlow::NTuple{D,Bool}) where {B,T,D}
@@ -36,7 +38,7 @@ function k_measure!(lo, hi, μ₀, μ₁, V, σ, near_prev, body::B, t::T, ϵ::T
         @inbounds σ[l] = d
         near = d^2 < d²
     end
-    was = ok && @inbounds(near_prev[l]) != 0x00
+    prev = ok ? @inbounds(near_prev[l]) : 0x00
     vnz = false
     @unroll for i in i32:Int32(D)
         li = l + (i-i32)*g.nc
@@ -59,7 +61,7 @@ function k_measure!(lo, hi, μ₀, μ₁, V, σ, near_prev, body::B, t::T, ϵ::T
                 cls = sh ? 2 : m0 != 1 ? 1 : 0
             else
                 m0 = d < 0 ? zero(T) : one(T)
-                if was
+                if prev != (d < 0 ? 0x02 : 0x00)    # was near, or changed side
                     @inbounds V[li] = zero(T)
                     @inbounds μ₀[li] = m0
                     @unroll for j in i32:Int32(D)
@@ -76,7 +78,7 @@ function k_measure!(lo, hi, μ₀, μ₁, V, σ, near_prev, body::B, t::T, ϵ::T
         wappend!(band, stat, 1, cls == 1, li)
         wappend!(shell, stat, 2, cls == 2, li)
     end
-    ok && (@inbounds near_prev[l] = near ? 0x01 : 0x00)
+    ok && (@inbounds near_prev[l] = near ? 0x01 : d < 0 ? 0x02 : 0x00)
     vnz && (stat[3] = Int32(1))
     return nothing
 end

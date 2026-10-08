@@ -1,6 +1,84 @@
 # Benchmarks
 
-## Against WaterLily master + BiotSavartBCs main, October 2026 (`bench/`)
+## WaterLily-Benchmarks cases on an A10, October 2026 (`bench/suite/`)
+
+These are the eight cases of [WaterLily-Benchmarks](https://github.com/WaterLily-jl/WaterLily-Benchmarks)
+(`src/cases.jl` at f6034df), on the GPU only, from the smallest default size up to the largest
+power of two that fits on the card. The references are WaterLily master eb1ace3 (1.9.1) and
+BiotSavartBCs main c7b6ffd (1.0.0). The machine is nam-shub-02, with 4× NVIDIA A10
+(22.5 GB, 600 GB/s). Float32, Julia 1.13.1, CUDA.jl 6.4.
+
+The method is the suite's. Each case runs in its own process and starts from a developed-flow
+checkpoint. It warms up for at least 50 steps and 2 s, then does 5 runs of 25 steps, each run
+reset to the checkpoint. A step is timed with a device synchronisation, and the time is the
+minimum over the runs of the mean step. Both codes load the same checkpoint.
+
+The suite has checkpoints up to tgv 8, tgv-periodic 7, sphere 5, sphere-biotsavart 4,
+cylinder 5, donut 6 and jelly 7. `bench/suite/develop.jl` makes the larger ones. It upsamples
+the next smaller checkpoint 2× (trilinear on the staggered grid) and develops it with
+TurboLily for 5 convective times; the TGVs get 1 and jelly gets 2 swimming cycles. The cases
+from 4M cells up ran four at a time, one per GPU. The smaller cases ran again one at a time
+on an idle machine, and those runs are the ones shown. The two passes agree within ±5 %
+(`bench/suite/results*`).
+
+| case | log2p | cells | reference [ms] | TurboLily [ms] | speedup | ref cost [ns/cell] | Turbo cost [ns/cell] |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| tgv | 6 | 262k | 2.99 | 0.81 | 3.7× | 11.4 | 3.1 |
+| tgv | 7 | 2.1M | 11.61 | 3.13 | 3.7× | 5.5 | 1.5 |
+| tgv | 8 | 16.8M | 81.82 | 21.04 | 3.9× | 4.9 | 1.3 |
+| tgv | 9 | 134.2M | 670.31 | 170.97 | 3.9× | 5.0 | 1.3 |
+| tgv-periodic | 6 | 262k | 4.30 | 0.81 | 5.3× | 16.4 | 3.1 |
+| tgv-periodic | 7 | 2.1M | 13.09 | 2.87 | 4.6× | 6.2 | 1.4 |
+| tgv-periodic | 8 | 16.8M | 83.77 | 19.93 | 4.2× | 5.0 | 1.2 |
+| tgv-periodic | 9 | 134.2M | 699.19 | 165.03 | 4.2× | 5.2 | 1.2 |
+| sphere | 3 | 295k | 3.27 | 0.97 | 3.4× | 11.1 | 3.3 |
+| sphere | 4 | 2.4M | 12.49 | 3.51 | 3.6× | 5.3 | 1.5 |
+| sphere | 5 | 18.9M | 90.35 | 24.87 | 3.6× | 4.8 | 1.3 |
+| sphere | 6 | 151.0M | 772.28 | 187.80 | 4.1× | 5.1 | 1.2 |
+| sphere-biotsavart | 3 | 295k | 5.56 | 1.81 | 3.1× | 18.8 | 6.1 |
+| sphere-biotsavart | 4 | 2.4M | 20.95 | 5.05 | 4.1× | 8.9 | 2.1 |
+| sphere-biotsavart | 5 | 18.9M | 124.20 | 29.89 | 4.2× | 6.6 | 1.6 |
+| sphere-biotsavart | 6 | 151.0M | 1020.85 | 230.64 | 4.4× | 6.8 | 1.5 |
+| cylinder | 4 | 442k | 6.86 | 1.71 | 4.0× | 15.5 | 3.9 |
+| cylinder | 5 | 3.5M | 24.30 | 7.73 | 3.1× | 6.9 | 2.2 |
+| cylinder | 6 | 28.3M | 161.34 | 45.80 | 3.5× | 5.7 | 1.6 |
+| cylinder-biotsavart | 4 | 442k | 13.81 | — | — | 31.2 | — |
+| cylinder-biotsavart | 5 | 3.5M | 32.44 | — | — | 9.2 | — |
+| donut | 5 | 66k | 3.44 | 0.92 | 3.8× | 52.5 | 14.0 |
+| donut | 6 | 524k | 5.08 | 1.64 | 3.1× | 9.7 | 3.1 |
+| donut | 7 | 4.2M | 21.80 | 6.05 | 3.6× | 5.2 | 1.4 |
+| donut | 8 | 33.6M | 158.88 | 44.20 | 3.6× | 4.7 | 1.3 |
+| jelly-biotsavart | 5 | 131k | 7.04 | 2.81 | 2.5× | 53.7 | 21.5 |
+| jelly-biotsavart | 6 | 1.0M | 17.09 | 6.12 | 2.8× | 16.3 | 5.8 |
+| jelly-biotsavart | 7 | 8.4M | 86.11 | 27.64 | 3.1× | 10.3 | 3.3 |
+| jelly-biotsavart | 8 | 67.1M | 546.61 | 171.26 | 3.2× | 8.1 | 2.6 |
+
+- **Largest size:** the last row of each case is the largest power of two that fits in 22.5 GB:
+  134M cells (TGV 512³) and 151M cells (sphere 1024×384×384). Both codes need about the same
+  memory; TurboLily's largest is sphere-biotsavart p=6 at 21.4 GB against 19.8 GB. The next
+  power of two is 8× larger.
+- **Speedup:** from 16M cells up it is 3.5–4.4×, except jelly-biotsavart (3.1–3.2×). Both
+  codes are then bandwidth-bound. TurboLily costs 1.2–1.6 ns per cell and step,
+  WaterLily 4.7–5.7 ns and BiotSavartBCs 6.6–6.8 ns, all without jelly. Jelly costs more in
+  both codes (2.6 against 8.1 ns at p=8). It needs about 3 V-cycles per step instead of 2, and
+  its two symmetry planes add image targets to every Biot-Savart evaluation; those are the
+  likely reasons, not profiled.
+- **Small grids:** below 1M cells both codes are limited by per-step overhead, so the cost
+  per cell rises, and the speedup ranges from 2.5× (jelly) to 5.3× (tgv-periodic).
+- **cylinder-biotsavart:** TurboLily has no time because `TurboLily.BiotSimulation` does
+  not support periodic directions yet. Its p=6 checkpoint would need BiotSavartBCs to develop
+  it, so that size was not run.
+- **Pressure iterations:** these are identical except in `cylinder`. Its periodic z direction
+  converges in fewer V-cycles in TurboLily (2.7 against 3.7 per step at p=4), as in the
+  periodic tests.
+- **Checkpoint loading fix:** this benchmark found a bug in TurboLily's `measure!`. After a
+  jump in time larger than the measure band, it left stale μ₀ where the body had been. The
+  jump happens when a moving body is reset to a checkpoint. The run after the jump needed many
+  more V-cycles (40 instead of 2.7 per step for cylinder p=4). The minimum over the runs mostly
+  hid this. This is fixed, with a test, and all moving-body cases were rerun after the
+  fix.
+
+## Against WaterLily master + BiotSavartBCs main, October 2026, RTX 2080 Ti (`bench/`)
 
 References: WaterLily master eb1ace3 (1.9.1; contains #346, which supersedes #337) and
 BiotSavartBCs main c7b6ffd (1.0.0; contains #13's stopping criterion and the `fill_ω!` part

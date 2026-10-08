@@ -85,6 +85,19 @@ pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
         sim_step!(sim)
         @test all(Array(sim.flow.u)[2,2:end-1,1] .== 1.5f0)
     end
+    @testset "measure! after a jump in time" begin   # the body moves far past the measure band
+        mk(w) = (c = SA[24f0, 32f0]; ctor(w)((128,64), (1,0), 8; T,
+            body=AutoBody((x,t)->√sum(abs2, x .- c)-8f0, (x,t)->x - SA[t, 0f0])))
+        a, b = mk(:ref), mk(:turbo)
+        for t in (60f0, 0f0)
+            measure!(a, t); measure!(b, t)
+            @test maxdiff(a.flow.μ₀, b.flow.μ₀) < 1e-5
+            @test maxdiff(a.flow.μ₁, b.flow.μ₁) < 1e-5
+            @test maxdiff(a.flow.V, b.flow.V) < 1e-5
+        end
+        sim_step!(a); sim_step!(b)
+        @test maxdiff(a.flow.u, b.flow.u) < 1e-4
+    end
     @testset "udf body force" begin
         grav!(flow, t; g=0.01f0) = (WaterLily.@loop flow.f[Ii] += g*(last(Ii)==2) over Ii in CartesianIndices(flow.f); nothing)
         du, dp, na, nb = compare(w->circle(w), 10; udf=grav!, g=0.02f0)

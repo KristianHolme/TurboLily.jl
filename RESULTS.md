@@ -1,6 +1,80 @@
 # Benchmarks
 
-## Against BiotSavartBCs 1.0 (`bench_release/`)
+## Against WaterLily master + BiotSavartBCs main, October 2026 (`bench/`)
+
+References: WaterLily master eb1ace3 (1.9.1; contains #346, which supersedes #337) and
+BiotSavartBCs main c7b6ffd (1.0.0; contains #13's stopping criterion and the `fill_ω!` part
+of #14, but not #14's FMM `interaction` rewrite). One RTX 2080 Ti, Float32, Julia 1.13.1,
+CUDA.jl 6.4, ms per step. The pressure-iteration counts are identical in both codes. Logs are
+in `bench/oct8/`. The sweeps and the standard cases ran at the same time on separate GPUs;
+the sphere 256×128×128 rows are from a rerun on an idle machine (two runs, mean).
+
+| case | grid | reference | TurboLily | speedup |
+|---|---|---|---|---|
+| WaterLily, sphere | 256×128×128 | 19.21 | 6.07 | 3.2× |
+| WaterLily, moving sphere (`remeasure=true`) | 256×128×128 | 23.60 | 8.38 | 2.8× |
+| WaterLily, 2D circle | 1024×512 | 3.74 | 1.36 | 2.8× |
+| WaterLily, TGV | 256³ | 76.67 | 20.29 | 3.8× |
+| Biot-Savart, sphere | 256×128×128 | 31.46 | 8.55 | 3.7× |
+| Biot-Savart, moving sphere | 256×128×128 | 45.25 | 11.04 | 4.1× |
+| Biot-Savart, 2D circle | 1024×512 | 5.03 | 2.23 | 2.3× |
+
+Size sweep (`bench_stack/sweep.jl` run in `bench/`), sphere Re=3700, ms per step (peak GPU
+memory):
+
+| WaterLily grid | cells | WL | TurboLily | speedup |
+|---|---|---|---|---|
+| 64×32×32 | 0.07M | 3.30 | 0.91 | 3.6× |
+| 128×64×64 | 0.52M | 5.32 | 1.29 | 4.1× |
+| 192×96×96 | 1.8M | 8.97 | 2.71 | 3.3× |
+| 256×128×128 | 4.2M | 20.68 | 5.73 | 3.6× |
+| 384×192×192 | 14.2M | 63.67 | 17.45 | 3.6× |
+| 512×256×256 | 33.6M | 148.6 | 41.2 | 3.6× |
+| 576×288×288 | 47.8M | 223.1 | 58.2 | 3.8× |
+| 640×320×320 | 65.5M (10.2 GB) | 306.9 | 79.4 | 3.9× |
+
+| Biot-Savart grid | cells | BSBC | TurboLily | speedup |
+|---|---|---|---|---|
+| 80×32×32 | 0.08M | 5.10 | 1.75 | 2.9× |
+| 120×48×48 | 0.28M | 5.83 | 1.69 | 3.4× |
+| 160×64×64 | 0.66M | 8.67 | 2.45 | 3.5× |
+| 240×96×96 | 2.2M | 19.88 | 4.71 | 4.2× |
+| 320×128×128 | 5.2M | 36.91 | 9.57 | 3.9× |
+| 400×160×160 | 10.2M | 66.78 | 17.32 | 3.9× |
+| 480×192×192 | 17.7M | 109.4 | 29.8 | 3.7× |
+| 560×224×224 | 28.1M | 186.7 | 48.9 | 3.8× |
+| 640×256×256 | 41.9M (7.2 GB) | 281.1 | 75.4 | 3.7× |
+
+Compared with the earlier runs below, WaterLily master is within about ±10 % of #337, and
+BiotSavartBCs main matches the 1.0 release. It is 7-50 % slower than the #14 PR branch, most
+on the moving body, because #14's FMM rewrite was not merged. TurboLily is unchanged within
+run-to-run noise (about ±10 %). TurboLily needs the same
+memory as the reference (+2-6 %).
+
+Long runs, sphere Re=3700, 192×96×96, t = 0…20:
+
+| | wall | steps | ms/step | mean C_d (t>10) |
+|---|---|---|---|---|
+| BiotSavartBCs main | 25.5 s | 1165 | 21.9 | 0.3895 |
+| TurboLily.BiotSimulation | 5.4 s (4.7×) | 1166 | 4.61 | 0.3897 |
+| WaterLily master | 13.7 s | 852 | 16.1 | 0.4140 |
+| TurboLily.Simulation | 2.7 s (5.1×) | 852 | 3.12 | 0.4141 |
+
+## Where the time goes (TurboLily, sphere 256×128×128)
+
+- **Plain step (≈6 ms):** multigrid ≈ 55 % (one V-cycle with smoothing ≈ 1.4 ms), momentum
+  predictor + corrector ≈ 1.1 ms, projection source and correction ≈ 1 ms, the rest is BCs and
+  the CFL condition. Nearly every large kernel runs at 80–90 % of the 616 GB/s memory bandwidth.
+- **Biot step (≈9 ms):** on top of the plain step, there are 2 full FMM evaluations
+  (≈ 0.45 ms each), 3 incremental FMM updates (≈ 0.1 ms each), vorticity (≈ 0.3 ms per
+  projection), and the boundary updates.
+
+## Earlier runs
+
+The sections below predate WaterLily 1.9.1 and the BiotSavartBCs `symmetry` and residual
+changes. They are kept for the comparison against the PR branches.
+
+### Against BiotSavartBCs 1.0 (`bench_release/`)
 
 BiotSavartBCs 1.0 is `main` (ce98bf2): #13's stopping criterion and the `fill_ω!` part of #14,
 but not #14's FMM `interaction` rewrite. WaterLily is #337 as in the stack below, because
@@ -28,7 +102,7 @@ Standard case, sphere 256×128×128: BSBC 1.0 30.52 ms/step, TurboLily 8.88 ms/s
 Long run, sphere Re=3700, 192×96×96, t = 0…20: BSBC 1.0 26.1 s, TurboLily 5.3 s (4.9×);
 mean C_d (t>10) 0.3893 and 0.3898.
 
-## Against WaterLily#337 + BiotSavartBCs#13+#14 (`bench_stack/`)
+### Against WaterLily#337 + BiotSavartBCs#13+#14 (`bench_stack/`)
 
 Reference: WaterLily PR #337 (3f1de92, on 55b2f5d) and BiotSavartBCs PR #14 (5aeb5c5, which
 contains #13). TurboLily follows #13's stopping criterion (`max|r| < 2e-3`, `Σ|r|/N < 2e-4`)
@@ -87,7 +161,7 @@ Long runs, sphere Re=3700, 192×96×96, t = 0…20:
 | WaterLily#337 | 13.1 s | 852 | 0.4141 |
 | TurboLily.Simulation | 2.5 s (5.2×) | 852 | 0.4141 |
 
-## Against WaterLily master + BiotSavartBCs main (earlier runs, `bench/`)
+### Against WaterLily master + BiotSavartBCs main, September 2026 (`bench/`)
 
 These used BiotSavartBCs' old stopping criterion (`Σr² < 1e-4`), so the Biot-Savart iteration
 counts differ from the stack above.
@@ -97,7 +171,7 @@ The references are WaterLily `main` (4da089f, with the GPU fix for `mom_project!
 and BiotSavartBCs `master` (6ffe945), run on the same GPU. Timings are wall-clock ms per time
 step after warm-up. GPU boost clocks vary by about ±10 % between runs.
 
-## Sphere, Re=3700, D = N/2 (`bench/bench.jl`, `bench/bench2.jl`)
+#### Sphere, Re=3700, D = N/2 (`bench/bench.jl`, `bench/bench2.jl`)
 
 | case | grid | reference | TurboLily | speedup |
 |---|---|---|---|---|
@@ -108,7 +182,7 @@ step after warm-up. GPU boost clocks vary by about ±10 % between runs.
 | Biot-Savart, moving body (`remeasure=true`) | 256×128×128 | 66.82 | 14.42 | 4.6× |
 | Biot-Savart, 2D circle | 1024×512 | 4.83 | 2.22 | 2.2× |
 
-## Size scaling, developed flow (`bench/bigbench.jl`)
+#### Size scaling, developed flow (`bench/bigbench.jl`)
 
 | case | grid | cells | reference | TurboLily | speedup |
 |---|---|---|---|---|---|
@@ -123,7 +197,7 @@ The pressure-iteration counts are the same in both codes.
 Taylor-Green vortex, Re=1600, 256³, periodic in all directions: WaterLily 77.6 ms/step,
 TurboLily 20.4 ms/step (3.8×).
 
-## Long runs (`bench/longrun.jl`): sphere, Re=3700, 192×96×96, t = 0…20
+#### Long runs (`bench/longrun.jl`): sphere, Re=3700, 192×96×96, t = 0…20
 
 | | wall | steps | ms/step | mean C_d (t>10) | std C_d |
 |---|---|---|---|---|---|
@@ -132,32 +206,9 @@ TurboLily 20.4 ms/step (3.8×).
 | WaterLily | 13.0 s | 852 | 15.2 | 0.4140 | 0.0072 |
 | TurboLily.Simulation | 2.7 s | 852 | 3.21 | 0.4142 | 0.0070 |
 
-## Where the time goes (TurboLily, sphere 256×128×128)
+### WaterLily master did not run on GPUs (September 2026)
 
-- **Plain step (≈6 ms):** multigrid ≈ 55 % (one V-cycle with smoothing ≈ 1.4 ms), momentum
-  predictor + corrector ≈ 1.1 ms, projection source and correction ≈ 1 ms, the rest is BCs and
-  the CFL condition. Nearly every large kernel runs at 80–90 % of the 616 GB/s memory bandwidth.
-- **Biot step (≈11 ms):** on top of the plain step, there are 2 full FMM evaluations
-  (≈ 0.45 ms each), 3 incremental FMM updates (≈ 0.1 ms each), vorticity (≈ 0.3 ms per
-  projection), and the boundary updates.
-
-## WaterLily master does not run on GPUs
-
-WaterLily `master` at 4da089f (merge of PR #328, "deforming body source", 2026-09-30) fails
-in the first `sim_step!` of every GPU simulation, with or without a body:
-
-```
-KernelError: passing non-bitstype argument
-Argument 5 to your kernel function is of type MultiLevelPoisson{Float32, CuArray{…}, …}, which is not a bitstype
-```
-
-`mom_project!` now does `@inside b.z[I] = div(I,a.u)-δv(b,I)*div(I,a.V)`. `@loop` passes
-every symbol in the expression to the kernel, including `b` (the `MultiLevelPoisson`). That
-struct holds `CuArray`s and a `Vector`, and it has no Adapt rule, so CUDA cannot convert it.
-On the CPU the KA backend accepts any argument, so the CPU tests pass. The example scripts
-default to `mem=Array`, so they also run.
-
-The fix: take the array outside the loop, `Dp = levels[1].D`, and use
-`(1+Dp[I]/2D)` in the kernel. The checkout in `dev/WL` has this 3-line fix; it is the
-WaterLily used in `bench/`. WaterLily#337 is based on 55b2f5d, before #328, so it is not
-affected. BiotSavartBCs and TurboLily replace `mom_project!` and never hit this code.
+WaterLily `master` at 4da089f failed in the first `sim_step!` of every GPU simulation:
+`mom_project!` passed the `MultiLevelPoisson` itself into a `@loop` kernel (`δv(b,I)`), which
+is not a bitstype. The runs in that section used a local 3-line fix. WaterLily 1.9.1 fixes it
+upstream with `diagonal(p)` and `δv(D,I)`.

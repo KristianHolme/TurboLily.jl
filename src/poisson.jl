@@ -224,7 +224,7 @@ function k_incr!(lo, hi, ps, pm, r, x, ϵ, op::Op{D}, ωd, ::Val{norms}, ::Val{e
     norms && block_partial!(ps, pm, a, m)
     return nothing
 end
-# red-black Gauss-Seidel half sweep on ϵ (WaterLily.gauss_rb indexing over half_rangek).
+# Red-black Gauss-Seidel half sweep on ϵ, with pairs along the last direction.
 # `init`: first sweep, also sets ϵ=r·iD on the partner cell and reads neighbours as r·iD.
 function k_gs!(lo, hi, ϵ, r, op::Op{D}, k0::Int32, init::Bool) where D
     Iv, ok = cellidx(lo, hi); ok || return
@@ -243,10 +243,9 @@ function k_gs!(lo, hi, ϵ, r, op::Op{D}, k0::Int32, init::Bool) where D
             lp = lin(g, setj(Iv, D, kp))
             @inbounds ϵ[lp] = r[lp]*getiD(op, lp)
         end
-        if 2Iv[D] == g.n[D] - i32           # odd size: last cell is outside the sweep range
-            lx = lin(g, setj(Iv, D, g.n[D] - i32))
-            @inbounds ϵ[lx] = r[lx]*getiD(op, lx)
-        end
+    end
+    k <= g.n[D] - i32 || return             # the last pair can have only one interior cell
+    if init
         @inbounds ϵ[l] = (r[l] - offdiag_f(op, I, l, RiD(r, op)))*getiD(op, l)
     else
         @inbounds ϵ[l] = (r[l] - offdiag_f(op, I, l, AV(ϵ)))*getiD(op, l)
@@ -304,7 +303,7 @@ function jacobi!(lv::Level, assign::Bool=false)
     launch(k_jacobi!, inside_lo(g), inside_hi(g), lv.ϵ, lv.r, lv.x, lv.op, assign)
     lv.r, lv.ϵ = lv.ϵ, lv.r
 end
-gs_range(g::Grid{D}) where D = (inside_lo(g), ntuple(d-> d==D ? Int(g.n[d])÷2 : Int(g.n[d])-1, D))
+gs_range(g::Grid{D}) where D = (inside_lo(g), ntuple(d-> d==D ? cld(Int(g.n[d]),2) : Int(g.n[d])-1, D))
 function smooth!(lv::Level{D,T}, ωd, red::RedBuf, norms::Bool=false; it=4, exclb=false) where {D,T}
     g = lv.op.g
     lo, hi = gs_range(g)

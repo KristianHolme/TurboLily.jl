@@ -125,8 +125,20 @@ function k_affected2!(lo, hi, m, g::Grid{D}, g2::Grid{D}, A2, bst) where D
     warp_box!(bst, 8, aff, I)
     return nothing
 end
-function affected_lists!(b::TBiotPoisson{T,S,V,D}) where {T,S,V,D}
+function k_clear_delta!(n, list, dω, g::Grid{D}) where {D}
+    k = tid1(); k <= n || return
+    l = @inbounds list[k]
+    @unroll for i in i32:Int32(D)
+        @inbounds dω[l + (i - i32) * g.nc] = zero(eltype(dω))
+    end
+    return nothing
+end
+function affected_lists!(b::TBiotPoisson{T, S, V, D}) where {T, S, V, D}
     g = b.g; L = b.L
+    # Cells leaving the lists must contribute zero to subsequent Δω restrictions.
+    for l in 1:2
+        launch1(k_clear_delta!, b.nA[l], b.lists[l], b.dω[l], g[l])
+    end
     while true
         st0 = vcat(Int32[0], fill(typemax(Int32),3), fill(typemin(Int32),3), Int32[0], fill(typemax(Int32),3), fill(typemin(Int32),3), Int32[0, 0])
         copyto!(b.bst, st0)

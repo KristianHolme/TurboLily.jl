@@ -1,5 +1,5 @@
 # TurboLily tests: every case is stepped side by side with the reference implementation
-# (WaterLily / BiotSavartBCs on the same GPU) and must agree to rounding level.
+# (WaterLily / BiotSavartBCs on CPU, TurboLily on CUDA) and must agree to rounding level.
 using Test, TurboLily, WaterLily, BiotSavartBCs, CUDA, StaticArrays
 
 const T = Float32
@@ -8,6 +8,27 @@ maxdiff(a, b) = maximum(abs, Array(a) .- Array(b))
 # ill-conditioned and differs between any two runs (also between two BiotSavartBCs runs)
 fluid(sim) = dropdims(minimum(Array(sim.flow.μ₀), dims=ndims(sim.flow.μ₀)), dims=ndims(sim.flow.μ₀)) .> 0
 piters(sim) = sim.pois isa BiotSavartPoisson ? sim.pois.ml.n : sim.pois.n
+
+# Keep ϵ first: @loop uses the first captured argument to select the backend.
+@inline function reference_gauss_rb!(ϵ, r, L, iD, k, I)
+    if isodd(sum(Tuple(I)) + k)
+        ϵ[I] = WaterLily.gauss(I, r, L, iD, ϵ)
+    end
+    return nothing
+end
+# The reference smoother must visit every cell on odd levels (WaterLily #353).
+# Even levels use WaterLily's implementation; odd levels scan the full interior.
+function WaterLily.GaussSeidelRB!(p::WaterLily.Poisson{T, S}; it = 4, ω = 1) where {T, S <: Union{Array, CuArray}}
+    if iseven(size(p.x, ndims(p.x)))
+        return invoke(WaterLily.GaussSeidelRB!, Tuple{WaterLily.Poisson{T}}, p; it, ω)
+    end
+    WaterLily.@inside p.ϵ[I] = p.r[I] * p.iD[I]
+    WaterLily.perBC!(p.ϵ, p.perdir)
+    for k in 1:it
+        WaterLily.@loop reference_gauss_rb!(p.ϵ, p.r, p.L, p.iD, k, I) over I ∈ WaterLily.inside(p.x)
+    end
+    return WaterLily.increment!(p; ω)
+end
 
 # runs `nstep` steps of both simulations and returns (max |Δu|, max |Δp - mean| on fluid cells)
 function compare(mk, nstep; remeasure=false, kw...)
@@ -149,5 +170,86 @@ bhalfcircle(which) = bctor(which)((128,64),(1,0),32f0; ν=32f0/1f3, T, symmetry=
         @test abs(maximum(u[:,:,1]) - 2) < 0.02
         @test abs(maximum(u[:,:,2]) - 1) < 0.02
         @test abs(minimum(u[1,:,1]) - 0.75) < 0.02
+    end
+end
+
+@testset "Red-black sweeps cover every interior cell" begin
+    for dims in ((8, 10), (8, 9), (8, 10, 10), (8, 10, 9), (8, 9, 9))
+        @testset "$dims" begin
+            D = length(dims)
+            sim = TurboLily.Simulation(dims, ntuple(i -> Int(i == 1), D), 1; T)
+            lv = sim.pois.levels[1]
+            r = zeros(T, size(lv.r))
+            interior = CartesianIndices(map(n -> 2:(n - 1), size(r)))
+            for I in interior
+                r[I] = sin(T(LinearIndices(r)[I]))
+            end
+            copyto!(lv.r, r)
+            fill!(lv.ϵ, 0)
+            iD, L = Array(lv.op.iD), Array(lv.op.L)
+            expected = r .* iD
+            for sweep in 1:4
+                for I in interior
+                    isodd(sum(Tuple(I)) + sweep) || continue
+                    s = zero(T)
+                    for j in 1:D
+                        δ = CartesianIndex(ntuple(d -> Int(d == j), D))
+                        s += expected[I - δ] * L[Tuple(I)..., j] +
+                            expected[I + δ] * L[Tuple(I + δ)..., j]
+                    end
+                    expected[I] = (r[I] - s) * iD[I]
+                end
+                TurboLily.launch(
+                    TurboLily.k_gs!, TurboLily.gs_range(lv.op.g)...,
+                    lv.ϵ, lv.r, lv.op, Int32(sweep), sweep == 1
+                )
+                @test maxdiff(lv.ϵ, expected) < 2.0f-6
+            end
+        end
+    end
+end
+
+@testset "Biot increments after body motion" begin
+    for D in (2, 3)
+        @testset "$(D)D" begin
+            dims = ntuple(d -> d == 1 ? 64 : 32, D)
+            c = SVector{D, T}(ntuple(_ -> 8.0f0, D))
+            direction = SVector{D, T}(ntuple(d -> T(d == 1), D))
+            body = AutoBody(
+                (x, t) -> sqrt(sum(abs2, x - c)) - 6.0f0,
+                (x, t) -> x - t * direction
+            )
+            sim = TurboLily.BiotSimulation(dims, ntuple(i -> Int(i == 1), D), 12; T, body)
+            b, a = sim.pois, sim.flow
+            u = reshape(sin.(T.(1:length(a.u))), size(a.u))
+            p = reshape(cos.(T.(1:length(a.p))), size(a.p))
+            copyto!(a.u, u)
+            for t in (0.0f0, 12.0f0, 80.0f0, 0.0f0)
+                measure!(sim, t)
+                copyto!(a.p, p)
+                TurboLily.fill_ω!(b, a.f, a.u)
+                TurboLily.correct_ω!(b, a.f, a.u, a.p, 0.25f0, false)
+                previous = map(Array, (a.f, b.ω...))
+                a.p .*= 2.0f0
+                TurboLily.correct_ω!(b, a.f, a.u, a.p, 0.25f0, true)
+                for l in 1:2
+                    current = l == 1 ? a.f : b.ω[1]
+                    @test maxdiff(b.dω[l], Array(current) .- previous[l]) == 0
+                end
+                full = map(copy, (a.f, b.ω...))
+                for l in 3:length(b.g)
+                    TurboLily.launch(
+                        TurboLily.k_vrestrict!, TurboLily.inside_lo(b.g[l]),
+                        TurboLily.inside_hi(b.g[l]), full[l], b.g[l], full[l - 1], b.g[l - 1]
+                    )
+                    @test maxdiff(b.dω[l], Array(full[l]) .- previous[l]) < 2.0f-5
+                end
+                if t == 80.0f0
+                    @test b.nA == [0, 0]
+                else
+                    @test all(>(0), b.nA)
+                end
+            end
+        end
     end
 end

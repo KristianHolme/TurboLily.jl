@@ -505,11 +505,21 @@ function udf_update!(a::TFlow{D,T}, out, uin, t, corr, udf; kwargs...) where {D,
         launch1(k_bdim_list!, n, list, out, uin, a.f, a.u⁰, a.V, a.μ₀, a.μ₁, g, dt, a.acc, T(t), corr)
     end
 end
+function k_zero_u!(lo, hi, u, g::Grid{D}) where D
+    I, ok = cellidx(lo, hi); ok || return
+    l = lin(g, I)
+    @unroll for i in i32:Int32(D)
+        @inbounds u[l + (i-i32)*g.nc] = zero(eltype(u))
+    end
+    return nothing
+end
 function mom_step_udf!(a::TFlow{D,T}, b::AbstractPoisson; udf, kwargs...) where {D,T}
     a.aux === nothing && (a.aux = similar(a.u))
     a.u, a.u⁰ = a.u⁰, a.u
     copy_exit!(a, a.u, a.u⁰)
     t₁ = sum(a.Δt); t₀ = t₁ - a.Δt[end]
+    # the predictor udf sees flow.u with a zero interior, as in WaterLily.mom_step!
+    launch(k_zero_u!, inside_lo(a.grid), inside_hi(a.grid), a.u, a.grid)
     @log "p"
     udf_update!(a, a.u, a.u⁰, t₀, false, udf; kwargs...)
     WaterLily.mom_project!(a, b, 1, t₁)

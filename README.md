@@ -26,8 +26,9 @@ using Pkg
 Pkg.add(url="https://github.com/KristianHolme/TurboLily.jl")
 ```
 
-It requires WaterLily 1.9.1 or later and BiotSavartBCs 1.0 or later. It is tested against
-WaterLily 1.9.1 and BiotSavartBCs 1.0.0, with Julia 1.13.1 and CUDA.jl 6.2.2 and 6.4.
+It requires WaterLily 1.9 (1.9.1 or later) or 1.10, and BiotSavartBCs 1.0 or later. The test
+suite passes against WaterLily 1.9.1 with BiotSavartBCs 1.0.0, and against WaterLily 1.10.0
+with BiotSavartBCs 1.0.1, with Julia 1.13.1 and CUDA.jl 6.2.2 and 6.4.
 
 Symmetry planes take the same `symmetry` keyword as `BiotSavartBCs.BiotSimulation`:
 
@@ -66,7 +67,7 @@ of the case that fits on the card. All sizes are in [`RESULTS.md`](RESULTS.md).
 Over all sizes, from 66k cells up, the speedup is 2.5–5.3×. From 16M cells up it is 3.1–4.4×.
 On large grids both codes are limited by memory bandwidth, and on small grids (below about 1M
 cells) by per-step overhead. Both codes need about the same GPU memory. The
-`cylinder-biotsavart` case is not supported (see 3.3).
+`cylinder-biotsavart` case is not supported (see 3.4).
 
 ### Sphere and Taylor-Green vortex (RTX 2080 Ti)
 
@@ -87,13 +88,36 @@ One RTX 2080 Ti, Float32, ms per step. The flow is a sphere at Re=3700 (`D = N/2
 ## Validation
 
 Every configuration is stepped side by side with the reference implementation, and the results
-must agree to rounding: `test/runtests.jl` contains 88 checks against WaterLily 1.9.1 and
+must agree to rounding: `test/runtests.jl` contains checks against WaterLily 1.9.1 and
 BiotSavartBCs 1.0.0. These cover 2D and 3D, `exitBC`, periodic directions (including a fully
-periodic Taylor-Green vortex), `uBC(i,x,t)`, `g`, moving and deforming bodies (WaterLily's
-pulsating-circle test bodies) with `remeasure=true`, `measure!` after a jump in time, `udf`
-(body force and the Smagorinsky `sgs!`), `setproperties(flow; uBC)`, Biot-Savart with
-`nonbiotfaces` and `symmetry` planes (2D and 3D), and the BiotSavartBCs potential-flow test.
-The pressure-iteration counts are identical, except with periodic directions (see 3.2).
+periodic Taylor-Green vortex and grids with odd periodic multigrid levels), `uBC(i,x,t)`, `g`,
+moving and deforming bodies (WaterLily's pulsating-circle test bodies) with `remeasure=true`,
+`measure!` after a jump in time, `udf` (body force, the Smagorinsky `sgs!`, and the state of
+`flow.u` that the callback sees), thin grids such as 2×128, `setproperties(flow; uBC)`,
+Biot-Savart with `nonbiotfaces` and `symmetry` planes (2D and 3D), and the BiotSavartBCs
+potential-flow test. The pressure-iteration counts are identical, except with periodic
+directions (see 3.2).
+
+What the comparisons establish:
+
+- The reference runs on the CPU, TurboLily on the GPU.
+- The reference is patched: the tests replace `WaterLily.GaussSeidelRB!` on levels with an odd
+  last dimension, where WaterLily 1.9.1 skips cells
+  ([WaterLily#353](https://github.com/WaterLily-jl/WaterLily.jl/pull/353)).
+- Velocity is compared on the interior and on the boundary faces normal to each component.
+  Tangential ghost values are not compared: neither code reads them, and TurboLily leaves
+  scratch values there.
+- Pressure is compared on cells with no fully closed face (`μ₀>0` on every face). Cells with a
+  closed face next to the body are ill-conditioned, and two reference runs differ there too.
+- Most cases run 5–10 steps. The tests do not establish grid or time-step convergence or
+  long-time statistics.
+- Equal iteration counts are a regression check, not an accuracy check. A separate test
+  recomputes the final Poisson residual `z - Ax` from scratch with WaterLily, independent of
+  the residual that the solver updates incrementally.
+
+The `3D sphere uBC(t) + g` case has a velocity tolerance of 3e-4 instead of 1e-4. Its second
+step is Δt≈5.5, and the WaterLily 1.9.1 and 1.10.0 references differ from each other by
+1.9e-4 on it.
 
 The velocity differences are of the same size as those between two runs of the reference code
 when one run gets a 1e-6 perturbation. The 3D flows amplify rounding differences in both codes
@@ -268,7 +292,7 @@ total, because the V-cycle only adds corrections computed from r.
   with both signs and L = 0 on the domain faces.
 
 **Relies on:** non-periodic domains (`TurboLily.BiotSimulation` does not support periodic
-directions, see 3.3) and L = 0 on the domain faces.
+directions, see 3.4) and L = 0 on the domain faces.
 
 **Saves:** 3 full reductions and 2 host syncs per Biot update. The remaining reductions run
 over about N^(2/3) cells.
@@ -432,20 +456,40 @@ amplify these differences exactly as they amplify a 1e-6 perturbation of the ref
 **WL.** `GaussSeidelRB!` fills the periodic ghost cells once (`perBC!`), then runs 4 half
 sweeps. Sweeps 2–4 therefore read stale ghost values on periodic boundaries.
 
-**TurboLily.** Neighbours are wrapped across periodic boundaries in every half sweep, so they
-always read current values.
+**TurboLily.** On levels where every periodic length is even, neighbours are wrapped across
+periodic boundaries in every half sweep, so they always read current values. On a level with
+an odd periodic length, the first and last interior cells are neighbours across the wrap and
+have the same red-black colour. A wrapped read would then race with the update of that
+neighbour. These levels therefore use WaterLily's method: ghosts filled once, no wrap. Odd
+levels occur also for even grids: a periodic 48 or 96 coarsens to a 3-cell level.
 
 **Effect.** This is a different, slightly better smoother. Results agree to the solver tolerance
 (differences of about 2e-4 after a few steps) rather than to rounding. With a tight tolerance
 in both codes they agree to 1e-6. On the Taylor-Green vortex TurboLily needs one V-cycle
 fewer per solve.
 
-#### 3.3 Not implemented
+#### 3.3 `udf` callbacks
+
+As in WaterLily, the predictor callback sees `flow.u` with a zero interior, and the corrector
+callback sees the projected predictor velocity. The velocity to advect with is the third
+argument, `udf(flow, u, t; kwargs...)`. TurboLily may leave different values than WaterLily
+in the tangential ghost cells of `flow.u`.
+
+#### 3.4 Not implemented
+
+These raise an `ArgumentError`:
 
 - `fmm=false` (the tree sum).
+- Biot-Savart BCs on grids too small for a second Biot-Savart level, e.g. 8×8.
 - Periodic directions with Biot-Savart BCs ([BiotSavartBCs#19](https://github.com/WaterLily-jl/BiotSavartBCs.jl/pull/19)).
-  `TurboLily.BiotSimulation` raises an error for `perdir`.
-- `T=Float64` and non-CUDA arrays.
+
+Also not implemented: `T=Float64` and non-CUDA arrays.
+
+Not supported: bodies wrapped in
+[WaterLilyNarrowBand.jl](https://github.com/WaterLily-jl/WaterLilyNarrowBand.jl)'s
+`NarrowBand` cache. TurboLily already measures only near the body, and an experimental
+integration gave little gain: about 5% per step for a 16-ring composite body and 69% slower
+for a sphere.
 
 ## Multi-GPU
 
@@ -465,8 +509,8 @@ NVLink):
 
 ## Tests
 
-The tests step every case with TurboLily and with WaterLily or BiotSavartBCs on the same GPU,
-so they need a CUDA GPU:
+The tests step every case with TurboLily on the GPU and with WaterLily or BiotSavartBCs on the
+CPU, so they need a CUDA GPU:
 
 ```sh
 julia --project -e 'using Pkg; Pkg.test()'

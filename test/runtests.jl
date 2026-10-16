@@ -1,11 +1,23 @@
 # TurboLily tests: every case is stepped side by side with the reference implementation
 # (WaterLily / BiotSavartBCs on CPU, TurboLily on CUDA) and must agree to rounding level.
+# The reference smoother is patched below for odd levels (WaterLily #353).
 using Test, TurboLily, WaterLily, BiotSavartBCs, CUDA, StaticArrays
 
 const T = Float32
 maxdiff(a, b) = maximum(abs, Array(a) .- Array(b))
-# cells with every face open; pressure in partially blocked cells at the body surface is
-# ill-conditioned and differs between any two runs (also between two BiotSavartBCs runs)
+# Velocity difference on the faces a step defines: component i on the interior cells and on
+# both boundary faces normal to i. Tangential ghost values are left out: neither code uses
+# them, and their contents depend on which scratch buffer became `u`.
+function udiff(a, b)
+    A, B = Array(a), Array(b); N = size(A)[1:end-1]; D = length(N)
+    maximum(1:D) do i
+        R = CartesianIndices(ntuple(d -> d == i ? (2:N[d]) : (2:N[d]-1), D))
+        maximum(I -> abs(A[I, i] - B[I, i]), R)
+    end
+end
+# cells with no fully closed face (μ₀>0 on every face); pressure in cells with a closed face
+# at the body surface is ill-conditioned and differs between any two runs (also between two
+# BiotSavartBCs runs), so pressure is not compared there
 fluid(sim) = dropdims(minimum(Array(sim.flow.μ₀), dims=ndims(sim.flow.μ₀)), dims=ndims(sim.flow.μ₀)) .> 0
 piters(sim) = sim.pois isa BiotSavartPoisson ? sim.pois.ml.n : sim.pois.n
 
@@ -39,7 +51,7 @@ function compare(mk, nstep; remeasure=false, kw...)
     end
     fl = fluid(a)
     dp = (Array(a.flow.p) .- Array(b.flow.p))[fl]
-    return maxdiff(a.flow.u, b.flow.u), maximum(abs, dp .- sum(dp)/length(dp)), piters(a), piters(b)
+    return udiff(a.flow.u, b.flow.u), maximum(abs, dp .- sum(dp)/length(dp)), piters(a), piters(b)
 end
 ctor(which) = which == :ref ? WaterLily.Simulation : TurboLily.Simulation
 bctor(which) = which == :ref ? BiotSavartBCs.BiotSimulation : TurboLily.BiotSimulation
@@ -76,8 +88,10 @@ pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
         ("2D oscillating body", oscillating, 10, true, 1e-4, 1e-2),
         ("3D sphere", w->sphere(w), 5, false, 1e-4, 1e-2),
         ("3D sphere periodic z + exitBC", w->sphere(w; perdir=(3,), exitBC=true), 5, false, 2e-3, 1e-2),
+        # uBC starts at 0, so the second step is Δt≈5.5; WaterLily 1.9.1 and 1.10.0 differ by
+        # 1.9e-4 here, so the velocity tolerance is wider than for the other cases
         ("3D sphere uBC(t) + g", w->ctor(w)((64,32,32), Ufun, 6f0; U=1, ν=0.02, T,
-            g=(i,x,t)->i==2 ? 0.01f0 : 0f0, body=AutoBody((x,t)->√sum(abs2,x .- SA[16f0,16f0,16f0])-6f0)), 5, false, 1e-4, 1e-2),
+            g=(i,x,t)->i==2 ? 0.01f0 : 0f0, body=AutoBody((x,t)->√sum(abs2,x .- SA[16f0,16f0,16f0])-6f0)), 5, false, 3e-4, 1e-2),
         ("3D periodic box, no body", w->ctor(w)((32,32,32),(1,0,0),8; ν=0.01, perdir=(2,3), T), 5, false, 2e-3, 1e-2),
         ("3D Taylor-Green vortex (fully periodic)", tgv, 10, false, 2e-3, 1e-2),
         # TurboLily includes the deforming-body source term of WaterLily#328; compare only
@@ -117,12 +131,99 @@ pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
             @test maxdiff(a.flow.V, b.flow.V) < 1e-5
         end
         sim_step!(a); sim_step!(b)
-        @test maxdiff(a.flow.u, b.flow.u) < 1e-4
+        @test udiff(a.flow.u, b.flow.u) < 1e-4
     end
     @testset "udf body force" begin
         grav!(flow, t; g=0.01f0) = (WaterLily.@loop flow.f[Ii] += g*(last(Ii)==2) over Ii in CartesianIndices(flow.f); nothing)
         du, dp, na, nb = compare(w->circle(w), 10; udf=grav!, g=0.02f0)
         @test du < 1e-4 && na == nb
+    end
+    @testset "udf Smagorinsky sgs!" begin
+        # (Cs·Δ)²|S|, written without views so that it also compiles in a GPU kernel
+        function smag(I::CartesianIndex{D}; S, Cs, Δ) where D
+            s = zero(eltype(S))
+            for i in 1:D, j in 1:D
+                s += S[I, i, j]^2
+            end
+            return (Cs*Δ)^2*sqrt(s)
+        end
+        a, b = circle(:ref), circle(:turbo)
+        Sa = zeros(T, size(a.flow.p)..., 2, 2); Sb = CUDA.zeros(T, size(b.flow.p)..., 2, 2)
+        for _ in 1:10
+            sim_step!(a; remeasure=false, udf=WaterLily.sgs!, νₜ=smag, S=Sa, Cs=0.17f0, Δ=1f0)
+            sim_step!(b; remeasure=false, udf=WaterLily.sgs!, νₜ=smag, S=Sb, Cs=0.17f0, Δ=1f0)
+        end
+        @test udiff(a.flow.u, b.flow.u) < 1e-4
+        @test piters(a) == piters(b)
+    end
+    @testset "udf sees WaterLily's flow state" begin
+        # WaterLily zeroes the interior of flow.u before the predictor udf
+        interior(u) = (A = Array(u); A[ntuple(d -> 2:size(A, d)-1, ndims(A)-1)..., :])
+        probe!(flow, u, t; rec) = (push!(rec, (maximum(abs, interior(flow.u)), maximum(abs, interior(u)))); nothing)
+        ra, rb = Tuple{T,T}[], Tuple{T,T}[]
+        a, b = circle(:ref), circle(:turbo)
+        for _ in 1:3
+            sim_step!(a; remeasure=false, udf=probe!, rec=ra)
+            sim_step!(b; remeasure=false, udf=probe!, rec=rb)
+        end
+        @test length(ra) == length(rb) == 6
+        @test all(k -> isapprox(collect(ra[k]), collect(rb[k]); atol=1e-4), eachindex(ra))
+        @test all(k -> ra[k][1] == rb[k][1] == 0, 1:2:6)   # predictor: zero interior
+        # a two-argument callback that reads flow.u
+        drag!(flow, t) = (flow.f .-= 0.1f0 .* flow.u; nothing)
+        du, dp, na, nb = compare(w->circle(w), 10; udf=drag!)
+        @test du < 1e-4 && na == nb
+    end
+    @testset "thin grids: reduction scratch" begin
+        # the block count of a launch depends on the rounded-up extent in each direction,
+        # so thin grids need more partials than cld(cells, 64)
+        for (dims, uBC) in (((2,128), (0,1)), ((2,2,128), (0,0,1)))
+            n = dims .+ 2
+            red = TurboLily.RedBuf(TurboLily.Grid(n))
+            @test length(red.ps) >= TurboLily.nblocks(ntuple(_->1, length(n)), n)
+            u0(i, x) = i == length(dims) ? 1 + 0.1f0*sinpi(x[end]/16) : 0f0
+            du, dp, na, nb = compare(w->ctor(w)(dims, uBC, 8; T, ν=0.01f0, u0), 3)
+            @test du < 1e-4
+            @test na == nb
+        end
+    end
+    @testset "odd periodic multigrid levels" begin
+        # 48 coarsens to an odd 3-cell level, 63 is odd on every level; red-black sweeps
+        # must not race across the periodic wrap
+        for (dims, perdir) in (((48,48), (1,2)), ((63,64), (1,)))
+            mk(w) = (c = SA[dims[1]/2f0, dims[2]/2f0];
+                ctor(w)(dims, (1,0), 8; T, ν=0.05f0, perdir, body=AutoBody((x,t)->√sum(abs2, x .- c)-6f0)))
+            du, dp, na, nb = compare(mk, 5)
+            @test du < 2e-3
+            @test dp < 1e-2
+        end
+    end
+end
+
+@testset "Poisson residual recomputed from scratch" begin
+    # The solver tracks the residual incrementally; check the final x against r = z - A x
+    # computed by WaterLily on the same arrays.
+    for (dims, perdir) in (((128,64), ()), ((48,48), (1,2)), ((63,64), (1,)), ((32,32,32), (3,)))
+        @testset "$dims perdir=$perdir" begin
+            D = length(dims)
+            c = SVector{D,T}(ntuple(d -> dims[d]/2f0, D))
+            sim = TurboLily.Simulation(dims, ntuple(i -> Int(i == 1), D), 8; T, perdir,
+                body=AutoBody((x,t)->√sum(abs2, x .- c)-6f0))
+            p = sim.pois; lv = p.ml.levels[1]
+            iD = Array(lv.iD)
+            z = zeros(T, size(iD))
+            for I in CartesianIndices(z)
+                iD[I] != 0 && (z[I] = sin(T(LinearIndices(z)[I])))
+            end
+            solved = iD .!= 0
+            z[solved] .-= sum(z[solved])/count(solved)
+            copyto!(lv.z, z); fill!(lv.x, 0)
+            WaterLily.solver!(p; tol=2e-3)
+            @test p.n[end] < 32
+            WaterLily.residual!(lv)
+            @test maximum(abs, Array(lv.r)) < 2e-3
+            @test sum(abs, Array(lv.r)) < WaterLily.l1n_tol(lv, 2e-3)
+        end
     end
 end
 
@@ -159,6 +260,8 @@ bhalfcircle(which) = bctor(which)((128,64),(1,0),32f0; ν=32f0/1f3, T, symmetry=
         @test_throws ArgumentError bplate(:turbo; sym=(-2,2))   # one plane per direction
         @test_throws ArgumentError bplate(:turbo; sym=(4,))
         @test_throws ArgumentError TurboLily.BiotSimulation((64,32),(1,0),8f0; T, fmm=false, symmetry=(-2,))
+        @test_throws ArgumentError TurboLily.BiotSimulation((64,32),(1,0),8f0; T, fmm=false)   # tree sum
+        @test_throws ArgumentError TurboLily.BiotSimulation((8,8),(1,0),1; T)   # one Biot-Savart level
         @test_throws ArgumentError TurboLily.BiotSimulation((64,32),(1,0),8f0; T, exitBC=true)
         @test_throws ArgumentError TurboLily.BiotSimulation((32,32,32),(1,0,0),8f0; T, perdir=(3,))
     end
@@ -204,6 +307,54 @@ end
                     lv.ϵ, lv.r, lv.op, Int32(sweep), sweep == 1
                 )
                 @test maxdiff(lv.ϵ, expected) < 2.0f-6
+            end
+        end
+    end
+end
+
+@testset "Odd periodic smoother is race-free" begin
+    # Serial reference: WaterLily.GaussSeidelRB! (ghosts filled once, then 4 half sweeps).
+    # Every thread layout must give it exactly; a race across the wrap would not.
+    for (dims, perdir) in (((65, 64), (1,)), ((64, 65), (2,)), ((1025, 64), (1,)), ((9, 16, 11), (1, 3)))
+        @testset "$dims perdir=$perdir" begin
+            D = length(dims)
+            sim = TurboLily.Simulation(dims, ntuple(i -> Int(i == 1), D), 1; T, perdir)
+            lv = sim.pois.levels[1]; op = lv.op; g = op.g
+            @test TurboLily.oddper(op)
+            r = zeros(T, size(lv.r))
+            interior = CartesianIndices(map(n -> 2:(n - 1), size(r)))
+            for I in interior
+                r[I] = sin(T(LinearIndices(r)[I]))
+            end
+            copyto!(lv.r, r)
+            iD, L = Array(op.iD), Array(op.L)
+            expected = r .* iD
+            for j in perdir   # perBC!
+                n = size(r, j)
+                sel(k) = ntuple(d -> d == j ? (k:k) : (:), D)
+                expected[sel(1)...] .= expected[sel(n-1)...]
+                expected[sel(n)...] .= expected[sel(2)...]
+            end
+            for sweep in 1:4, I in interior
+                isodd(sum(Tuple(I)) + sweep) || continue
+                s = zero(T)
+                for j in 1:D
+                    δ = CartesianIndex(ntuple(d -> Int(d == j), D))
+                    s += expected[I - δ] * L[Tuple(I)..., j] + expected[I + δ] * L[Tuple(I + δ)..., j]
+                end
+                expected[I] = (r[I] - s) * iD[I]
+            end
+            lo, hi = Int32.(TurboLily.gs_range(g)[1]), Int32.(TurboLily.gs_range(g)[2])
+            ext = (Int.(hi .- lo .+ 1)..., ntuple(_ -> 1, 3 - D)...)
+            nop = TurboLily.noper(op)
+            for th in (D == 2 ? ((32, 8, 1), (16, 16, 1), (64, 4, 1), (128, 2, 1)) : ((32, 4, 2), (8, 8, 4), (4, 4, 16)))
+                fill!(lv.ϵ, 0)
+                TurboLily.launch(TurboLily.k_rid!, TurboLily.inside_lo(g), TurboLily.inside_hi(g), lv.ϵ, lv.r, op)
+                TurboLily.perBC!(lv.ϵ, g, op.per)
+                for k in 1:4
+                    @cuda threads=th blocks=cld.(ext, th) TurboLily.k_gs!(lo, hi, lv.ϵ, lv.r, nop, Int32(k), false)
+                end
+                @test maxdiff(Array(lv.ϵ)[interior], expected[interior]) < 2.0f-6
             end
         end
     end

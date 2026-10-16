@@ -74,14 +74,20 @@ threads_for(::Val{3}) = (32,4,2)
 Launch kernel `k(lo,hi,args...)` with one thread per cell of the box `lo:hi`.
 """
 function launch(k::K, lo::NTuple{D,<:Integer}, hi::NTuple{D,<:Integer}, args...) where {K,D}
-    ext = hi .- lo .+ 1
-    any(ext .<= 0) && return 0
-    th = threads_for(Val(D))
-    ext3 = (ext..., ntuple(_->1, 3-D)...)
-    bl = cld.(ext3, th)
+    th, bl = launch_dims(lo, hi)
+    prod(bl) == 0 && return 0
     @cuda threads=th blocks=bl k(Int32.(lo), Int32.(hi), args...)
     return prod(bl)
 end
+# threads and blocks of `launch` over the box `lo:hi` (zero blocks for an empty box)
+function launch_dims(lo::NTuple{D,<:Integer}, hi::NTuple{D,<:Integer}) where D
+    ext = hi .- lo .+ 1
+    th = threads_for(Val(D))
+    any(ext .<= 0) && return th, (0, 0, 0)
+    ext3 = (ext..., ntuple(_->1, 3-D)...)
+    return th, cld.(ext3, th)
+end
+nblocks(lo, hi) = prod(launch_dims(lo, hi)[2])
 """
     launch_face(k, lo, hi, j, args...)
 
@@ -203,7 +209,9 @@ struct RedBuf
 end
 RedBuf(nb::Integer, n=8) = RedBuf(CUDA.zeros(Float64,n), CUDA.zeros(Float32,n),
     CUDA.zeros(Float32,nb), CUDA.zeros(Float32,nb), zeros(Float64,n), zeros(Float32,n))
-RedBuf(g::Grid) = RedBuf(cld(Int(g.nc), 64) + 1)
+# Room for the block partials of any reduction on `g`: a `launch` over a box inside the
+# full array, or a 1D launch of 256 threads over at most `nc` items.
+RedBuf(g::Grid) = RedBuf(max(nblocks(ntuple(_->1, length(g.n)), Int.(g.n)), cld(Int(g.nc), 256)))
 function fetch!(b::RedBuf)
     copyto!(b.hs, b.s); copyto!(b.hm, b.m)
     return b
@@ -218,9 +226,12 @@ Launch `k(lo,hi,ps,pm,args...)` (which calls `block_partial!`) and reduce the pa
 into `b.s[slot]`, `b.m[slot]`.
 """
 function red_launch(k::K, lo, hi, b::RedBuf, slot, args...) where K
+    checkcap(b, nblocks(lo, hi))
     nb = launch(k, lo, hi, b.ps, b.pm, args...)
     nb == 0 && return nothing
-    @assert nb <= length(b.ps)
     @cuda threads=1024 k_finish!(b.ps, b.pm, Int32(nb), b.s, b.m, Int32(slot))
     return nothing
 end
+"Throw before a launch that would write `nb` block partials into `b`."
+checkcap(b::RedBuf, nb) = nb <= length(b.ps) ||
+    throw(ErrorException("reduction scratch too small: $nb blocks, room for $(length(b.ps))"))

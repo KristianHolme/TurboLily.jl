@@ -304,11 +304,32 @@ function jacobi!(lv::Level, assign::Bool=false)
     lv.r, lv.ϵ = lv.ϵ, lv.r
 end
 gs_range(g::Grid{D}) where D = (inside_lo(g), ntuple(d-> d==D ? cld(Int(g.n[d]),2) : Int(g.n[d])-1, D))
+function k_rid!(lo, hi, ϵ, r, op::Op)
+    I, ok = cellidx(lo, hi); ok || return
+    l = lin(op.g, I)
+    @inbounds ϵ[l] = r[l]*getiD(op, l)
+    return nothing
+end
+# An odd periodic length puts the first and last interior cells, which are neighbours across
+# the wrap, in the same red-black colour. Reading the wrapped neighbour would then race with
+# its update, so such levels read the periodic ghosts, filled once before the sweeps
+# (as WaterLily.GaussSeidelRB!).
+oddper(op::Op{D}) where D = any(d-> op.per[d] && isodd(op.g.n[d]), 1:D)
+noper(op::Op{D}) where D = Op(op.L, op.Dg, op.iD, op.reg, op.Lreg, op.Dreg, op.iDreg, op.g, ntuple(_->false, D))
 function smooth!(lv::Level{D,T}, ωd, red::RedBuf, norms::Bool=false; it=4, exclb=false) where {D,T}
     g = lv.op.g
     lo, hi = gs_range(g)
-    for i in 1:it
-        launch(k_gs!, lo, hi, lv.ϵ, lv.r, lv.op, Int32(i), i==1)
+    if oddper(lv.op)
+        launch(k_rid!, inside_lo(g), inside_hi(g), lv.ϵ, lv.r, lv.op)
+        perBC!(lv.ϵ, g, lv.op.per)
+        op = noper(lv.op)
+        for i in 1:it
+            launch(k_gs!, lo, hi, lv.ϵ, lv.r, op, Int32(i), false)
+        end
+    else
+        for i in 1:it
+            launch(k_gs!, lo, hi, lv.ϵ, lv.r, lv.op, Int32(i), i==1)
+        end
     end
     if norms
         red_launch(k_incr!, inside_lo(g), inside_hi(g), red, 3, lv.r, lv.x, lv.ϵ, lv.op, ωd, Val(true), Val(exclb))

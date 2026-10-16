@@ -39,11 +39,12 @@ function TBiotPoisson(flow::TFlow{D,T}; nonbiotfaces=(), fmm=true, symmetry=()) 
     # argument checks as BiotSavartBCs.BiotSavartPoisson
     flow.exitBC && throw(ArgumentError("exitBC=true is ignored when using Biot-Savart BCs"))
     isempty(flow.perdir) || throw(ArgumentError("TurboLily.BiotSimulation does not support periodic directions yet; use BiotSavartBCs.BiotSimulation"))
-    isempty(symmetry) || fmm || throw(ArgumentError("symmetry requires fmm=true and no periodic directions"))
+    fmm || throw(ArgumentError("fmm=false (the direct tree sum) is not implemented in TurboLily; use BiotSavartBCs.BiotSimulation"))
     all(f -> f isa Integer && 0 < abs(f) <= D, symmetry) && allunique(abs.(symmetry)) ||
         throw(ArgumentError("symmetry faces must be valid with at most one per direction"))
     pois = TPoisson(flow)
     ml = BiotSavartBCs.MLArray(flow.f)
+    length(ml) >= 2 || throw(ArgumentError("grid $(size(flow.p) .- 2) has a single Biot-Savart level; TurboLily needs at least two (use BiotSavartBCs.BiotSimulation)"))
     ω = Tuple(ml[2:end])
     g = map(a->Grid(Base.front(size(a))), Tuple(ml))
     tars = BiotSavartBCs.collect_targets(ml, (nonbiotfaces..., symmetry...))   # no targets on these faces
@@ -592,7 +593,7 @@ function k_listnorms!(n, ps, pm, list, r)
 end
 function list_norms!(b::TBiotPoisson, list, r, slot)
     n = length(list); red = b.red
-    nb = cld(n, 256)
+    nb = cld(n, 256); checkcap(red, nb)
     @cuda threads=256 blocks=nb k_listnorms!(Int32(n), red.ps, red.pm, list, r)
     @cuda threads=1024 k_finish!(red.ps, red.pm, Int32(nb), red.s, red.m, Int32(slot))
 end
@@ -672,7 +673,7 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w::Int, t; tol=2
         fmm!(b, b.dω, b.boxes)
         launch1(k_addtar!, nt, tar1, a.f, b.dω[1])
         list_norms!(b, b.lists[3], top.r, 5)
-        nb = cld(nt, 256)
+        nb = cld(nt, 256); checkcap(red, nb)
         @cuda threads=256 blocks=nb k_biotbc2!(Int32(nt), red.ps, red.pm, tar1, a.u, a.f, top.r, U, g, idt)
         @cuda threads=1024 k_finish!(red.ps, red.pm, Int32(nb), red.s, red.m, Int32(6))
         launch1(k_fixresid2!, nt, tar1, a.u, top.r, red.s, Int32(6), 1f0, idt, g)
@@ -695,9 +696,10 @@ the CUDA flow and Biot-Savart pressure solver.
 - `nonbiotfaces`: domain faces without Biot-Savart BCs (e.g. `(-2,)` for the lower y face).
 - `symmetry`: domain faces that are symmetry planes (e.g. `(-2,)`). Like `nonbiotfaces` they
   get no Biot-Savart BCs, but the images of the vorticity across them are included.
-  Requires `fmm=true`, at most one face per direction.
+  At most one face per direction.
 
-Periodic directions (`perdir`) are not supported yet.
+Not supported (`ArgumentError`): `fmm=false`, periodic directions (`perdir`), and grids
+too small for a second Biot-Savart level.
 """
 function BiotSimulation(args...; nonbiotfaces=(), fmm=true, symmetry=(), mem=CuArray, kwargs...)
     WaterLily.Simulation(args...; mem=CuArray,

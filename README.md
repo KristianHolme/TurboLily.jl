@@ -519,3 +519,9 @@ julia --project -e 'using Pkg; Pkg.test()'
 The benchmark scripts are not part of this repository. [`RESULTS.md`](RESULTS.md) has the full
 tables, the method of each benchmark, and earlier comparisons against WaterLily and
 BiotSavartBCs pull requests.
+
+## License
+
+MIT, see [`LICENSE`](LICENSE). Parts of TurboLily are derived from WaterLily.jl and
+BiotSavartBCs.jl by Gabriel Weymouth, both MIT-licensed. TurboLily was written with
+[Claude Code](https://claude.com/claude-code).

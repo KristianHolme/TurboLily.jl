@@ -171,20 +171,69 @@ struct RiD{S,O}; r::S; op::O; end
 "`RiD` around a cell flagged `isdeep`, where every iD is iDreg."
 struct RiDc{S,T}; r::S; iD::T; end
 @inline (f::RiDc)(I, l) = @inbounds(f.r[l])*f.iD
-function k_jacobi!(lo, hi, rn, r, x, op::Op, assign::Bool=false)
-    I, ok = cellidx(lo, hi); ok || return
-    l = lin(op.g, I)
-    if isdeep(op, l)
-        f = RiDc(r, op.iDreg)
-        e = f(I, l)
-        @inbounds rn[l] = r[l] - mult_f(op, I, l, f)
-    else
-        f = RiD(r, op)
-        e = f(I, l)
-        @inbounds rn[l] = r[l] - mult_f(op, I, l, f)
+function k_jacobi!(lo, hi, rn, r, x, op::Op, assign::Bool, fr)
+    I, ok = cellidx(lo, hi)
+    w = 0f0
+    if ok
+        l = lin(op.g, I)
+        if isdeep(op, l)
+            f = RiDc(r, op.iDreg)
+            e = f(I, l)
+            w = @inbounds(r[l]) - mult_f(op, I, l, f)
+        else
+            f = RiD(r, op)
+            e = f(I, l)
+            w = @inbounds(r[l]) - mult_f(op, I, l, f)
+        end
+        @inbounds rn[l] = w
+        @inbounds x[l] = assign ? e : x[l] + e
     end
-    @inbounds x[l] = assign ? e : x[l] + e
+    restrict_block!(fr, I, ok, w)
     return nothing
+end
+"""
+    FusedR(rc, cx, gc)
+
+Restriction fused into the fine Jacobi kernel (`fr` argument; `nothing` = separate
+`k_restrict!`). A `launch` block (32×4×2 or 32×8) starting at the even index 2 holds whole
+2ᵈ coarsening blocks, so the block sums its new residuals in shared memory, in the order of
+`k_restrict!`, writes the coarse residual and zeroes the coarse solution.
+"""
+struct FusedR{D,S}; rc::S; cx::S; gc::Grid{D}; end
+Adapt.@adapt_structure FusedR
+@inline restrict_block!(::Nothing, I, ok, w) = nothing
+@inline function restrict_block!(fr::FusedR{D}, I, ok, w) where D
+    sh = CuStaticSharedArray(Float32, 256)
+    t = flat_tid()
+    @inbounds sh[t+i32] = ok ? w : 0f0
+    sync_threads()
+    lead = ok
+    @unroll for d in i32:Int32(D)
+        lead &= iseven(I[d])
+    end
+    if lead
+        bx = blockDim().x; bxy = blockDim().x*blockDim().y
+        s = 0f0
+        if D == 3
+            for dz in Int32(0):i32, dy in Int32(0):i32, dx in Int32(0):i32
+                @inbounds s += sh[t + i32 + dx + dy*bx + dz*bxy]
+            end
+        else
+            for dy in Int32(0):i32, dx in Int32(0):i32
+                @inbounds s += sh[t + i32 + dx + dy*bx]
+            end
+        end
+        lc = lin(fr.gc, ntuple(d-> (I[d]+Int32(2)) >> 1, Val(D)))
+        @inbounds fr.rc[lc] = s
+        @inbounds fr.cx[lc] = 0f0
+    end
+    return nothing
+end
+"`FusedR` for the restriction from `fine` to `coarse`, or `nothing` if a block can't hold whole coarse cells."
+function fused_restrict(fine::Level{D}, coarse::Level{D}) where D
+    gf, gc = fine.op.g, coarse.op.g
+    ok = all(fine.c) && all(d-> gf.n[d]-2 == 2*(gc.n[d]-2), 1:D) && D in (2, 3)
+    return ok ? FusedR(coarse.r, coarse.x, gc) : nothing
 end
 # restriction: coarse r = Σ fine r over the 2ᵈ block (semi-coarsening mask c)
 function k_restrict!(lo, hi, rc, gc::Grid{D}, rf, gf::Grid{D}, c) where D
@@ -319,30 +368,32 @@ function k_mkfix!(fixd, sums, nsd)
     return nothing
 end
 # Jacobi on the corrected residual; partial Σ|rc|, max|rc| (the initial residual norms)
-function k_jacobi_fix!(lo, hi, ps, pm, rn, r, x, op::Op, fixd)
+function k_jacobi_fix!(lo, hi, ps, pm, rn, r, x, op::Op, fixd, fr)
     I, ok = cellidx(lo, hi)
-    a = 0f0
+    a = 0f0; w = 0f0
     if ok
         l = lin(op.g, I)
         rc = make_rc(r, op, fixd)
         v = rc(I, l)
         if isdeep(op, l)
-            @inbounds rn[l] = v - mult_f(op, I, l, RcDc(r, rc.s, rc.apply, op.iDreg))
+            w = v - mult_f(op, I, l, RcDc(r, rc.s, rc.apply, op.iDreg))
             @inbounds x[l] += v*op.iDreg
         else
-            @inbounds rn[l] = v - mult_f(op, I, l, RcD(rc))
+            w = v - mult_f(op, I, l, RcD(rc))
             @inbounds x[l] += v*getiD(op, l)
         end
+        @inbounds rn[l] = w
         a = abs(v)
     end
+    restrict_block!(fr, I, ok, w)
     block_partial!(ps, pm, a, a)
     return nothing
 end
 
 # ---------------------------------------------------------------- solver pieces
-function jacobi!(lv::Level, assign::Bool=false)
+function jacobi!(lv::Level, assign::Bool=false, fr=nothing)
     g = lv.op.g
-    launch(k_jacobi!, inside_lo(g), inside_hi(g), lv.ϵ, lv.r, lv.x, lv.op, assign)
+    launch(k_jacobi!, inside_lo(g), inside_hi(g), lv.ϵ, lv.r, lv.x, lv.op, assign, fr)
     lv.r, lv.ϵ = lv.ϵ, lv.r
 end
 gs_range(g::Grid{D}) where D = (inside_lo(g), ntuple(d-> d==D ? cld(Int(g.n[d]),2) : Int(g.n[d])-1, D))
@@ -383,17 +434,20 @@ end
 # global correction, which is applied inside the fine Jacobi (norms into slot 2)
 function vcycle!(p::TPoisson{T}, l, fix=nothing; assign=false) where T
     fine, coarse = p.levels[l], p.levels[l+1]
+    fr = fused_restrict(fine, coarse)
     if fix === nothing
-        jacobi!(fine, assign)
+        jacobi!(fine, assign, fr)
     else
         g = fine.op.g
         @cuda k_mkfix!(p.fixd, p.red.s, p.nsd)
-        red_launch(k_jacobi_fix!, inside_lo(g), inside_hi(g), p.red, 2, fine.ϵ, fine.r, fine.x, fine.op, p.fixd)
+        red_launch(k_jacobi_fix!, inside_lo(g), inside_hi(g), p.red, 2, fine.ϵ, fine.r, fine.x, fine.op, p.fixd, fr)
         fine.r, fine.ϵ = fine.ϵ, fine.r
     end
     gc = coarse.op.g
-    launch(k_restrict!, inside_lo(gc), inside_hi(gc), coarse.r, gc, fine.r, fine.op.g, fine.c)
-    fill!(coarse.x, 0)
+    if fr === nothing
+        launch(k_restrict!, inside_lo(gc), inside_hi(gc), coarse.r, gc, fine.r, fine.op.g, fine.c)
+        fill!(coarse.x, 0)
+    end
     l+1 < length(p.levels) && vcycle!(p, l+1)
     smooth!(coarse, p.ωd, p.red)
     g = fine.op.g

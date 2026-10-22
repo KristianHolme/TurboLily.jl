@@ -209,13 +209,24 @@ end
     end
     return nothing
 end
+# (sum,max) of the block partials 1:nb, grid-strided; block b writes its result to outs/outm[k+b-1]
 function k_finish!(ps, pm, nb::Int32, outs, outm, k::Int32)
     s = 0.0; m = 0f0
-    i = threadIdx().x
+    i = (blockIdx().x - i32)*blockDim().x + threadIdx().x
     while i <= nb
         @inbounds s += Float64(ps[i]); @inbounds m = max(m, pm[i])
-        i += blockDim().x
+        i += gridDim().x*blockDim().x
     end
+    s, m = block_red(s, m)
+    if threadIdx().x == i32
+        @inbounds outs[k + blockIdx().x - i32] = s; @inbounds outm[k + blockIdx().x - i32] = m
+    end
+    return nothing
+end
+# (sum,max) of Float64/Float32 values 1:nq in one block
+function k_finish2!(qs, qm, nq::Int32, outs, outm, k::Int32)
+    i = threadIdx().x
+    s = i <= nq ? @inbounds(qs[i]) : 0.0; m = i <= nq ? @inbounds(qm[i]) : 0f0
     s, m = block_red(s, m)
     if threadIdx().x == i32
         @inbounds outs[k] = s; @inbounds outm[k] = m
@@ -236,10 +247,30 @@ struct RedBuf
     ps::CuVector{Float32}
     pm::CuVector{Float32}
     hs::Vector{Float64}
+    qs::CuVector{Float64}    # per-block results of the first level of `finish!`
+    qm::CuVector{Float32}
 end
+const FINISH_BLOCKS = 64
 function RedBuf(nb::Integer, n=8)
     s = CUDA.zeros(Float64, 2n)
-    RedBuf(s, view(s, n+1:2n), CUDA.zeros(Float32,nb), CUDA.zeros(Float32,nb), zeros(Float64,2n))
+    RedBuf(s, view(s, n+1:2n), CUDA.zeros(Float32,nb), CUDA.zeros(Float32,nb), zeros(Float64,2n),
+        CUDA.zeros(Float64, FINISH_BLOCKS), CUDA.zeros(Float32, FINISH_BLOCKS))
+end
+"""
+    finish!(b::RedBuf, nb, outs, outm, k)
+
+Reduce the block partials `b.ps/pm[1:nb]` into `outs[k]` (Float64 sum) and `outm[k]` (max).
+FP64 runs at 1/32 rate on GeForce cards, so many partials are first reduced by
+`FINISH_BLOCKS` blocks, then by one.
+"""
+function finish!(b::RedBuf, nb, outs, outm, k)
+    if nb <= 16384
+        @cuda threads=1024 k_finish!(b.ps, b.pm, Int32(nb), outs, outm, Int32(k))
+    else
+        @cuda threads=256 blocks=FINISH_BLOCKS k_finish!(b.ps, b.pm, Int32(nb), b.qs, b.qm, i32)
+        @cuda threads=FINISH_BLOCKS k_finish2!(b.qs, b.qm, Int32(FINISH_BLOCKS), outs, outm, Int32(k))
+    end
+    return nothing
 end
 # Room for the block partials of any reduction on `g`: a `launch` over a box inside the
 # full array, or a 1D launch of 256 threads over at most `nc` items.
@@ -275,7 +306,7 @@ function red_launch(k::K, lo, hi, b::RedBuf, slot, args...) where K
     checkcap(b, nblocks(lo, hi))
     nb = launch(k, lo, hi, b.ps, b.pm, args...)
     nb == 0 && return nothing
-    @cuda threads=1024 k_finish!(b.ps, b.pm, Int32(nb), b.s, b.m, Int32(slot))
+    finish!(b, nb, b.s, b.m, slot)
     return nothing
 end
 "Throw before a launch that would write `nb` block partials into `b`."

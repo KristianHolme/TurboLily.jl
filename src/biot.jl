@@ -602,7 +602,7 @@ function list_norms!(b::TBiotPoisson, list, r, slot)
     n = length(list); red = b.red
     nb = cld(n, 256); checkcap(red, nb)
     @cuda threads=256 blocks=nb k_listnorms!(Int32(n), red.ps, red.pm, list, r)
-    @cuda threads=1024 k_finish!(red.ps, red.pm, Int32(nb), red.s, red.m, Int32(slot))
+    finish!(red, nb, red.s, red.m, slot)
 end
 # boundary velocity u = U + uᵥ; r[adjacent] += Δuₙ·sgn·scale; partial Σ Δuₙ·sgn (net flux change)
 function k_biotbc2!(n, ps, pm, tar, u, uv, r, U, g::Grid, scale)
@@ -682,7 +682,7 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w::Int, t; tol=2
         list_norms!(b, b.lists[3], top.r, 5)
         nb = cld(nt, 256); checkcap(red, nb)
         @cuda threads=256 blocks=nb k_biotbc2!(Int32(nt), red.ps, red.pm, tar1, a.u, a.f, top.r, U, g, idt)
-        @cuda threads=1024 k_finish!(red.ps, red.pm, Int32(nb), red.s, red.m, Int32(6))
+        finish!(red, nb, red.s, red.m, 6)
         launch1(k_fixresid2!, nt, tar1, a.u, top.r, red.s, Int32(6), 1f0, idt, g)
         list_norms!(b, b.lists[3], top.r, 7)
         fetch!(red)

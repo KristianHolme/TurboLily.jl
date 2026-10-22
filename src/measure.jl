@@ -193,7 +193,7 @@ function WaterLily.update!(p::TPoisson{T}) where T
         checkcap(p.red, nblocks(inside_lo(g), inside_hi(g)))
         nb = launch(k_diag!, inside_lo(g), inside_hi(g), p.red.ps, p.red.pm, op.L, op.Dg, op.iD, op.reg, g, op.Lreg)
         set_deep!(op)
-        l == 1 && @cuda threads=1024 k_finish!(p.red.ps, p.red.pm, Int32(nb), p.nsd, p.red.m, Int32(1))
+        l == 1 && finish!(p.red, nb, p.nsd, p.red.m, 1)
     end
     return p
 end

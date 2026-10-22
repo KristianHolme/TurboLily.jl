@@ -23,7 +23,26 @@ Per(t::NTuple{D,Bool}) where D = Per{t}()
 @inline Base.getindex(::Per{P}, j::Integer) where P = @inbounds P[j]
 Base.Tuple(::Per{P}) where P = P
 
+"""
+    SGrid{D,N}
+
+`Grid` with the array size `N` as a type parameter: strides and component offsets are
+compile-time constants, so neighbour offsets become immediates of the loads. Costs one
+compilation per grid size; used by the momentum core only.
+"""
+struct SGrid{D,N} end
+SGrid(g::Grid{D}) where D = SGrid{D,Tuple(Int.(g.n))}()
+@inline function Base.getproperty(::SGrid{D,N}, s::Symbol) where {D,N}
+    s === :n && return Int32.(N)
+    s === :s && return ntuple(d-> Int32(prod(N[1:d-1])), Val(D))
+    s === :nc && return Int32(prod(N))
+    error("SGrid has no property $s")
+end
+const AGrid{D} = Union{Grid{D},SGrid{D}}
+
 # (`sum` would widen Int32 to Int64)
+@inline lin(g::SGrid{3}, I::NTuple{3,Int32}) = i32 + (I[1]-i32) + (I[2]-i32)*g.s[2] + (I[3]-i32)*g.s[3]
+@inline lin(g::SGrid{2}, I::NTuple{2,Int32}) = i32 + (I[1]-i32) + (I[2]-i32)*g.s[2]
 @inline lin(g::Grid{3}, I::NTuple{3,Int32}) = i32 + (I[1]-i32) + (I[2]-i32)*g.s[2] + (I[3]-i32)*g.s[3]
 @inline lin(g::Grid{2}, I::NTuple{2,Int32}) = i32 + (I[1]-i32) + (I[2]-i32)*g.s[2]
 @inline function coords(g::Grid{3}, l::Int32)

@@ -107,7 +107,7 @@ end
 # Flux Φⱼ of momentum component i through the lower j-face of cell I (WaterLily.conv_diff! semantics)
 # Interior face (3 ≤ Iⱼ ≤ nⱼ-1): the upwind stencil is selected first so λ is evaluated once.
 # Both far values are loaded before the selection, so no load waits on the sign of uf.
-@inline function fluxi(j, i, l, u, g::Grid, λ::F, ν) where F
+@inline function fluxi(j, i, l, u, g::AGrid, λ::F, ν) where F
     nc, sj = g.nc, g.s[j]
     ci = (i-i32)*nc
     @inbounds uf = (u[l + (j-i32)*nc] + u[l - g.s[i] + (j-i32)*nc]) * 0.5f0 # ϕ(i,CI(I,j),u)
@@ -141,7 +141,7 @@ end
 # Any face with 2 ≤ Iⱼ ≤ nⱼ, as `flux` but with selects instead of branches, so that a kernel
 # over the full j range keeps the code and register use of `fluxi`. Equal to `fluxi` on
 # interior faces. Unselected values may come from outside the row; they are never used.
-@inline function fluxb(j, i, Ij, l, u, g::Grid, λ::F, ν, per) where F
+@inline function fluxb(j, i, Ij, l, u, g::AGrid, λ::F, ν, per) where F
     nc, sj, nj = g.nc, g.s[j], g.n[j]
     ci = (i-i32)*nc
     @inbounds uf = (u[l + (j-i32)*nc] + u[l - g.s[i] + (j-i32)*nc]) * 0.5f0
@@ -229,7 +229,7 @@ function core_and_shell(g::Grid{D}, fullx=false) where D
 end
 # per-cell update with y/z faces interior and the full x range; the x faces use the
 # branch-free `fluxb`, which handles the domain-boundary faces x=2 (lower) and x=n (upper)
-function k_momc!(lo, hi, out, uin, u0, g::Grid{D}, dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool) where {D,T,F,A}
+function k_momc!(lo, hi, out, uin, u0, g::AGrid{D}, dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool) where {D,T,F,A}
     I, ok = cellidx(lo, hi); ok || return
     l = lin(g, I)
     @unroll for i in i32:Int32(D)
@@ -248,7 +248,7 @@ function k_momc!(lo, hi, out, uin, u0, g::Grid{D}, dt::T, ν::T, λ::F, per, acc
     return nothing
 end
 launch_core!(a::TFlow{D,T}, lo, hi, out, uin, t, corr) where {D,T} =
-    launch(k_momc!, lo, hi, out, uin, a.u⁰, a.grid, a.Δt[end], a.ν, a.λ, a.per, a.acc, T(t), corr)
+    launch(k_momc!, lo, hi, out, uin, a.u⁰, SGrid(a.grid), a.Δt[end], a.ν, a.λ, a.per, a.acc, T(t), corr)
 function launch_mom!(a::TFlow{D,T}, out, uin, t, corr) where {D,T}
     fullx = true
     (clo, chi), slabs = core_and_shell(a.grid, fullx)

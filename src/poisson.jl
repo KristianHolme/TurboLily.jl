@@ -4,11 +4,13 @@ using Adapt
 """
     Op
 
-Kernel-side view of one Poisson level `A = L + D + L'`. Cells flagged `reg[I]≠0` have
+Kernel-side view of one Poisson level `A = L + D + L'`. Cells with bit `0x01` of `reg[I]` have
 `L=Lreg` on all 2d faces, so `D=Dreg` and `iD=iDreg`; the solver kernels then skip
-reading `L`, `D` and `iD`, which dominate the memory traffic away from the body.
+reading `L`, `D` and `iD`, which dominate the memory traffic away from the body. Bit `0x02`
+marks a regular cell whose 2d neighbours are regular too, so a stencil over `r·iD` needs no
+flag of a neighbour.
 """
-struct Op{D,T,S<:AbstractArray{T},V<:AbstractArray{T},R<:AbstractArray{UInt8}}
+struct Op{D,T,S<:AbstractArray{T},V<:AbstractArray{T},R<:AbstractArray{UInt8},P<:Per}
     L :: V
     Dg :: S
     iD :: S
@@ -17,11 +19,12 @@ struct Op{D,T,S<:AbstractArray{T},V<:AbstractArray{T},R<:AbstractArray{UInt8}}
     Dreg :: T
     iDreg :: T
     g :: Grid{D}
-    per :: NTuple{D,Bool}
+    per :: P
 end
 Adapt.@adapt_structure Op
 
-@inline isreg(op::Op, l) = @inbounds op.reg[l] != 0x00
+@inline isreg(op::Op, l) = @inbounds (op.reg[l] & 0x01) != 0x00
+@inline isdeep(op::Op, l) = @inbounds (op.reg[l] & 0x02) != 0x00
 @inline getiD(op::Op, l) = isreg(op, l) ? op.iDreg : @inbounds(op.iD[l])
 
 "Array as a neighbour-value functor `(I,l)->x[l]`."
@@ -71,8 +74,8 @@ end
 One multigrid level. Arrays alias the corresponding `WaterLily.Poisson` level;
 `r` and `ϵ` may be swapped by the fused Jacobi kernel.
 """
-mutable struct Level{D,T,S<:AbstractArray{T},V<:AbstractArray{T},R}
-    op :: Op{D,T,S,V,R}
+mutable struct Level{D,T,S<:AbstractArray{T},V<:AbstractArray{T},R,P}
+    op :: Op{D,T,S,V,R,P}
     x :: S
     ϵ :: S
     r :: S
@@ -97,12 +100,26 @@ function k_regflag!(lo, hi, reg, L, g::Grid{D}, Lreg) where D
     @inbounds reg[l] = b ? 0x01 : 0x00
     return nothing
 end
+# bit 0x02: the cell and its 2d neighbours (wrapped in periodic directions) are regular.
+# Only bit 0x02 is written, so concurrent reads of bit 0x01 are unaffected.
+function k_deepflag!(lo, hi, reg, g::Grid{D}, per) where D
+    I, ok = cellidx(lo, hi); ok || return
+    l = lin(g, I)
+    b = @inbounds(reg[l]) & 0x01
+    @unroll for j in i32:Int32(D)
+        b &= @inbounds(reg[nbm(g,I,l,j,per)]) & @inbounds(reg[nbp(g,I,l,j,per)])
+    end
+    b != 0x00 && (@inbounds reg[l] = 0x03)
+    return nothing
+end
+set_deep!(op::Op) = launch(k_deepflag!, inside_lo(op.g), inside_hi(op.g), op.reg, op.g, op.per)
 "Recompute the regular-cell flags from `L` (after `L` changed)."
 function set_reg!(lv::Level{D,T}) where {D,T}
     op = lv.op; g = op.g
     Lreg = maximum(op.L)
     fill!(op.reg, 0x00)
     launch(k_regflag!, inside_lo(g), inside_hi(g), op.reg, op.L, g, Lreg)
+    set_deep!(op)
     Dreg = -T(2D)*Lreg
     lv.op = Op(op.L, op.Dg, op.iD, op.reg, Lreg, Dreg, inv(Dreg), g, op.per)
 end
@@ -115,19 +132,19 @@ Multigrid pressure solver with the same algorithm as `WaterLily.MultiLevelPoisso
 fused CUDA kernels, compressed regular-cell stencils and one host synchronisation
 per V-cycle.
 """
-struct TPoisson{T,S,V,D,R} <: AbstractPoisson{T,S,V}
+struct TPoisson{T,S,V,D,R,P} <: AbstractPoisson{T,S,V}
     x :: S
     L :: V
     z :: S
     ml :: MultiLevelPoisson{T,S,V}
-    levels :: Vector{Level{D,T,S,V,R}}
-    per :: NTuple{D,Bool}
+    levels :: Vector{Level{D,T,S,V,R,P}}
+    per :: P
     n :: Vector{Int16}
     perdir :: NTuple
     nsolve :: Base.RefValue{Int}     # number of solved rows (count(!iszero, iD))
     red :: RedBuf
     ωd :: CuVector{Float32}          # [ω, r₁]: relaxation and previous Σ|r| (device side)
-    fixd :: CuVector{Float32}        # [-, tiny] for the lazy residual correction
+    fixd :: CuVector{Float32}        # [s, tiny] for the lazy residual correction, s = Σr/nsolve
     nsd :: CuVector{Float64}         # number of solved rows, count(iD≠0), on the device
     graphs :: Dict{Any,CuGraphExec}
     seen :: Set{Any}
@@ -135,9 +152,9 @@ end
 function TPoisson(x::AbstractArray{T,D}, L, z; perdir=()) where {T,D}
     ml = MultiLevelPoisson(x, L, z; perdir)
     nl = length(ml.levels)
-    per = ntuple(j->j ∈ perdir, D)
+    per = Per(ntuple(j->j ∈ perdir, D))
     levels = [Level(ml.levels[l], l < nl ? coarsen_mask(ml.levels[l].x, ml.levels[l+1].x) : ntuple(_->false,D), per) for l in 1:nl]
-    p = TPoisson{T,typeof(x),typeof(L),D,typeof(levels[1].op.reg)}(x, L, z, ml, levels, per, Int16[], perdir, Ref(0), RedBuf(Grid(x)),
+    p = TPoisson{T,typeof(x),typeof(L),D,typeof(levels[1].op.reg),typeof(per)}(x, L, z, ml, levels, per, Int16[], perdir, Ref(0), RedBuf(Grid(x)),
         CUDA.ones(Float32, 2), CUDA.zeros(Float32, 2), CUDA.zeros(Float64, 1), Dict{Any,CuGraphExec}(), Set{Any}())
     finish_update!(p)
 end
@@ -151,12 +168,21 @@ end
 # Jacobi: ϵ=r·iD, r ← r-Aϵ (written to rn), x += ϵ
 struct RiD{S,O}; r::S; op::O; end
 @inline (f::RiD)(I, l) = @inbounds(f.r[l])*getiD(f.op, l)
+"`RiD` around a cell flagged `isdeep`, where every iD is iDreg."
+struct RiDc{S,T}; r::S; iD::T; end
+@inline (f::RiDc)(I, l) = @inbounds(f.r[l])*f.iD
 function k_jacobi!(lo, hi, rn, r, x, op::Op, assign::Bool=false)
     I, ok = cellidx(lo, hi); ok || return
     l = lin(op.g, I)
-    f = RiD(r, op)
-    e = f(I, l)
-    @inbounds rn[l] = r[l] - mult_f(op, I, l, f)
+    if isdeep(op, l)
+        f = RiDc(r, op.iDreg)
+        e = f(I, l)
+        @inbounds rn[l] = r[l] - mult_f(op, I, l, f)
+    else
+        f = RiD(r, op)
+        e = f(I, l)
+        @inbounds rn[l] = r[l] - mult_f(op, I, l, f)
+    end
     @inbounds x[l] = assign ? e : x[l] + e
     return nothing
 end
@@ -187,7 +213,7 @@ end
         (per[d] && I[d]==i32) ? g.n[d]-i32 : (per[d] && I[d]==g.n[d]) ? Int32(2) : I[d]
     end
 end
-struct Prol{D,S,C}; cx::S; gc::Grid{D}; g::Grid{D}; c::C; per::NTuple{D,Bool}; end
+struct Prol{D,S,C,P}; cx::S; gc::Grid{D}; g::Grid{D}; c::C; per::P; end
 @inline (f::Prol)(I, l) = @inbounds f.cx[lin(f.gc, down(wrapI(f.g, I, f.per), f.c))]
 # increment with ϵ = prolongation(cx): r -= ωAϵ, x += ωϵ
 function k_prol_incr!(lo, hi, r, x, op::Op, cx, gc::Grid, c, ωd)
@@ -246,7 +272,11 @@ function k_gs!(lo, hi, ϵ, r, op::Op{D}, k0::Int32, init::Bool) where D
     end
     k <= g.n[D] - i32 || return             # the last pair can have only one interior cell
     if init
-        @inbounds ϵ[l] = (r[l] - offdiag_f(op, I, l, RiD(r, op)))*getiD(op, l)
+        if isdeep(op, l)
+            @inbounds ϵ[l] = (r[l] - offdiag_f(op, I, l, RiDc(r, op.iDreg)))*op.iDreg
+        else
+            @inbounds ϵ[l] = (r[l] - offdiag_f(op, I, l, RiD(r, op)))*getiD(op, l)
+        end
     else
         @inbounds ϵ[l] = (r[l] - offdiag_f(op, I, l, AV(ϵ)))*getiD(op, l)
     end
@@ -276,21 +306,33 @@ struct Rc{S,O}; r::S; op::O; s::Float32; apply::Bool; end
 end
 struct RcD{S,O}; rc::Rc{S,O}; end
 @inline (f::RcD)(I, l) = f.rc(I, l)*getiD(f.rc.op, l)
-@inline function make_rc(r, op, sums, nsd, fixd)
-    s = Float32(@inbounds(sums[1]) / @inbounds(nsd[1]))
+"`RcD` around a cell flagged `isdeep`: every iD is iDreg ≠ 0."
+struct RcDc{S,T}; r::S; s::T; apply::Bool; iD::T; end
+@inline (f::RcDc)(I, l) = (f.apply ? @inbounds(f.r[l]) - f.s : @inbounds(f.r[l]))*f.iD
+@inline function make_rc(r, op, fixd)
+    s = @inbounds fixd[1]
     return Rc(r, op, s, abs(s) > @inbounds(fixd[2]))
 end
+# s = Σr/nsolve, once per solve (a Float64 division per thread is slow on GeForce cards)
+function k_mkfix!(fixd, sums, nsd)
+    @inbounds fixd[1] = Float32(sums[1] / nsd[1])
+    return nothing
+end
 # Jacobi on the corrected residual; partial Σ|rc|, max|rc| (the initial residual norms)
-function k_jacobi_fix!(lo, hi, ps, pm, rn, r, x, op::Op, sums, nsd, fixd)
+function k_jacobi_fix!(lo, hi, ps, pm, rn, r, x, op::Op, fixd)
     I, ok = cellidx(lo, hi)
     a = 0f0
     if ok
         l = lin(op.g, I)
-        rc = make_rc(r, op, sums, nsd, fixd)
+        rc = make_rc(r, op, fixd)
         v = rc(I, l)
-        f = RcD(rc)
-        @inbounds rn[l] = v - mult_f(op, I, l, f)
-        @inbounds x[l] += v*getiD(op, l)
+        if isdeep(op, l)
+            @inbounds rn[l] = v - mult_f(op, I, l, RcDc(r, rc.s, rc.apply, op.iDreg))
+            @inbounds x[l] += v*op.iDreg
+        else
+            @inbounds rn[l] = v - mult_f(op, I, l, RcD(rc))
+            @inbounds x[l] += v*getiD(op, l)
+        end
         a = abs(v)
     end
     block_partial!(ps, pm, a, a)
@@ -315,7 +357,7 @@ end
 # its update, so such levels read the periodic ghosts, filled once before the sweeps
 # (as WaterLily.GaussSeidelRB!).
 oddper(op::Op{D}) where D = any(d-> op.per[d] && isodd(op.g.n[d]), 1:D)
-noper(op::Op{D}) where D = Op(op.L, op.Dg, op.iD, op.reg, op.Lreg, op.Dreg, op.iDreg, op.g, ntuple(_->false, D))
+noper(op::Op{D}) where D = Op(op.L, op.Dg, op.iD, op.reg, op.Lreg, op.Dreg, op.iDreg, op.g, Per(ntuple(_->false, D)))
 function smooth!(lv::Level{D,T}, ωd, red::RedBuf, norms::Bool=false; it=4, exclb=false) where {D,T}
     g = lv.op.g
     lo, hi = gs_range(g)
@@ -345,7 +387,8 @@ function vcycle!(p::TPoisson{T}, l, fix=nothing; assign=false) where T
         jacobi!(fine, assign)
     else
         g = fine.op.g
-        red_launch(k_jacobi_fix!, inside_lo(g), inside_hi(g), p.red, 2, fine.ϵ, fine.r, fine.x, fine.op, p.red.s, p.nsd, p.fixd)
+        @cuda k_mkfix!(p.fixd, p.red.s, p.nsd)
+        red_launch(k_jacobi_fix!, inside_lo(g), inside_hi(g), p.red, 2, fine.ϵ, fine.r, fine.x, fine.op, p.fixd)
         fine.r, fine.ϵ = fine.ϵ, fine.r
     end
     gc = coarse.op.g

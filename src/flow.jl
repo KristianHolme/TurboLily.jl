@@ -26,7 +26,7 @@ is a fused CUDA implementation of `WaterLily.mom_step!`.
 `u` and `u⁰` (and `f` as the corrector output) are swapped instead of copied;
 always read `flow.u` afresh rather than holding on to the array.
 """
-mutable struct TFlow{D,T,Sf<:AbstractArray{T},Vf<:AbstractArray{T},Tf<:AbstractArray{T},Lf,Bf,Af} <: AbstractFlow{D,T}
+mutable struct TFlow{D,T,Sf<:AbstractArray{T},Vf<:AbstractArray{T},Tf<:AbstractArray{T},Lf,Bf,Af,Pf<:Per} <: AbstractFlow{D,T}
     u :: Vf
     u⁰:: Vf
     f :: Vf
@@ -46,7 +46,7 @@ mutable struct TFlow{D,T,Sf<:AbstractArray{T},Vf<:AbstractArray{T},Tf<:AbstractA
     bc :: Bf                    # isbits boundary function
     acc :: Af                   # isbits acceleration or nothing
     grid :: Grid{D}
-    per :: NTuple{D,Bool}
+    per :: Pf                   # periodic directions
     bdimlow :: NTuple{D,Bool}   # lower boundary faces normal to j get the BDIM update (no BC! overwrites them)
     band :: CuVector{Int32}     # linear (I,i) indices of faces with μ₀≠1, μ₁=0 (u = V+μ₀f̃)
     shell :: CuVector{Int32}    # linear (I,i) indices of faces with μ₁≠0 (full BDIM update)
@@ -74,9 +74,9 @@ function TFlow(N::NTuple{D}, uBC; T=Float32, mem=CuArray, bdimfaces=(), kw...) w
     copyto!(f.f, f.u)
     bc = f.uBC isa Function ? f.uBC : ConstBC{D,T}(T.(f.uBC))
     acc = make_acc(f.g, f.uBC)
-    per = ntuple(j->j ∈ f.perdir, D)
+    per = Per(ntuple(j->j ∈ f.perdir, D))
     bdimlow = ntuple(j->per[j] || -j ∈ bdimfaces, D)
-    a = TFlow{D,T,typeof(f.p),typeof(f.u),typeof(f.μ₁),typeof(f.λ),typeof(bc),typeof(acc)}(
+    a = TFlow{D,T,typeof(f.p),typeof(f.u),typeof(f.μ₁),typeof(f.λ),typeof(bc),typeof(acc),typeof(per)}(
         f.u, f.u⁰, f.f, f.p, f.σ, f.V, f.μ₀, f.μ₁, f.uBC, f.Δt, f.ν, f.g, f.exitBC, f.perdir, f.λ,
         bc, acc, Grid(f.p), per, bdimlow, CuVector{Int32}(undef,1024), CuVector{Int32}(undef,1024), 0, 0, true,
         RedBuf(Grid(f.p)), nothing, (n = similar(f.p, UInt8); fill!(n, 0x01); n), CUDA.zeros(Int32, 4))
@@ -98,20 +98,21 @@ function WaterLily.setproperties(a::TFlow{D,T}, patch::NamedTuple) where {D,T}
     bc = uBC isa Function ? uBC : ConstBC{D,T}(uBC)
     acc = make_acc(nt.g, uBC)
     nt = merge(nt, (; uBC, bc, acc))
-    return TFlow{D,T,typeof(nt.p),typeof(nt.u),typeof(nt.μ₁),typeof(nt.λ),typeof(bc),typeof(acc)}(values(nt)...)
+    return TFlow{D,T,typeof(nt.p),typeof(nt.u),typeof(nt.μ₁),typeof(nt.λ),typeof(bc),typeof(acc),typeof(nt.per)}(values(nt)...)
 end
 
 # ---------------------------------------------------------------- convection-diffusion
 # Flux Φⱼ of momentum component i through the lower j-face of cell I (WaterLily.conv_diff! semantics)
 # Interior face (3 ≤ Iⱼ ≤ nⱼ-1): the upwind stencil is selected first so λ is evaluated once.
+# Both far values are loaded before the selection, so no load waits on the sign of uf.
 @inline function fluxi(j, i, l, u, g::Grid, λ::F, ν) where F
     nc, sj = g.nc, g.s[j]
     ci = (i-i32)*nc
     @inbounds uf = (u[l + (j-i32)*nc] + u[l - g.s[i] + (j-i32)*nc]) * 0.5f0 # ϕ(i,CI(I,j),u)
     @inbounds c = u[l+ci]; @inbounds b = u[l-sj+ci]
+    @inbounds fm = u[l+ci-2sj]; @inbounds fp = u[l+ci+sj]
     up = uf > 0
-    @inbounds far = u[l + ci + (up ? -2sj : sj)]
-    return uf*λ(far, up ? b : c, up ? c : b) - ν*(c-b)
+    return uf*λ(up ? fm : fp, up ? b : c, up ? c : b) - ν*(c-b)
 end
 # Any face, including the domain-boundary faces Iⱼ=2 and Iⱼ=nⱼ
 @inline function flux(j, i, I::NTuple{D,Int32}, l, u, g::Grid{D}, λ::F, ν, per) where {D,F}
@@ -134,6 +135,24 @@ end
     else # Ij == nj
         return (uf < 0 ? uf*(c+b)*0.5f0 : uf*λ(@inbounds(u[l-2sj+ci]), b, c)) - ν*(c-b)
     end
+end
+# Any face with 2 ≤ Iⱼ ≤ nⱼ, as `flux` but with selects instead of branches, so that a kernel
+# over the full j range keeps the code and register use of `fluxi`. Equal to `fluxi` on
+# interior faces. Unselected values may come from outside the row; they are never used.
+@inline function fluxb(j, i, Ij, l, u, g::Grid, λ::F, ν, per) where F
+    nc, sj, nj = g.nc, g.s[j], g.n[j]
+    ci = (i-i32)*nc
+    @inbounds uf = (u[l + (j-i32)*nc] + u[l - g.s[i] + (j-i32)*nc]) * 0.5f0
+    wrap = per[j] & (Ij == nj)          # upper periodic face ≡ lower face at index 2
+    lb = wrap ? l - (nj-Int32(2))*sj : l
+    lo = Ij == Int32(2) || wrap
+    @inbounds c = u[lb+ci]; @inbounds b = u[lb-sj+ci]
+    @inbounds fm = u[lb + ci + ((per[j] & lo) ? (nj-Int32(4))*sj : -2sj)]
+    @inbounds fp = u[lb+ci+sj]
+    up = uf > 0
+    t = uf*λ(up ? fm : fp, up ? b : c, up ? c : b)
+    central = !per[j] & ((lo & up) | ((Ij == nj) & (uf < 0)))
+    return (central ? uf*(c+b)*0.5f0 : t) - ν*(c-b)
 end
 @inline function iscore(I::NTuple{D,Int32}, g::Grid{D}) where D
     c = true
@@ -206,16 +225,15 @@ function core_and_shell(g::Grid{D}, fullx=false) where D
     end
     return (clo, chi), slabs
 end
-# per-cell update with y/z faces interior and the full x range: the general flux is only
-# evaluated on the x faces at the domain boundary (x=2 lower, x=n-1 upper)
+# per-cell update with y/z faces interior and the full x range; the x faces use the
+# branch-free `fluxb`, which handles the domain-boundary faces x=2 (lower) and x=n (upper)
 function k_momc!(lo, hi, out, uin, u0, g::Grid{D}, dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool) where {D,T,F,A}
     I, ok = cellidx(lo, hi); ok || return
     l = lin(g, I)
-    xlo = I[1] == 2i32; xhi = I[1] == g.n[1] - i32
     @unroll for i in i32:Int32(D)
         r = zero(T)
-        r += xlo ? flux(1, i, I, l, uin, g, λ, ν, per) : fluxi(1, i, l, uin, g, λ, ν)
-        r -= xhi ? flux(1, i, shift(I,1,1), l+i32, uin, g, λ, ν, per) : fluxi(1, i, l+i32, uin, g, λ, ν)
+        r += fluxb(1, i, I[1], l, uin, g, λ, ν, per)
+        r -= fluxb(1, i, I[1]+i32, l+i32, uin, g, λ, ν, per)
         @unroll for j in Int32(2):Int32(D)
             r += fluxi(j, i, l, uin, g, λ, ν)
             r -= fluxi(j, i, l+g.s[j], uin, g, λ, ν)

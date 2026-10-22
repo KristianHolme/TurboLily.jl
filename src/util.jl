@@ -12,6 +12,17 @@ Grid(n::NTuple{D,<:Integer}) where D =
     Grid{D}(Int32.(n), ntuple(d->Int32(prod(n[1:d-1])), Val(D)), Int32(prod(n)))
 Grid(a::AbstractArray) = Grid(size(a))
 
+"""
+    Per(t::NTuple{D,Bool})
+
+Periodic flags as a type parameter: `per[j]` is a compile-time constant in kernels, so the
+wrap code of non-periodic directions disappears.
+"""
+struct Per{P} end
+Per(t::NTuple{D,Bool}) where D = Per{t}()
+@inline Base.getindex(::Per{P}, j::Integer) where P = @inbounds P[j]
+Base.Tuple(::Per{P}) where P = P
+
 # (`sum` would widen Int32 to Int64)
 @inline lin(g::Grid{3}, I::NTuple{3,Int32}) = i32 + (I[1]-i32) + (I[2]-i32)*g.s[2] + (I[3]-i32)*g.s[3]
 @inline lin(g::Grid{2}, I::NTuple{2,Int32}) = i32 + (I[1]-i32) + (I[2]-i32)*g.s[2]

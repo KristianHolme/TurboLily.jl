@@ -713,26 +713,71 @@ function k_resid_src!(lo, hi, ps, pm, r, x, u, V, op::Op{D}, idt, useV::Bool) wh
     block_partial!(ps, pm, s, 0f0)
     return nothing
 end
+# projected u at face (l,i): u - Δt·L·(x[l] - x[l-δᵢ]); `r` is isreg(op, l)
+@inline function projv(u, x, op::Op, l, i, r::Bool, dt)
+    g = op.g; ci = (i-i32)*g.nc
+    L = r ? op.Lreg : @inbounds(op.L[l+ci])
+    return @inbounds(u[l+ci]) - dt*L*(@inbounds(x[l])-@inbounds(x[l-g.s[i]]))
+end
 function k_proj!(lo, hi, u, x, op::Op{D}, dt) where D
     I, ok = cellidx(lo, hi); ok || return
     g = op.g
     l = lin(g, I)
     r = isreg(op, l)
     @unroll for i in i32:Int32(D)
-        ci = (i-i32)*g.nc
-        L = r ? op.Lreg : @inbounds(op.L[l+ci])
-        @inbounds u[l+ci] -= dt*L*(x[l]-x[l-g.s[i]])
+        @inbounds u[l+(i-i32)*g.nc] = projv(u, x, op, l, i, r, dt)
     end
+    return nothing
+end
+# Projection out of place (uold → unew) and the CFL flux Σᵢ max(0,u⁺ᵢ) + max(0,-u⁻ᵢ) of each cell
+# (block max in pm), with the face values BC!(u, bc, t; saveexit=exit) leaves after the
+# projection: bc values on non-periodic boundary faces, the old exit face, the periodic copy.
+function k_proj_cfl!(lo, hi, ps, pm, unew, uold, x, op::Op{D}, dt::T, bc::B, t::T, exit::Bool) where {D,T,B}
+    I, ok = cellidx(lo, hi)
+    m = 0f0
+    if ok
+        g = op.g; per = op.per
+        l = lin(g, I)
+        r = isreg(op, l)
+        @unroll for i in i32:Int32(D)
+            ci = (i-i32)*g.nc; s = g.s[i]; Ii = I[i]; ni = g.n[i]
+            v = projv(uold, x, op, l, i, r, dt)
+            @inbounds unew[l+ci] = v
+            lw = ((Ii == Int32(2)) & !per[i]) ? bc(i, loc(i, I, T), t) : v
+            up = if Ii < ni - i32
+                projv(uold, x, op, l+s, i, isreg(op, l+s), dt)
+            elseif per[i]
+                l2 = l - (ni-Int32(3))*s
+                projv(uold, x, op, l2, i, isreg(op, l2), dt)
+            elseif exit & (i == i32)
+                @inbounds uold[l+s+ci]
+            else
+                bc(i, loc(i, setj(I, i, ni), T), t)
+            end
+            m += max(0f0, up) + max(0f0, -lw)
+        end
+    end
+    block_partial!(ps, pm, 0f0, m)
     return nothing
 end
 # (WaterLily ≥ 1.9.1: domain BCs at t and the convective exit (predictor) are applied here,
 # and the step is Δt/w with w=1 in the predictor and w=2 in the corrector)
-function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t) where {D,T}
+# `cfl=true`: the CFL flux maximum of the final velocity goes to b.red slot 5 (see `cfl!`),
+# from the projection kernel, which then writes to `a.f` (swapped into `a.u`)
+function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t; cfl=false) where {D,T}
     BC!(a, a.u, t)
     w == 1 && a.exitBC && exitBC!(a, a.u, a.u⁰, a.Δt[end])
     dt = a.Δt[end]/T(w); g = a.grid; lv = b.levels[1]
     red_launch(k_resid_src!, inside_lo(g), inside_hi(g), b.red, 1, lv.r, lv.x, a.u, a.V, lv.op, inv(dt), !a.Vzero)
     solve!(b, dt)
-    launch(k_proj!, inside_lo(g), inside_hi(g), a.u, b.x, lv.op, dt)
+    if cfl
+        red_launch(k_proj_cfl!, inside_lo(g), inside_hi(g), b.red, 5, a.f, a.u, b.x, lv.op, dt, a.bc, T(t), a.exitBC)
+        copy_exit!(a, a.f, a.u)
+        a.u, a.f = a.f, a.u
+    else
+        launch(k_proj!, inside_lo(g), inside_hi(g), a.u, b.x, lv.op, dt)
+    end
     BC!(a, a.u, t)
 end
+"WaterLily.CFL of the velocity projected by `mom_project!(...; cfl=true)`."
+cfl!(a::TFlow, b::TPoisson; Δt_max=10) = (fetch!(b.red); min(Δt_max, inv(getmax(b.red, 5) + 5a.ν)))

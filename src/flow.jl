@@ -470,8 +470,13 @@ function WaterLily.mom_step!(a::TFlow{D,T}, b::AbstractPoisson; udf=nothing, kwa
     mom_update!(a, a.f, a.u, t₁, true)
     copy_exit!(a, a.f, a.u)
     a.u, a.f = a.f, a.u
-    WaterLily.mom_project!(a, b, 2, t₁)
-    push!(a.Δt, WaterLily.CFL(a))
+    if b isa TPoisson
+        WaterLily.mom_project!(a, b, 2, t₁; cfl=true)
+        push!(a.Δt, cfl!(a, b))
+    else
+        WaterLily.mom_project!(a, b, 2, t₁)
+        push!(a.Δt, WaterLily.CFL(a))
+    end
 end
 
 # ---------------------------------------------------------------- udf path

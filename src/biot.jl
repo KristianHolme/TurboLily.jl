@@ -521,40 +521,46 @@ end
 
 # ---------------------------------------------------------------- incremental vorticity
 # recompute ω on the affected cells from u - Δt·L∇p
-function k_curl_corr1!(n, list, ω, dω, U::F, g::Grid{D}) where {D,F}
-    k = tid1(); k <= n || return
+# component i of the curl, with i a compile-time constant (static tuple indexing)
+@inline curl_ci(i, l, U::F, g::Grid{3}) where F = i == i32 ? curl_c(i32, l, U, g) : i == Int32(2) ? curl_c(Int32(2), l, U, g) : curl_c(Int32(3), l, U, g)
+@inline curl_ci(i, l, U::F, g::Grid{2}) where F = i == i32 ? curl_c(i32, l, U, g) : curl_c(Int32(2), l, U, g)
+# one thread per (listed cell, component)
+function k_curl_corr1!(nt, n, list, ω, dω, U::F, g::Grid{D}) where {D,F}
+    t = tid1() - i32; t < nt || return
+    k = t ÷ Int32(D) + i32; i = t % Int32(D) + i32
     l = @inbounds list[k]
-    @unroll for i in i32:Int32(D)
-        li = l + (i-i32)*g.nc
-        v = curl_c(i, l, U, g)
-        @inbounds dω[li] = v - ω[li]
-        @inbounds ω[li] = v
-    end
+    li = l + (i-i32)*g.nc
+    v = curl_ci(i, l, U, g)
+    @inbounds dω[li] = v - ω[li]
+    @inbounds ω[li] = v
     return nothing
 end
-function k_curl_corr2!(n, list, ω2, dω2, g2::Grid{D}, U::F, g::Grid{D}) where {D,F}
-    k = tid1(); k <= n || return
-    l2 = @inbounds list[k]
+# Level-2 ω of a listed coarse cell: sum of the curls of its 2ᵈ fine cells inside 3:n-2.
+# One thread per (cell, component, fine cell); the first lane of each group of 2ᵈ adds the
+# group's curls in the order (dz, dy, dx) of a nested loop.
+function k_curl_corr2!(nt, n, list, ω2, dω2, g2::Grid{D}, U::F, g::Grid{D}) where {D,F}
+    NS = Int32(2^D)
+    t = tid1() - i32
+    grp = t ÷ NS; sub = t % NS
+    k = grp ÷ Int32(D) + i32; i = grp % Int32(D) + i32
+    valid = t < nt
+    l2 = @inbounds list[valid ? k : i32]
     I = coords(g2, l2)
-    J0 = ntuple(d-> Int32(2)*I[d] - Int32(2), Val(D))
-    @unroll for i in i32:Int32(D)
-        s = 0f0
-        if D == 3
-            for dz in 0:1, dy in 0:1, dx in 0:1
-                J = (J0[1]+Int32(dx), J0[2]+Int32(dy), J0[D]+Int32(dz))
-                inb = true
-                @unroll for d in i32:Int32(D)
-                    inb &= (J[d] >= Int32(3)) & (J[d] <= g.n[d] - Int32(2))
-                end
-                inb && (s += curl_c(i, lin(g, J), U, g))
-            end
-        else
-            for dy in 0:1, dx in 0:1
-                J = (J0[1]+Int32(dx), J0[2]+Int32(dy))
-                inb = (J[1] >= Int32(3)) & (J[1] <= g.n[1] - Int32(2)) & (J[2] >= Int32(3)) & (J[2] <= g.n[2] - Int32(2))
-                inb && (s += curl_c(i, lin(g, J), U, g))
-            end
-        end
+    J = ntuple(d-> Int32(2)*I[d] - Int32(2) + ((sub >> (d-1)) & i32), Val(D))
+    inb = valid
+    @unroll for d in i32:Int32(D)
+        inb &= (J[d] >= Int32(3)) & (J[d] <= g.n[d] - Int32(2))
+    end
+    v = inb ? curl_ci(i, lin(g, J), U, g) : 0f0
+    base = (threadIdx().x - i32) & ~(NS - i32)          # first lane of the group in the block
+    lane0 = base % Int32(32) + i32
+    s = 0f0
+    for q in Int32(0):NS-i32
+        vq = shfl_sync(0xffffffff, v, lane0 + q)
+        bq = shfl_sync(0xffffffff, Int32(inb), lane0 + q)
+        bq != 0 && (s += vq)
+    end
+    if valid & (sub == 0)
         li2 = l2 + (i-i32)*g2.nc
         @inbounds dω2[li2] = s - ω2[li2]
         @inbounds ω2[li2] = s
@@ -570,8 +576,9 @@ Recompute ω of `u - Δt·L∇p` on the affected cells (levels 1 and 2), storing
 function correct_ω!(b::TBiotPoisson, ω1, u, p, dt, incremental::Bool)
     g = b.g; op = b.levels[1].op
     U = UC(u, p, op, dt)
-    launch1(k_curl_corr1!, b.nA[1], b.lists[1], ω1, b.dω[1], U, g[1])
-    launch1(k_curl_corr2!, b.nA[2], b.lists[2], b.ω[1], b.dω[2], g[2], U, g[1])
+    D = length(g[1].n)
+    launch1(k_curl_corr1!, D*b.nA[1], b.nA[1], b.lists[1], ω1, b.dω[1], U, g[1])
+    launch1(k_curl_corr2!, 2^D*D*b.nA[2], b.nA[2], b.lists[2], b.ω[1], b.dω[2], g[2], U, g[1])
     src = incremental ? b.dω : (ω1, b.ω...)
     for l in 3:length(g)
         launch(k_vrestrict!, inside_lo(g[l]), inside_hi(g[l]), src[l], g[l], src[l-1], g[l-1])

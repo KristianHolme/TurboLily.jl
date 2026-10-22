@@ -369,69 +369,47 @@ function copy_exit!(a::TFlow{D}, dst, src) where D
     launch_face(k_copyexit!, lo, hi, 1, dst, src, g)
 end
 
-# Convective exit (single block, three phases): WaterLily.exitBC!
-function k_exit!(u, u0, g::Grid{D}, dt::T) where {D,T}
-    # plane of cells with I[1] fixed, others 2:n-1
-    np = Int32(1)
-    @unroll for d in i32:Int32(D)
-        d > 1 && (np *= g.n[d]-Int32(2))
-    end
-    sh = CuStaticSharedArray(Float32, 32)
-    function planeI(k)   # k ∈ 0:np-1 → offset with I[1]=1
-        o = Int32(0); r = k
-        @unroll for d in i32:Int32(D)
-            if d > 1
-                m = g.n[d]-Int32(2)
-                o += (r % m + i32)*g.s[d]; r ÷= m
-            end
-        end
-        o + i32
-    end
-    function bsum(v)
-        v, _ = warp_red(v, 0f0)
-        lane = (threadIdx().x - i32) % Int32(32) + i32
-        wid = (threadIdx().x - i32) ÷ Int32(32) + i32
-        lane == i32 && (@inbounds sh[wid] = v)
-        sync_threads()
-        v = lane <= blockDim().x ÷ Int32(32) ? @inbounds(sh[lane]) : 0f0
-        v, _ = warp_red(v, 0f0)
-        v = shfl_sync(0xffffffff, v, 1)
-        sync_threads()
-        v
-    end
-    n1 = g.n[1]
-    s = 0f0; k = threadIdx().x - i32
-    while k < np
-        s += @inbounds u[planeI(k) + i32]          # I[1]=2
-        k += blockDim().x
-    end
-    sh2 = CuStaticSharedArray(Float32, 1)
-    s = bsum(s)
-    threadIdx().x == i32 && (@inbounds sh2[1] = s)
-    sync_threads()
-    U = @inbounds(sh2[1]) / np
-    sync_threads()
-    s = 0f0; k = threadIdx().x - i32
-    while k < np
-        l = planeI(k) + n1 - i32
+# Convective exit (WaterLily.exitBC!), in three launches over the plane (block partial sums,
+# reduced on the device), so that all SMs share the strided plane accesses; sums in a.red
+# slots 1 (inlet) and 2 (exit).
+# (the inlet u₁ is the value BC! sets there, so it is evaluated rather than read)
+function k_exitsum!(lo, hi, j, ps, pm, bc::B, t::T) where {B,T}
+    I, ok = faceidx(lo, hi, j)
+    v = ok ? bc(i32, loc(i32, I, T), t) : 0f0
+    block_partial!(ps, pm, v, 0f0)
+    return nothing
+end
+function k_exitupd!(lo, hi, j, ps, pm, u, u0, g::Grid, dt::T, sums, np) where T
+    I, ok = faceidx(lo, hi, j)
+    U = Float32(@inbounds(sums[1]))/np
+    v = 0f0
+    if ok
+        l = lin(g, I)
         v = @inbounds u0[l] - U*dt*(u0[l]-u0[l-i32])
         @inbounds u[l] = v
-        s += v
-        k += blockDim().x
     end
-    s = bsum(s)
-    threadIdx().x == i32 && (@inbounds sh2[1] = s)
-    sync_threads()
-    fix = @inbounds(sh2[1])/np - U
-    k = threadIdx().x - i32
-    while k < np
-        l = planeI(k) + n1 - i32
-        @inbounds u[l] -= fix
-        k += blockDim().x
-    end
-    nothing
+    block_partial!(ps, pm, v, 0f0)
+    return nothing
 end
-exitBC!(a::TFlow{D,T}, u, u0, dt) where {D,T} = (@cuda threads=1024 k_exit!(u, u0, a.grid, T(dt)); nothing)
+function k_exitfix!(lo, hi, j, u, g::Grid, sums, np)
+    I, ok = faceidx(lo, hi, j); ok || return
+    U = Float32(@inbounds(sums[1]))/np
+    fix = Float32(@inbounds(sums[2]))/np - U
+    @inbounds u[lin(g, I)] -= fix
+    return nothing
+end
+function exitBC!(a::TFlow{D,T}, u, u0, dt, t) where {D,T}
+    g = a.grid; b = a.red
+    plane(x) = (ntuple(d-> d == 1 ? x : 2, D), ntuple(d-> d == 1 ? x : Int(g.n[d])-1, D))
+    np = Float32(prod(Int.(g.n[2:D]) .- 2))
+    nb = launch_face(k_exitsum!, plane(2)..., 1, b.ps, b.pm, a.bc, T(t))
+    finish!(b, nb, b.s, b.m, 1)
+    lo, hi = plane(Int(g.n[1]))
+    nb = launch_face(k_exitupd!, lo, hi, 1, b.ps, b.pm, u, u0, g, T(dt), b.s, np)
+    finish!(b, nb, b.s, b.m, 2)
+    launch_face(k_exitfix!, lo, hi, 1, u, g, b.s, np)
+    return nothing
+end
 
 # ---------------------------------------------------------------- CFL
 function k_cfl!(lo, hi, ps, pm, u, g::Grid{D}) where D

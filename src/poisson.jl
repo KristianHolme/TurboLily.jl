@@ -690,35 +690,6 @@ end
 
 # ---------------------------------------------------------------- projection
 # r = iD==0 ? 0 : (div u - δv·div V)/Δt - A p, partial Σr
-function k_resid_src!(lo, hi, ps, pm, r, x, u, V, op::Op{D}, idt, useV::Bool) where D
-    I, ok = cellidx(lo, hi)
-    s = 0f0
-    if ok
-        g = op.g
-        l = lin(g, I)
-        v = 0f0
-        if getiD(op, l) != 0
-            du = 0f0; dv = 0f0
-            @unroll for i in i32:Int32(D)
-                ci = (i-i32)*g.nc
-                @inbounds du += u[l+g.s[i]+ci] - u[l+ci]
-                useV && (@inbounds dv += V[l+g.s[i]+ci] - V[l+ci])
-            end
-            z = useV ? du - (1 + (isreg(op,l) ? op.Dreg : @inbounds(op.Dg[l]))/(2D))*dv : du
-            v = z*idt - mult(op, I, l, x)
-        end
-        @inbounds r[l] = v
-        s = v
-    end
-    block_partial!(ps, pm, s, 0f0)
-    return nothing
-end
-# projected u at face (l,i): u - Δt·L·(x[l] - x[l-δᵢ]); `r` is isreg(op, l)
-@inline function projv(u, x, op::Op, l, i, r::Bool, dt)
-    g = op.g; ci = (i-i32)*g.nc
-    L = r ? op.Lreg : @inbounds(op.L[l+ci])
-    return @inbounds(u[l+ci]) - dt*L*(@inbounds(x[l])-@inbounds(x[l-g.s[i]]))
-end
 # The x faces of BC!(u, bc, t; saveexit=exit) on this cell's row, for the cells at x=2 and
 # x=n-1, with the values `v` just projected (k_bc!'s expressions for a non-periodic j=1).
 # BC! then only needs its y and z passes: those overwrite every x-face value of the ghost
@@ -755,6 +726,53 @@ struct XBC{B,T}; bc::B; t::T; exit::Bool; end
         end
     end
     return nothing
+end
+# Face values of u at cell I. With an XBC (BC! not yet applied), the values BC! will leave:
+# bc on non-periodic boundary faces, the exit face as it is, the periodic copy of index 2.
+@inline ulo(::Nothing, u, I, l, i, g, per) = @inbounds u[l+(i-i32)*g.nc]
+@inline uhi(::Nothing, u, I, l, i, g, per) = @inbounds u[l+g.s[i]+(i-i32)*g.nc]
+@inline ulo(f::XBC{B,T}, u, I, l, i, g, per) where {B,T} =
+    ((I[i] == Int32(2)) & !per[i]) ? f.bc(i, loc(i,I,T), f.t) : @inbounds(u[l+(i-i32)*g.nc])
+@inline function uhi(f::XBC{B,T}, u, I, l, i, g, per) where {B,T}
+    ci = (i-i32)*g.nc; s = g.s[i]; ni = g.n[i]
+    I[i] < ni - i32 && return @inbounds u[l+s+ci]
+    per[i] && return @inbounds u[l-(ni-Int32(3))*s+ci]
+    (f.exit & (i == i32)) && return @inbounds u[l+s+ci]
+    return f.bc(i, loc(i, setj(I, i, ni), T), f.t)
+end
+@inline uall(u, l, g::Grid{3}) = (@inbounds(u[l]), @inbounds(u[l+g.nc]), @inbounds(u[l+2g.nc]))
+@inline uall(u, l, g::Grid{2}) = (@inbounds(u[l]), @inbounds(u[l+g.nc]))
+# `xf`: an XBC to apply the x faces of BC! here (and read the face values BC! will leave),
+# or nothing when BC! was applied before
+function k_resid_src!(lo, hi, ps, pm, r, x, u, V, op::Op{D}, idt, useV::Bool, xf) where D
+    I, ok = cellidx(lo, hi)
+    s = 0f0
+    if ok
+        g = op.g; per = op.per
+        l = lin(g, I)
+        v = 0f0
+        if getiD(op, l) != 0
+            du = 0f0; dv = 0f0
+            @unroll for i in i32:Int32(D)
+                ci = (i-i32)*g.nc
+                du += uhi(xf, u, I, l, i, g, per) - ulo(xf, u, I, l, i, g, per)
+                useV && (@inbounds dv += V[l+g.s[i]+ci] - V[l+ci])
+            end
+            z = useV ? du - (1 + (isreg(op,l) ? op.Dreg : @inbounds(op.Dg[l]))/(2D))*dv : du
+            v = z*idt - mult(op, I, l, x)
+        end
+        @inbounds r[l] = v
+        s = v
+        xf === nothing || xfaces!(xf, u, I, l, g, uall(u, l, g))
+    end
+    block_partial!(ps, pm, s, 0f0)
+    return nothing
+end
+# projected u at face (l,i): u - Δt·L·(x[l] - x[l-δᵢ]); `r` is isreg(op, l)
+@inline function projv(u, x, op::Op, l, i, r::Bool, dt)
+    g = op.g; ci = (i-i32)*g.nc
+    L = r ? op.Lreg : @inbounds(op.L[l+ci])
+    return @inbounds(u[l+ci]) - dt*L*(@inbounds(x[l])-@inbounds(x[l-g.s[i]]))
 end
 function k_proj!(lo, hi, u, x, op::Op{D}, dt, xf) where D
     I, ok = cellidx(lo, hi); ok || return
@@ -808,12 +826,14 @@ end
 # `cfl=true`: the CFL flux maximum of the final velocity goes to b.red slot 5 (see `cfl!`),
 # from the projection kernel, which then writes to `a.f` (swapped into `a.u`)
 function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t; cfl=false) where {D,T}
-    BC!(a, a.u, t)
-    w == 1 && a.exitBC && exitBC!(a, a.u, a.u⁰, a.Δt[end])
+    # x faces of BC! (non-periodic x) in the residual and projection kernels, the rest of BC! after them
+    xf = a.per[1] ? nothing : XBC(a.bc, T(t), a.exitBC)
+    xf === nothing && BC!(a, a.u, t)
+    w == 1 && a.exitBC && exitBC!(a, a.u, a.u⁰, a.Δt[end], t)
     dt = a.Δt[end]/T(w); g = a.grid; lv = b.levels[1]
-    red_launch(k_resid_src!, inside_lo(g), inside_hi(g), b.red, 1, lv.r, lv.x, a.u, a.V, lv.op, inv(dt), !a.Vzero)
+    red_launch(k_resid_src!, inside_lo(g), inside_hi(g), b.red, 1, lv.r, lv.x, a.u, a.V, lv.op, inv(dt), !a.Vzero, xf)
+    xf === nothing || BC!(a, a.u, t; jfirst=2)
     solve!(b, dt)
-    xf = a.per[1] ? nothing : XBC(a.bc, T(t), a.exitBC)    # x faces of BC! in the projection
     if cfl
         red_launch(k_proj_cfl!, inside_lo(g), inside_hi(g), b.red, 5, a.f, a.u, b.x, lv.op, dt, a.bc, T(t), a.exitBC, xf)
         copy_exit!(a, a.f, a.u)

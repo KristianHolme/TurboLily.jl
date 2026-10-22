@@ -661,7 +661,7 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w::Int, t; tol=2
     fmm!(b, a.f)
     launch1(k_biotbc!, nt, tar1, a.u, a.f, top.r, U, g, false)
     # residual r = (div(u) - δv·div(V))/Δt - A p (Σr in slot 1), global flux fix, norms
-    red_launch(k_resid_src!, inside_lo(g), inside_hi(g), red, 1, top.r, a.p, a.u, a.V, op, idt, !a.Vzero)
+    red_launch(k_resid_src!, inside_lo(g), inside_hi(g), red, 1, top.r, a.p, a.u, a.V, op, idt, !a.Vzero, nothing)
     launch1(k_fixresid2!, nt, tar1, a.u, top.r, red.s, Int32(1), dt, idt, g)
     r₁, r∞ = norms!(b, top.r)
     nᵖ, nᵇ = 0, 0

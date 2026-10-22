@@ -56,7 +56,8 @@ mutable struct TFlow{D,T,Sf<:AbstractArray{T},Vf<:AbstractArray{T},Tf<:AbstractA
     red :: RedBuf
     aux :: Union{Nothing,Vf}    # extra vector buffer for the udf path (allocated on first use)
     near :: CuArray{UInt8,D}    # per cell at the last measure!: 0x01 near the body, else 0x00 outside / 0x02 inside
-    mstat :: CuVector{Int32}    # [nband, nshell, V≠0] from the last measure!
+    mstat :: CuVector{Int32}    # [nband, nshell, V≠0, near cells] from the last measure!
+    nearl :: CuVector{Int32}    # linear indices of the cells near the body (measure! scratch)
 end
 
 """
@@ -79,7 +80,8 @@ function TFlow(N::NTuple{D}, uBC; T=Float32, mem=CuArray, bdimfaces=(), kw...) w
     a = TFlow{D,T,typeof(f.p),typeof(f.u),typeof(f.μ₁),typeof(f.λ),typeof(bc),typeof(acc),typeof(per)}(
         f.u, f.u⁰, f.f, f.p, f.σ, f.V, f.μ₀, f.μ₁, f.uBC, f.Δt, f.ν, f.g, f.exitBC, f.perdir, f.λ,
         bc, acc, Grid(f.p), per, bdimlow, CuVector{Int32}(undef,1024), CuVector{Int32}(undef,1024), 0, 0, true,
-        RedBuf(Grid(f.p)), nothing, (n = similar(f.p, UInt8); fill!(n, 0x01); n), CUDA.zeros(Int32, 4))
+        RedBuf(Grid(f.p)), nothing, (n = similar(f.p, UInt8); fill!(n, 0x01); n), CUDA.zeros(Int32, 4),
+        CuVector{Int32}(undef, 1024))
     return a
 end
 

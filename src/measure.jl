@@ -23,12 +23,16 @@ still grows, so the caller can detect the overflow and retry with a larger list)
     return nothing
 end
 
-# WaterLily.measure! for one cell, only touching cells that are or were near the body, or that
-# changed side since the last measure (a body that moved further than the band in between).
+# WaterLily.measure! in two passes. The first evaluates the distance in every cell and updates
+# only cells away from the body that were near it, or that changed side since the last measure
+# (a body that moved further than the band in between); it lists the cells near the body. The
+# second measures the listed cells (normal and body velocity), so the costly `measure` code
+# does not set the register use of the pass over all cells.
 # `near` holds 0x01 for a cell near the body, 0x00 / 0x02 for a cell away from it outside / inside.
-# Appends the BDIM band faces (class 1: μ₀≠1, μ₁=0; class 2: μ₁≠0) and flags V≠0.
-function k_measure!(lo, hi, μ₀, μ₁, V, σ, near_prev, body::B, t::T, ϵ::T, d²::T, g::Grid{D},
-                    stat, band, shell, bdimlow::NTuple{D,Bool}) where {B,T,D}
+# Both append the BDIM band faces (class 1: μ₀≠1, μ₁=0; class 2: μ₁≠0); `stat` counts
+# [band, shell, V≠0, near cells].
+function k_measure!(lo, hi, μ₀, μ₁, V, σ, near_prev, body::B, t::T, d²::T, g::Grid{D},
+                    stat, band, nearl, bdimlow::NTuple{D,Bool}) where {B,T,D}
     I, ok = cellidx(lo, hi)
     l = ok ? lin(g, I) : i32
     near = false
@@ -38,38 +42,54 @@ function k_measure!(lo, hi, μ₀, μ₁, V, σ, near_prev, body::B, t::T, ϵ::T
         @inbounds σ[l] = d
         near = d^2 < d²
     end
+    wappend!(nearl, stat, 4, near, l)
     prev = ok ? @inbounds(near_prev[l]) : 0x00
+    @unroll for i in i32:Int32(D)
+        li = l + (i-i32)*g.nc
+        cls = 0
+        if ok & !near
+            m0 = d < 0 ? zero(T) : one(T)
+            if prev != (d < 0 ? 0x02 : 0x00)    # was near, or changed side
+                @inbounds V[li] = zero(T)
+                @inbounds μ₀[li] = m0
+                @unroll for j in i32:Int32(D)
+                    @inbounds μ₁[li + (j-i32)*D*g.nc] = zero(T)
+                end
+            end
+            cls = m0 != 1 ? 1 : 0
+            I[i] == 2i32 && (cls = bdimlow[i] ? max(cls, 1) : 0)
+        end
+        wappend!(band, stat, 1, cls == 1, li)
+    end
+    ok && (@inbounds near_prev[l] = near ? 0x01 : d < 0 ? 0x02 : 0x00)
+    return nothing
+end
+function k_measure_near!(cap, nearl, μ₀, μ₁, V, σ, body::B, t::T, ϵ::T, d²::T, g::Grid{D},
+                         stat, band, shell, bdimlow::NTuple{D,Bool}) where {B,T,D}
+    k = tid1()
+    ok = k <= min(@inbounds(stat[4]), cap)
+    l = ok ? @inbounds(nearl[k]) : i32
+    I = coords(g, l)
+    d = ok ? @inbounds(σ[l]) : zero(T)
     vnz = false
     @unroll for i in i32:Int32(D)
         li = l + (i-i32)*g.nc
         cls = 0
         if ok
-            if near
-                dᵢ, nᵢ, Vᵢ = WaterLily.measure(body, loc(i, I, T), t; fastd²=d²)
-                dᵢ = abs(dᵢ) ≤ T(0.5) ? dᵢ : copysign(dᵢ, d)
-                @inbounds V[li] = Vᵢ[i]
-                vnz |= Vᵢ[i] != 0
-                m0 = WaterLily.μ₀(dᵢ, ϵ)
-                @inbounds μ₀[li] = m0
-                m1 = WaterLily.μ₁(dᵢ, ϵ)
-                sh = false
-                @unroll for j in i32:Int32(D)
-                    v = m1*nᵢ[j]
-                    @inbounds μ₁[li + (j-i32)*D*g.nc] = v
-                    sh |= v != 0
-                end
-                cls = sh ? 2 : m0 != 1 ? 1 : 0
-            else
-                m0 = d < 0 ? zero(T) : one(T)
-                if prev != (d < 0 ? 0x02 : 0x00)    # was near, or changed side
-                    @inbounds V[li] = zero(T)
-                    @inbounds μ₀[li] = m0
-                    @unroll for j in i32:Int32(D)
-                        @inbounds μ₁[li + (j-i32)*D*g.nc] = zero(T)
-                    end
-                end
-                cls = m0 != 1 ? 1 : 0
+            dᵢ, nᵢ, Vᵢ = WaterLily.measure(body, loc(i, I, T), t; fastd²=d²)
+            dᵢ = abs(dᵢ) ≤ T(0.5) ? dᵢ : copysign(dᵢ, d)
+            @inbounds V[li] = Vᵢ[i]
+            vnz |= Vᵢ[i] != 0
+            m0 = WaterLily.μ₀(dᵢ, ϵ)
+            @inbounds μ₀[li] = m0
+            m1 = WaterLily.μ₁(dᵢ, ϵ)
+            sh = false
+            @unroll for j in i32:Int32(D)
+                v = m1*nᵢ[j]
+                @inbounds μ₁[li + (j-i32)*D*g.nc] = v
+                sh |= v != 0
             end
+            cls = sh ? 2 : m0 != 1 ? 1 : 0
             # lower boundary face: BC! overwrites u there, except where `bdimlow` (an interior
             # face in a periodic direction, or a non-Biot-Savart face of a Biot-Savart
             # simulation, where μ₀ is zeroed after this kernel by vecBC0!)
@@ -78,8 +98,7 @@ function k_measure!(lo, hi, μ₀, μ₁, V, σ, near_prev, body::B, t::T, ϵ::T
         wappend!(band, stat, 1, cls == 1, li)
         wappend!(shell, stat, 2, cls == 2, li)
     end
-    ok && (@inbounds near_prev[l] = near ? 0x01 : d < 0 ? 0x02 : 0x00)
-    vnz && (stat[3] = Int32(1))
+    vnz && (@inbounds stat[3] = Int32(1))
     return nothing
 end
 
@@ -96,18 +115,23 @@ function WaterLily.measure!(a::TFlow{D,T}, body::AbstractBody; t=zero(T), ϵ=1) 
     g = a.grid
     while true
         fill!(a.mstat, 0)
-        launch(k_measure!, inside_lo(g), inside_hi(g), a.μ₀, a.μ₁, a.V, a.σ, a.near, body, T(t), T(ϵ),
-               T((2+ϵ)^2), g, a.mstat, a.band, a.shell, a.bdimlow)
+        d² = T((2+ϵ)^2)
+        launch(k_measure!, inside_lo(g), inside_hi(g), a.μ₀, a.μ₁, a.V, a.σ, a.near, body, T(t),
+               d², g, a.mstat, a.band, a.nearl, a.bdimlow)
+        # one thread per entry of the near list; threads past the count (on the device) return
+        launch1(k_measure_near!, length(a.nearl), a.nearl, a.μ₀, a.μ₁, a.V, a.σ, body, T(t), T(ϵ),
+                d², g, a.mstat, a.band, a.shell, a.bdimlow)
         vecBC0!(a.μ₀, g, a.per, false)
         vecBC0!(a.V, g, a.per, a.exitBC)
         st = hostcopy!(Vector{Int32}(undef, length(a.mstat)), a.mstat)
         a.nband, a.nshell = st[1], st[2]
         a.Vzero = st[3] == 0
-        (a.nband <= length(a.band) && a.nshell <= length(a.shell)) && break
+        (a.nband <= length(a.band) && a.nshell <= length(a.shell) && st[4] <= length(a.nearl)) && break
         # lists too small: grow and measure again (every cell near the body is rewritten,
         # so a repeated measure gives the same result)
         a.band = CuVector{Int32}(undef, 2a.nband + 1024)
         a.shell = CuVector{Int32}(undef, 2a.nshell + 1024)
+        a.nearl = CuVector{Int32}(undef, 2st[4] + 1024)
         a.near .= 0x01
     end
     return nothing

@@ -145,7 +145,7 @@ function affected_lists!(b::TBiotPoisson{T, S, V, D}) where {T, S, V, D}
         copyto!(b.bst, st0)
         launch(k_affected!, ntuple(_->3,D), ntuple(d->Int(g[1].n[d])-2,D), b.mask, L, g[1], Int32(layer_width(Val(D))), b.lists[1], b.bst)
         launch(k_affected2!, inside_lo(g[2]), inside_hi(g[2]), b.mask, g[1], g[2], b.lists[2], b.bst)
-        st = Array(b.bst)
+        st = hostcopy!(Vector{Int32}(undef, length(b.bst)), b.bst)
         b.nA[1], b.nA[2] = st[1], st[8]
         if b.nA[1] > length(b.lists[1]) || b.nA[2] > length(b.lists[2])
             b.lists[1] = CuVector{Int32}(undef, 2b.nA[1] + 256)

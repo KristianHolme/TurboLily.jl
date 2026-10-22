@@ -100,7 +100,7 @@ function WaterLily.measure!(a::TFlow{D,T}, body::AbstractBody; t=zero(T), ϵ=1) 
                T((2+ϵ)^2), g, a.mstat, a.band, a.shell, a.bdimlow)
         vecBC0!(a.μ₀, g, a.per, false)
         vecBC0!(a.V, g, a.per, a.exitBC)
-        st = Array(a.mstat)
+        st = hostcopy!(Vector{Int32}(undef, length(a.mstat)), a.mstat)
         a.nband, a.nshell = st[1], st[2]
         a.Vzero = st[3] == 0
         (a.nband <= length(a.band) && a.nshell <= length(a.shell)) && break

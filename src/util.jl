@@ -223,8 +223,22 @@ RedBuf(nb::Integer, n=8) = RedBuf(CUDA.zeros(Float64,n), CUDA.zeros(Float32,n),
 # Room for the block partials of any reduction on `g`: a `launch` over a box inside the
 # full array, or a 1D launch of 256 threads over at most `nc` items.
 RedBuf(g::Grid) = RedBuf(max(nblocks(ntuple(_->1, length(g.n)), Int.(g.n)), cld(Int(g.nc), 256)))
+"""
+    hostcopy!(dst::Array, src::CuArray)
+
+`copyto!(dst, src)` for small reads on the critical path. CUDA.jl's copy waits for the
+stream cooperatively (a worker thread wakes the task), which leaves the GPU idle for
+50–200 µs before the next launch; this blocks the calling thread in the driver instead.
+"""
+function hostcopy!(dst::Array{T}, src::CuArray{T}) where T
+    s = CUDA.stream()
+    CUDA.synchronize(s; blocking=true)
+    # the stream is idle: a copy to pageable memory completes before the call returns
+    GC.@preserve dst src unsafe_copyto!(pointer(dst), pointer(src), length(src); stream=s, async=true)
+    return dst
+end
 function fetch!(b::RedBuf)
-    copyto!(b.hs, b.s); copyto!(b.hm, b.m)
+    hostcopy!(b.hs, b.s); hostcopy!(b.hm, b.m)
     return b
 end
 getsum(b::RedBuf, k) = b.hs[k]

@@ -31,6 +31,45 @@ Adapt.@adapt_structure Op
 struct AV{S}; x::S; end
 @inline (f::AV)(I, l) = @inbounds f.x[l]
 
+"""
+    Pre(f, op, I, l)
+
+The values of the neighbour functor `f` at cell `l` and its 2d neighbours (wrapped as
+`nbm`/`nbp`), loaded up front. A kernel that branches on a cell flag before `mult_f` would
+otherwise issue the stencil loads only after the flag load. A neighbour is identified from
+its index tuple, which folds to a constant once the stencil loop is unrolled.
+"""
+struct Pre{D,T}; I::NTuple{D,Int32}; c::T; m::NTuple{D,T}; p::NTuple{D,T}; end
+@inline function (f::Pre{3})(Ip, lp)
+    Ip[1] != f.I[1] && return Ip[1] < f.I[1] ? f.m[1] : f.p[1]
+    Ip[2] != f.I[2] && return Ip[2] < f.I[2] ? f.m[2] : f.p[2]
+    Ip[3] != f.I[3] && return Ip[3] < f.I[3] ? f.m[3] : f.p[3]
+    return f.c
+end
+@inline function (f::Pre{2})(Ip, lp)
+    Ip[1] != f.I[1] && return Ip[1] < f.I[1] ? f.m[1] : f.p[1]
+    Ip[2] != f.I[2] && return Ip[2] < f.I[2] ? f.m[2] : f.p[2]
+    return f.c
+end
+@inline function Pre(f::F, op::Op{3}, I, l) where F
+    g, per = op.g, op.per
+    m = (f(shift(I,1,-1), nbm(g,I,l,1,per)), f(shift(I,2,-1), nbm(g,I,l,2,per)), f(shift(I,3,-1), nbm(g,I,l,3,per)))
+    p = (f(shift(I,1,1), nbp(g,I,l,1,per)), f(shift(I,2,1), nbp(g,I,l,2,per)), f(shift(I,3,1), nbp(g,I,l,3,per)))
+    return Pre(I, f(I, l), m, p)
+end
+@inline function Pre(f::F, op::Op{2}, I, l) where F
+    g, per = op.g, op.per
+    m = (f(shift(I,1,-1), nbm(g,I,l,1,per)), f(shift(I,2,-1), nbm(g,I,l,2,per)))
+    p = (f(shift(I,1,1), nbp(g,I,l,1,per)), f(shift(I,2,1), nbp(g,I,l,2,per)))
+    return Pre(I, f(I, l), m, p)
+end
+"Preloaded values times a constant (`RiDc` on preloaded r)."
+struct Scaled{P,T}; p::P; s::T; end
+@inline (f::Scaled)(Ip, lp) = f.p(Ip, lp)*f.s
+"Preloaded values, corrected and scaled (`RcDc` on preloaded r)."
+struct ShiftScaled{P,T}; p::P; s::T; apply::Bool; iD::T; end
+@inline (f::ShiftScaled)(Ip, lp) = (f.apply ? f.p(Ip, lp) - f.s : f.p(Ip, lp))*f.iD
+
 # Σ_nb L·f (off-diagonal part of A) with neighbour values from f(I,l)
 @inline function offdiag_f(op::Op{D}, I, l, f::F) where {D,F}
     g, per = op.g, op.per
@@ -174,10 +213,11 @@ struct RiDc{S,T}; r::S; iD::T; end
 # Jacobi at cell I: ϵ=r·iD, new residual r-Aϵ into rn (returned), x += ϵ
 @inline function jacobi_cell!(I, rn, r, x, op::Op, assign::Bool)
     l = lin(op.g, I)
+    pr = Pre(AV(r), op, I, l)
     if isdeep(op, l)
-        f = RiDc(r, op.iDreg)
+        f = Scaled(pr, op.iDreg)
         e = f(I, l)
-        w = @inbounds(r[l]) - mult_f(op, I, l, f)
+        w = pr.c - mult_f(op, I, l, f)
     else
         f = RiD(r, op)
         e = f(I, l)
@@ -278,8 +318,8 @@ function k_prol_incr!(lo, hi, r, x, op::Op, cx, gc::Grid, c, ωd)
 end
 @inline function prol_cell!(I, r, x, op::Op, cx, gc::Grid, c, ω)
     l = lin(op.g, I)
-    f = Prol(cx, gc, op.g, c, op.per)
-    e = f(I, l)
+    f = Pre(Prol(cx, gc, op.g, c, op.per), op, I, l)
+    e = f.c
     @inbounds r[l] -= ω*mult_f(op, I, l, f)
     @inbounds x[l] += ω*e
     return nothing
@@ -307,9 +347,10 @@ function k_incr!(lo, hi, ps, pm, r, x, ϵ, op::Op{D}, ωd, ::Val{norms}, ::Val{e
 end
 @inline function incr_cell!(I, r, x, ϵ, op::Op, ω)
     l = lin(op.g, I)
-    v = @inbounds(r[l]) - ω*mult(op, I, l, ϵ)
+    pe = Pre(AV(ϵ), op, I, l)
+    v = @inbounds(r[l]) - ω*mult_f(op, I, l, pe)
     @inbounds r[l] = v
-    @inbounds x[l] += ω*ϵ[l]
+    @inbounds x[l] += ω*pe.c
     return v
 end
 # Red-black Gauss-Seidel half sweep on ϵ, with pairs along the last direction.
@@ -338,13 +379,15 @@ end
     end
     k <= g.n[D] - i32 || return             # the last pair can have only one interior cell
     if init
+        pr = Pre(AV(r), op, I, l)
         if isdeep(op, l)
-            @inbounds ϵ[l] = (r[l] - offdiag_f(op, I, l, RiDc(r, op.iDreg)))*op.iDreg
+            @inbounds ϵ[l] = (pr.c - offdiag_f(op, I, l, Scaled(pr, op.iDreg)))*op.iDreg
         else
             @inbounds ϵ[l] = (r[l] - offdiag_f(op, I, l, RiD(r, op)))*getiD(op, l)
         end
     else
-        @inbounds ϵ[l] = (r[l] - offdiag_f(op, I, l, AV(ϵ)))*getiD(op, l)
+        pe = Pre(AV(ϵ), op, I, l)
+        @inbounds ϵ[l] = (r[l] - offdiag_f(op, I, l, pe))*getiD(op, l)
     end
     return nothing
 end
@@ -390,10 +433,11 @@ function k_jacobi_fix!(lo, hi, ps, pm, rn, r, x, op::Op, fixd, fr)
     a = 0f0; w = 0f0
     if ok
         l = lin(op.g, I)
+        pr = Pre(AV(r), op, I, l)
         rc = make_rc(r, op, fixd)
         v = rc(I, l)
         if isdeep(op, l)
-            w = v - mult_f(op, I, l, RcDc(r, rc.s, rc.apply, op.iDreg))
+            w = v - mult_f(op, I, l, ShiftScaled(pr, rc.s, rc.apply, op.iDreg))
             @inbounds x[l] += v*op.iDreg
         else
             w = v - mult_f(op, I, l, RcD(rc))
@@ -750,6 +794,7 @@ function k_resid_src!(lo, hi, ps, pm, r, x, u, V, op::Op{D}, idt, useV::Bool, xf
     if ok
         g = op.g; per = op.per
         l = lin(g, I)
+        px = Pre(AV(x), op, I, l)
         v = 0f0
         if getiD(op, l) != 0
             du = 0f0; dv = 0f0
@@ -759,7 +804,7 @@ function k_resid_src!(lo, hi, ps, pm, r, x, u, V, op::Op{D}, idt, useV::Bool, xf
                 useV && (@inbounds dv += V[l+g.s[i]+ci] - V[l+ci])
             end
             z = useV ? du - (1 + (isreg(op,l) ? op.Dreg : @inbounds(op.Dg[l]))/(2D))*dv : du
-            v = z*idt - mult(op, I, l, x)
+            v = z*idt - mult_f(op, I, l, px)
         end
         @inbounds r[l] = v
         s = v

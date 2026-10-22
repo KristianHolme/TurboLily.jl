@@ -207,19 +207,21 @@ end
 """
     RedBuf(nblocks)
 
-Reduction scratch: per-block partials `ps/pm`, results `s` (Float64 sums) and `m`
-(Float32 maxima) on the device, and host mirrors `hs/hm`.
+Reduction scratch: per-block partials `ps/pm`, results on the device in `s` (`n` sums,
+then `n` maxima, so that one copy fetches both; `m` is the maxima half), and the host
+mirror `hs`.
 """
 struct RedBuf
     s::CuVector{Float64}
-    m::CuVector{Float32}
+    m::CuVector{Float64}
     ps::CuVector{Float32}
     pm::CuVector{Float32}
     hs::Vector{Float64}
-    hm::Vector{Float32}
 end
-RedBuf(nb::Integer, n=8) = RedBuf(CUDA.zeros(Float64,n), CUDA.zeros(Float32,n),
-    CUDA.zeros(Float32,nb), CUDA.zeros(Float32,nb), zeros(Float64,n), zeros(Float32,n))
+function RedBuf(nb::Integer, n=8)
+    s = CUDA.zeros(Float64, 2n)
+    RedBuf(s, view(s, n+1:2n), CUDA.zeros(Float32,nb), CUDA.zeros(Float32,nb), zeros(Float64,2n))
+end
 # Room for the block partials of any reduction on `g`: a `launch` over a box inside the
 # full array, or a 1D launch of 256 threads over at most `nc` items.
 RedBuf(g::Grid) = RedBuf(max(nblocks(ntuple(_->1, length(g.n)), Int.(g.n)), cld(Int(g.nc), 256)))
@@ -238,11 +240,11 @@ function hostcopy!(dst::Array{T}, src::CuArray{T}) where T
     return dst
 end
 function fetch!(b::RedBuf)
-    hostcopy!(b.hs, b.s); hostcopy!(b.hm, b.m)
+    hostcopy!(b.hs, b.s)
     return b
 end
 getsum(b::RedBuf, k) = b.hs[k]
-getmax(b::RedBuf, k) = b.hm[k]
+getmax(b::RedBuf, k) = Float32(b.hs[length(b.m)+k])
 
 """
     red_launch(k, lo, hi, b::RedBuf, slot, args...)

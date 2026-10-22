@@ -391,6 +391,99 @@ end
     end
     return nothing
 end
+# ---------------------------------------------------------------- fused Gauss-Seidel pair
+# Half sweeps k0 (red) and k0+1 (black) in one pass, on 3D non-periodic levels: blocks of
+# 32×8 threads own an x-y tile with a one-cell halo and march a chunk of z planes, updating
+# red at plane z and black at plane z-1 (in-plane neighbours in shared memory, the column in
+# registers, the next planes prefetched). ϵ is read from `ϵi` and written to `ϵo`, so blocks
+# never see each other's updates. offdiag_f is called with the neighbour values, so the
+# result equals two k_gs! launches.
+const GS2_TX, GS2_TY, GS2_CH = 32, 8, 16
+const GS2_CELLS = 2^18
+"Neighbour values of cell I for offdiag_f, identified by the neighbour's index tuple."
+struct NBV{T}; I::NTuple{3,Int32}; xm::T; xp::T; ym::T; yp::T; zm::T; zp::T; end
+@inline (f::NBV)(Ip, lp) = Ip[1] != f.I[1] ? (Ip[1] < f.I[1] ? f.xm : f.xp) :
+                           Ip[2] != f.I[2] ? (Ip[2] < f.I[2] ? f.ym : f.yp) : (Ip[3] < f.I[3] ? f.zm : f.zp)
+"A one-element stand-in for the regular flags: the prefetched flag of the cell being updated."
+struct Flag <: AbstractVector{UInt8}; v::UInt8; end
+@inline Base.getindex(f::Flag, i::Integer) = f.v
+Base.size(::Flag) = (1,)
+@inline withflag(op::Op, f::UInt8) = Op(op.L, op.Dg, op.iD, Flag(f), op.Lreg, op.Dreg, op.iDreg, op.g, op.per)
+@inline function gs2_ld(ϵi, r, op, act, lc, z, n3, sz)
+    ok = act & (z >= i32) & (z <= n3)
+    l = lc + (z - i32)*sz
+    return (ok ? @inbounds(r[l]) : 0f0), (ok ? @inbounds(op.reg[l]) : 0x00), (ok ? @inbounds(ϵi[l]) : 0f0)
+end
+function k_gs2!(ϵi, ϵo, r, op::Op{3}, k0::Int32)
+    TX, TY, CH = Int32(GS2_TX), Int32(GS2_TY), Int32(GS2_CH)
+    g = op.g; n1, n2, n3 = g.n; sy, sz = g.s[2], g.s[3]
+    Sin = CuStaticSharedArray(Float32, (GS2_TX, GS2_TY))
+    SE = CuStaticSharedArray(Float32, (GS2_TX, GS2_TY, 2))
+    tx = threadIdx().x; ty = threadIdx().y
+    x = (blockIdx().x - i32)*(TX - Int32(2)) + tx          # tx=1 is the halo column x0-1
+    y = (blockIdx().y - i32)*(TY - Int32(2)) + ty
+    zc0 = Int32(2) + (blockIdx().z - i32)*CH
+    zc1 = min(zc0 + CH - i32, n3 - i32)
+    act = (x <= n1) & (y <= n2)
+    inxy = act & (x >= Int32(2)) & (x <= n1 - i32) & (y >= Int32(2)) & (y <= n2 - i32)
+    outt = inxy & (tx > i32) & (tx < TX) & (ty > i32) & (ty < TY)
+    ho = tx == i32 ? -i32 : tx == TX ? i32 : Int32(0)    # offset of the neighbour outside the tile
+    vo = ty == i32 ? -sy : ty == TY ? sy : Int32(0)
+    lc = act ? lin(g, (x, y, i32)) : i32                 # this column at z=1
+    _, _, em = gs2_ld(ϵi, r, op, act, lc, zc0 - Int32(2), n3, sz)
+    r0, f0, e0 = gs2_ld(ϵi, r, op, act, lc, zc0 - i32, n3, sz)
+    r1, f1, ep = gs2_ld(ϵi, r, op, act, lc, zc0, n3, sz)
+    l0 = lc + (zc0 - Int32(2))*sz
+    ok0 = inxy & (zc0 - i32 >= Int32(2))
+    hh = (ok0 & (ho != 0)) ? @inbounds(ϵi[l0 + ho]) : 0f0
+    hv = (ok0 & (vo != 0)) ? @inbounds(ϵi[l0 + vo]) : 0f0
+    Em2 = 0f0; Em1 = 0f0; rprev = 0f0; fprev = 0x00
+    for zz in zc0-i32:zc1+i32
+        l = lc + (zz - i32)*sz
+        @inbounds Sin[tx, ty] = e0
+        r2, f2, epn = gs2_ld(ϵi, r, op, act, lc, zz + Int32(2), n3, sz)
+        okn = inxy & (zz + i32 <= n3 - i32)
+        hhn = (okn & (ho != 0)) ? @inbounds(ϵi[l + sz + ho]) : 0f0
+        hvn = (okn & (vo != 0)) ? @inbounds(ϵi[l + sz + vo]) : 0f0
+        sync_threads()
+        E = e0
+        if inxy & (zz >= Int32(2)) & (zz <= n3 - i32) & isodd(x + y + zz + k0)
+            xm = tx > i32 ? @inbounds(Sin[tx-1, ty]) : hh
+            xp = tx < TX ? @inbounds(Sin[tx+1, ty]) : hh
+            ym = ty > i32 ? @inbounds(Sin[tx, ty-1]) : hv
+            yp = ty < TY ? @inbounds(Sin[tx, ty+1]) : hv
+            I = (x, y, zz); o = withflag(op, f0)
+            E = (r0 - offdiag_f(o, I, l, NBV(I, xm, xp, ym, yp, em, ep)))*getiD(o, l)
+        end
+        b = (zz & i32) + i32
+        @inbounds SE[tx, ty, b] = E
+        sync_threads()
+        zb = zz - i32
+        if outt & (zb >= zc0)
+            lb = l - sz
+            v = Em1
+            if iseven(x + y + zb + k0)
+                bo = Int32(3) - b
+                I = (x, y, zb); o = withflag(op, fprev)
+                v = (rprev - offdiag_f(o, I, lb, NBV(I, @inbounds(SE[tx-1, ty, bo]), @inbounds(SE[tx+1, ty, bo]),
+                        @inbounds(SE[tx, ty-1, bo]), @inbounds(SE[tx, ty+1, bo]), Em2, E)))*getiD(o, lb)
+            end
+            @inbounds ϵo[lb] = v
+        end
+        Em2 = Em1; Em1 = E; em = e0; e0 = ep; ep = epn
+        rprev = r0; fprev = f0; r0 = r1; f0 = f1; r1 = r2; f1 = f2; hh = hhn; hv = hvn
+    end
+    return nothing
+end
+"Use the fused pair on this level: 3D, no periodic direction, at least GS2_CELLS cells."
+usegs2(op::Op{3,T,S,V,R,Per{(false,false,false)}}) where {T,S,V,R} = prod(Int.(op.g.n)) >= GS2_CELLS
+usegs2(op::Op) = false
+function gs2!(ϵi, ϵo, r, op::Op{3}, k0)
+    g = op.g
+    bl = (cld(Int(g.n[1]) - 2, GS2_TX - 2), cld(Int(g.n[2]) - 2, GS2_TY - 2), cld(Int(g.n[3]) - 2, GS2_CH))
+    @cuda maxregs=64 threads=(GS2_TX, GS2_TY) blocks=bl k_gs2!(ϵi, ϵo, r, op, Int32(k0))
+end
+
 # perBC! for a scalar field
 function k_perbc!(lo, hi, j, a, g::Grid)
     I, ok = faceidx(lo, hi, j); ok || return
@@ -480,6 +573,11 @@ function smooth!(lv::Level{D,T}, ωd, red::RedBuf, norms::Bool=false; it=4, excl
         for i in 1:it
             launch(k_gs!, lo, hi, lv.ϵ, lv.r, op, Int32(i), false)
         end
+    elseif it == 4 && usegs2(lv.op)
+        # sweeps 1 and 2 on z (scratch during the solve), the fused pair 3,4 from z into ϵ
+        launch(k_gs!, lo, hi, lv.z, lv.r, lv.op, Int32(1), true)
+        launch(k_gs!, lo, hi, lv.z, lv.r, lv.op, Int32(2), false)
+        gs2!(lv.z, lv.ϵ, lv.r, lv.op, 3)
     else
         for i in 1:it
             launch(k_gs!, lo, hi, lv.ϵ, lv.r, lv.op, Int32(i), i==1)

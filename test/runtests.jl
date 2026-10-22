@@ -87,6 +87,8 @@ pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
         ("2D circle exitBC", w->circle(w; exitBC=true), 10, false, 1e-4, 1e-2),
         ("2D oscillating body", oscillating, 10, true, 1e-4, 1e-2),
         ("3D sphere", w->sphere(w), 5, false, 1e-4, 1e-2),
+        # 66³ cells: large enough for the fused Gauss-Seidel pair (non-periodic 3D levels)
+        ("3D sphere 64³", w->sphere(w; n=64, m=64, R=10f0), 3, false, 1e-4, 1e-2),
         ("3D sphere periodic z + exitBC", w->sphere(w; perdir=(3,), exitBC=true), 5, false, 2e-3, 1e-2),
         # uBC starts at 0, so the second step is Δt≈5.5; WaterLily 1.9.1 and 1.10.0 differ by
         # 1.9e-4 here, so the velocity tolerance is wider than for the other cases
@@ -308,6 +310,37 @@ end
                 )
                 @test maxdiff(lv.ϵ, expected) < 2.0f-6
             end
+        end
+    end
+end
+
+@testset "Fused Gauss-Seidel pair equals two half sweeps" begin
+    # sizes that are not multiples of the 30×6 tiles or the 16-plane chunks; the body gives
+    # cells with irregular coefficients
+    for dims in ((64, 64, 62), (64, 72, 56))
+        @testset "$dims" begin
+            c = SA[24f0, 30f0, 28f0]
+            sim = TurboLily.Simulation(dims, (1, 0, 0), 8; T, body = AutoBody((x, t) -> √sum(abs2, x .- c) - 10f0))
+            lv = sim.pois.levels[1]; op = lv.op
+            @test TurboLily.usegs2(op)
+            r = zeros(T, size(lv.r))
+            interior = CartesianIndices(map(n -> 2:(n - 1), size(r)))
+            for I in interior
+                r[I] = sin(T(LinearIndices(r)[I]))
+            end
+            copyto!(lv.r, r)
+            lo, hi = TurboLily.gs_range(op.g)
+            fill!(lv.ϵ, 0)
+            for k in 1:4
+                TurboLily.launch(TurboLily.k_gs!, lo, hi, lv.ϵ, lv.r, op, Int32(k), k == 1)
+            end
+            ref = Array(lv.ϵ)
+            fill!(lv.ϵ, 0); fill!(lv.z, 0)
+            for k in 1:2
+                TurboLily.launch(TurboLily.k_gs!, lo, hi, lv.z, lv.r, op, Int32(k), k == 1)
+            end
+            TurboLily.gs2!(lv.z, lv.ϵ, lv.r, op, 3)
+            @test Array(lv.ϵ)[interior] == ref[interior]
         end
     end
 end

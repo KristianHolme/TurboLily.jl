@@ -171,23 +171,25 @@ struct RiD{S,O}; r::S; op::O; end
 "`RiD` around a cell flagged `isdeep`, where every iD is iDreg."
 struct RiDc{S,T}; r::S; iD::T; end
 @inline (f::RiDc)(I, l) = @inbounds(f.r[l])*f.iD
+# Jacobi at cell I: ϵ=r·iD, new residual r-Aϵ into rn (returned), x += ϵ
+@inline function jacobi_cell!(I, rn, r, x, op::Op, assign::Bool)
+    l = lin(op.g, I)
+    if isdeep(op, l)
+        f = RiDc(r, op.iDreg)
+        e = f(I, l)
+        w = @inbounds(r[l]) - mult_f(op, I, l, f)
+    else
+        f = RiD(r, op)
+        e = f(I, l)
+        w = @inbounds(r[l]) - mult_f(op, I, l, f)
+    end
+    @inbounds rn[l] = w
+    @inbounds x[l] = assign ? e : x[l] + e
+    return w
+end
 function k_jacobi!(lo, hi, rn, r, x, op::Op, assign::Bool, fr)
     I, ok = cellidx(lo, hi)
-    w = 0f0
-    if ok
-        l = lin(op.g, I)
-        if isdeep(op, l)
-            f = RiDc(r, op.iDreg)
-            e = f(I, l)
-            w = @inbounds(r[l]) - mult_f(op, I, l, f)
-        else
-            f = RiD(r, op)
-            e = f(I, l)
-            w = @inbounds(r[l]) - mult_f(op, I, l, f)
-        end
-        @inbounds rn[l] = w
-        @inbounds x[l] = assign ? e : x[l] + e
-    end
+    w = ok ? jacobi_cell!(I, rn, r, x, op, assign) : 0f0
     restrict_block!(fr, I, ok, w)
     return nothing
 end
@@ -238,6 +240,10 @@ end
 # restriction: coarse r = Σ fine r over the 2ᵈ block (semi-coarsening mask c)
 function k_restrict!(lo, hi, rc, gc::Grid{D}, rf, gf::Grid{D}, c) where D
     I, ok = cellidx(lo, hi); ok || return
+    restrict_cell!(I, rc, gc, rf, gf, c)
+    return nothing
+end
+@inline function restrict_cell!(I, rc, gc::Grid{D}, rf, gf::Grid{D}, c) where D
     J0 = ntuple(d-> c[d] ? Int32(2)*I[d]-Int32(2) : I[d], Val(D))
     l0 = lin(gf, J0)
     s = 0f0
@@ -267,7 +273,10 @@ struct Prol{D,S,C,P}; cx::S; gc::Grid{D}; g::Grid{D}; c::C; per::P; end
 # increment with ϵ = prolongation(cx): r -= ωAϵ, x += ωϵ
 function k_prol_incr!(lo, hi, r, x, op::Op, cx, gc::Grid, c, ωd)
     I, ok = cellidx(lo, hi); ok || return
-    ω = @inbounds ωd[1]
+    prol_cell!(I, r, x, op, cx, gc, c, @inbounds(ωd[1]))
+    return nothing
+end
+@inline function prol_cell!(I, r, x, op::Op, cx, gc::Grid, c, ω)
     l = lin(op.g, I)
     f = Prol(cx, gc, op.g, c, op.per)
     e = f(I, l)
@@ -283,10 +292,7 @@ function k_incr!(lo, hi, ps, pm, r, x, ϵ, op::Op{D}, ωd, ::Val{norms}, ::Val{e
     ω = @inbounds ωd[1]
     a = 0f0; m = 0f0
     if ok
-        l = lin(op.g, I)
-        v = @inbounds(r[l]) - ω*mult(op, I, l, ϵ)
-        @inbounds r[l] = v
-        @inbounds x[l] += ω*ϵ[l]
+        v = incr_cell!(I, r, x, ϵ, op, ω)
         a = abs(v)
         edge = false
         if exclb
@@ -299,10 +305,21 @@ function k_incr!(lo, hi, ps, pm, r, x, ϵ, op::Op{D}, ωd, ::Val{norms}, ::Val{e
     norms && block_partial!(ps, pm, a, m)
     return nothing
 end
+@inline function incr_cell!(I, r, x, ϵ, op::Op, ω)
+    l = lin(op.g, I)
+    v = @inbounds(r[l]) - ω*mult(op, I, l, ϵ)
+    @inbounds r[l] = v
+    @inbounds x[l] += ω*ϵ[l]
+    return v
+end
 # Red-black Gauss-Seidel half sweep on ϵ, with pairs along the last direction.
 # `init`: first sweep, also sets ϵ=r·iD on the partner cell and reads neighbours as r·iD.
 function k_gs!(lo, hi, ϵ, r, op::Op{D}, k0::Int32, init::Bool) where D
     Iv, ok = cellidx(lo, hi); ok || return
+    gs_cell!(Iv, ϵ, r, op, k0, init)
+    return nothing
+end
+@inline function gs_cell!(Iv, ϵ, r, op::Op{D}, k0::Int32, init::Bool) where D
     g = op.g
     fs = Int32(0)
     @unroll for d in i32:Int32(D-1)
@@ -448,10 +465,113 @@ function vcycle!(p::TPoisson{T}, l, fix=nothing; assign=false) where T
         launch(k_restrict!, inside_lo(gc), inside_hi(gc), coarse.r, gc, fine.r, fine.op.g, fine.c)
         fill!(coarse.x, 0)
     end
-    l+1 < length(p.levels) && vcycle!(p, l+1)
-    smooth!(coarse, p.ωd, p.red)
+    if l+1 == bottom_index(p)
+        bottom!(p, l+1)
+    else
+        l+1 < length(p.levels) && vcycle!(p, l+1)
+        smooth!(coarse, p.ωd, p.red)
+    end
     g = fine.op.g
     launch(k_prol_incr!, inside_lo(g), inside_hi(g), fine.r, fine.x, fine.op, coarse.x, gc, fine.c, p.ωd)
+end
+
+# ---------------------------------------------------------------- small coarse levels
+# On levels of a few thousand cells every kernel is a few µs of launch overhead. The V-cycle
+# below such a level runs as one single-block kernel, with block barriers between the passes
+# of the separate kernels and the same cell functions, so the results are identical.
+const BOTTOM_CELLS = 2048
+"Kernel-side view of one level for `k_bottom!` (`ϵ`, `r` as before the V-cycle's swap)."
+struct DLevel{O,S,C}; op::O; x::S; ϵ::S; r::S; c::C; end
+Adapt.@adapt_structure DLevel
+@inline boxlen(e::NTuple{3,Int32}) = e[1]*e[2]*e[3]
+@inline boxlen(e::NTuple{2,Int32}) = e[1]*e[2]
+@inline function unravel(k::Int32, lo::NTuple{3,Int32}, e::NTuple{3,Int32})
+    q = k ÷ e[1]
+    return (lo[1] + k - q*e[1], lo[2] + q % e[2], lo[3] + q ÷ e[2])
+end
+@inline unravel(k::Int32, lo::NTuple{2,Int32}, e::NTuple{2,Int32}) = (lo[1] + k % e[1], lo[2] + k ÷ e[1])
+@inline inner(g::Grid{D}) where D = (ntuple(_->Int32(2), Val(D)), ntuple(d-> g.n[d]-Int32(2), Val(D)))
+# each pass: thread t takes cells t, t+nt, … of its box, then the block synchronises
+@inline function b_jacobi!(op::Op, rn, r, x)
+    lo, e = inner(op.g); k = threadIdx().x - i32
+    while k < boxlen(e)
+        jacobi_cell!(unravel(k, lo, e), rn, r, x, op, false)
+        k += blockDim().x
+    end
+    sync_threads()
+end
+@inline function b_restrict_zero!(rc, cx, gc::Grid, rf, gf::Grid, c)
+    lo, e = inner(gc); k = threadIdx().x - i32
+    while k < boxlen(e)
+        restrict_cell!(unravel(k, lo, e), rc, gc, rf, gf, c)
+        k += blockDim().x
+    end
+    k = threadIdx().x
+    while k <= length(cx)
+        @inbounds cx[k] = 0f0
+        k += blockDim().x
+    end
+    sync_threads()
+end
+@inline function b_smooth!(op::Op{D}, ϵ, r, x, ω) where D
+    g = op.g
+    lo = ntuple(_->Int32(2), Val(D))
+    e = ntuple(d-> d == D ? cld(g.n[d], Int32(2)) - i32 : g.n[d] - Int32(2), Val(D))
+    for i in i32:Int32(4)
+        k = threadIdx().x - i32
+        while k < boxlen(e)
+            gs_cell!(unravel(k, lo, e), ϵ, r, op, i, i == i32)
+            k += blockDim().x
+        end
+        sync_threads()
+    end
+    lo, e = inner(g); k = threadIdx().x - i32
+    while k < boxlen(e)
+        incr_cell!(unravel(k, lo, e), r, x, ϵ, op, ω)
+        k += blockDim().x
+    end
+    sync_threads()
+end
+@inline function b_prol!(op::Op, r, x, cx, gc::Grid, c, ω)
+    lo, e = inner(op.g); k = threadIdx().x - i32
+    while k < boxlen(e)
+        prol_cell!(unravel(k, lo, e), r, x, op, cx, gc, c, ω)
+        k += blockDim().x
+    end
+    sync_threads()
+end
+# vcycle!(levels[1]) followed by smooth!(levels[1]), as the host recursion does them
+function k_bottom!(lv::NTuple{K,DLevel}, ωd) where K
+    ω = @inbounds ωd[1]
+    @unroll for k in 1:K-1
+        a = lv[k]; b = lv[k+1]
+        b_jacobi!(a.op, a.ϵ, a.r, a.x)                  # new residual in ϵ: the roles swap
+        b_restrict_zero!(b.r, b.x, b.op.g, a.ϵ, a.op.g, a.c)
+    end
+    c = lv[K]
+    b_smooth!(c.op, c.ϵ, c.r, c.x, ω)
+    @unroll for kk in 1:K-1
+        k = K - kk
+        a = lv[k]; b = lv[k+1]
+        b_prol!(a.op, a.ϵ, a.x, b.x, b.op.g, a.c, ω)
+        b_smooth!(a.op, a.r, a.ϵ, a.x, ω)
+    end
+    return nothing
+end
+"First level from which every coarser level is small enough for `k_bottom!` (0: none)."
+function bottom_index(p::TPoisson)
+    nl = length(p.levels); lb = nl + 1
+    while lb > 2 && prod(p.levels[lb-1].op.g.n) <= BOTTOM_CELLS && !oddper(p.levels[lb-1].op)
+        lb -= 1
+    end
+    return lb <= nl ? lb : 0
+end
+function bottom!(p::TPoisson, lb)
+    lv = Tuple(DLevel(v.op, v.x, v.ϵ, v.r, v.c) for v in p.levels[lb:end])
+    @cuda threads=512 k_bottom!(lv, p.ωd)
+    for l in lb:length(p.levels)-1
+        v = p.levels[l]; v.r, v.ϵ = v.ϵ, v.r
+    end
 end
 
 # ω update on the device (WaterLily.solver! rule); r₁ comes from slot 2 on the first iteration

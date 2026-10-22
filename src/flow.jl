@@ -346,9 +346,9 @@ function k_bc!(lo, hi, j, a, g::Grid{D}, bc::B, t::T, saveexit::Bool, perj::Bool
     end
     nothing
 end
-function BC!(a::TFlow{D,T}, u, t) where {D,T}
+function BC!(a::TFlow{D,T}, u, t; jfirst=1) where {D,T}
     g = a.grid
-    for j in 1:D
+    for j in jfirst:D
         lo = ntuple(_->1, D); hi = ntuple(d-> d==j ? 1 : Int(g.n[d]), D)
         launch_face(k_bc!, lo, hi, j, u, g, a.bc, T(t), a.exitBC, a.per[j])
     end

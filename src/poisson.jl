@@ -719,30 +719,73 @@ end
     L = r ? op.Lreg : @inbounds(op.L[l+ci])
     return @inbounds(u[l+ci]) - dt*L*(@inbounds(x[l])-@inbounds(x[l-g.s[i]]))
 end
-function k_proj!(lo, hi, u, x, op::Op{D}, dt) where D
+# The x faces of BC!(u, bc, t; saveexit=exit) on this cell's row, for the cells at x=2 and
+# x=n-1, with the values `v` just projected (k_bc!'s expressions for a non-periodic j=1).
+# BC! then only needs its y and z passes: those overwrite every x-face value of the ghost
+# rows, so the x pass is only needed on the interior rows.
+struct XBC{B,T}; bc::B; t::T; exit::Bool; end
+@inline projall(u, x, op::Op{3}, l, r, dt) =
+    (projv(u, x, op, l, i32, r, dt), projv(u, x, op, l, Int32(2), r, dt), projv(u, x, op, l, Int32(3), r, dt))
+@inline projall(u, x, op::Op{2}, l, r, dt) = (projv(u, x, op, l, i32, r, dt), projv(u, x, op, l, Int32(2), r, dt))
+@inline xfaces!(::Nothing, u, I, l, g, v) = nothing
+@inline function xfaces!(f::XBC{B,T}, u, I::NTuple{D,Int32}, l, g::Grid{D}, v) where {B,T,D}
+    bc, t = f.bc, f.t
+    n1 = g.n[1]
+    if I[1] == Int32(2)
+        I1 = setj(I, 1, 1)
+        @unroll for i in i32:Int32(D)
+            ci = (i-i32)*g.nc
+            if i == i32
+                @inbounds u[l-i32+ci] = bc(i, loc(i,I1,T), t)
+                @inbounds u[l+ci] = bc(i, loc(i,I,T), t)
+            else
+                @inbounds u[l-i32+ci] = bc(i, loc(i,I1,T), t) + v[i] - bc(i, loc(i,I,T), t)
+            end
+        end
+    end
+    if I[1] == n1 - i32
+        In = setj(I, 1, n1)
+        @unroll for i in i32:Int32(D)
+            ci = (i-i32)*g.nc
+            if i == i32
+                f.exit || (@inbounds u[l+i32+ci] = bc(i, loc(i,In,T), t))
+            else
+                @inbounds u[l+i32+ci] = bc(i, loc(i,In,T), t) + v[i] - bc(i, loc(i,I,T), t)
+            end
+        end
+    end
+    return nothing
+end
+function k_proj!(lo, hi, u, x, op::Op{D}, dt, xf) where D
     I, ok = cellidx(lo, hi); ok || return
     g = op.g
     l = lin(g, I)
     r = isreg(op, l)
+    v = projall(u, x, op, l, r, dt)
     @unroll for i in i32:Int32(D)
-        @inbounds u[l+(i-i32)*g.nc] = projv(u, x, op, l, i, r, dt)
+        @inbounds u[l+(i-i32)*g.nc] = v[i]
     end
+    xfaces!(xf, u, I, l, g, v)
     return nothing
 end
 # Projection out of place (uold → unew) and the CFL flux Σᵢ max(0,u⁺ᵢ) + max(0,-u⁻ᵢ) of each cell
 # (block max in pm), with the face values BC!(u, bc, t; saveexit=exit) leaves after the
 # projection: bc values on non-periodic boundary faces, the old exit face, the periodic copy.
-function k_proj_cfl!(lo, hi, ps, pm, unew, uold, x, op::Op{D}, dt::T, bc::B, t::T, exit::Bool) where {D,T,B}
+function k_proj_cfl!(lo, hi, ps, pm, unew, uold, x, op::Op{D}, dt::T, bc::B, t::T, exit::Bool, xf) where {D,T,B}
     I, ok = cellidx(lo, hi)
     m = 0f0
     if ok
         g = op.g; per = op.per
         l = lin(g, I)
         r = isreg(op, l)
+        vs = projall(uold, x, op, l, r, dt)
+        @unroll for i in i32:Int32(D)
+            @inbounds unew[l+(i-i32)*g.nc] = vs[i]
+        end
+        xfaces!(xf, unew, I, l, g, vs)
         @unroll for i in i32:Int32(D)
             ci = (i-i32)*g.nc; s = g.s[i]; Ii = I[i]; ni = g.n[i]
-            v = projv(uold, x, op, l, i, r, dt)
-            @inbounds unew[l+ci] = v
+            v = vs[i]
             lw = ((Ii == Int32(2)) & !per[i]) ? bc(i, loc(i, I, T), t) : v
             up = if Ii < ni - i32
                 projv(uold, x, op, l+s, i, isreg(op, l+s), dt)
@@ -770,14 +813,15 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t; cfl=false
     dt = a.Δt[end]/T(w); g = a.grid; lv = b.levels[1]
     red_launch(k_resid_src!, inside_lo(g), inside_hi(g), b.red, 1, lv.r, lv.x, a.u, a.V, lv.op, inv(dt), !a.Vzero)
     solve!(b, dt)
+    xf = a.per[1] ? nothing : XBC(a.bc, T(t), a.exitBC)    # x faces of BC! in the projection
     if cfl
-        red_launch(k_proj_cfl!, inside_lo(g), inside_hi(g), b.red, 5, a.f, a.u, b.x, lv.op, dt, a.bc, T(t), a.exitBC)
+        red_launch(k_proj_cfl!, inside_lo(g), inside_hi(g), b.red, 5, a.f, a.u, b.x, lv.op, dt, a.bc, T(t), a.exitBC, xf)
         copy_exit!(a, a.f, a.u)
         a.u, a.f = a.f, a.u
     else
-        launch(k_proj!, inside_lo(g), inside_hi(g), a.u, b.x, lv.op, dt)
+        launch(k_proj!, inside_lo(g), inside_hi(g), a.u, b.x, lv.op, dt, xf)
     end
-    BC!(a, a.u, t)
+    BC!(a, a.u, t; jfirst = xf === nothing ? 1 : 2)
 end
 "WaterLily.CFL of the velocity projected by `mom_project!(...; cfl=true)`."
 cfl!(a::TFlow, b::TPoisson; Δt_max=10) = (fetch!(b.red); min(Δt_max, inv(getmax(b.red, 5) + 5a.ν)))

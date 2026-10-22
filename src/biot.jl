@@ -691,7 +691,7 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w::Int, t; tol=2
         (r₁ < r₁tol && r∞ < r∞tol) && break
     end
     push!(b.n, nᵖ)
-    launch(k_proj!, inside_lo(g), inside_hi(g), a.u, a.p, op, dt)
+    launch(k_proj!, inside_lo(g), inside_hi(g), a.u, a.p, op, dt, nothing)
     pflowBC!(a.u, g)
 end
 """

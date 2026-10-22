@@ -249,13 +249,25 @@ function k_momc!(lo, hi, out, uin, u0, g::AGrid{D}, dt::T, ν::T, λ::F, per, ac
 end
 launch_core!(a::TFlow{D,T}, lo, hi, out, uin, t, corr) where {D,T} =
     launch(k_momc!, lo, hi, out, uin, a.u⁰, SGrid(a.grid), a.Δt[end], a.ν, a.λ, a.per, a.acc, T(t), corr)
+# all boundary slabs in one launch: thread t takes cell t-start[b] of slab b (x fastest)
+function k_momslabs!(nt, lo::NTuple{K}, ext::NTuple{K}, start::NTuple{K,Int32}, out, uin, u0, g::Grid{D},
+                     dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool) where {K,D,T,F,A}
+    k = tid1() - i32; k < nt || return
+    I = ntuple(_->i32, Val(D))
+    @unroll for b in 1:K
+        (k >= start[b]) && (I = unravel(k - start[b], lo[b], ext[b]))
+    end
+    mom_cell!(I, out, uin, u0, g, dt, ν, λ, per, acc, t, corr)
+    return nothing
+end
 function launch_mom!(a::TFlow{D,T}, out, uin, t, corr) where {D,T}
     fullx = true
     (clo, chi), slabs = core_and_shell(a.grid, fullx)
     launch_core!(a, clo, chi, out, uin, t, corr)
-    for (k, (lo, hi)) in enumerate(slabs)
-        launch_face(k_momf!, lo, hi, cld(k,2) + fullx, out, uin, a.u⁰, a.grid, a.Δt[end], a.ν, a.λ, a.per, a.acc, T(t), corr)
-    end
+    lo = Tuple(Int32.(l) for (l, h) in slabs); ext = Tuple(Int32.(h .- l .+ 1) for (l, h) in slabs)
+    len = map(e-> Int(prod(e)), ext)
+    start = Tuple(Int32.(cumsum((0, len...))[1:end-1]))
+    launch1(k_momslabs!, sum(len), lo, ext, start, out, uin, a.u⁰, a.grid, a.Δt[end], a.ν, a.λ, a.per, a.acc, T(t), corr)
 end
 
 # Full BDIM update on the listed faces; `shell=false` lists have μ₁=0.

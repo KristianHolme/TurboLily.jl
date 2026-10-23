@@ -315,11 +315,59 @@ end
     @inbounds out[li] = corr ? T(0.5)*(uin[li] + v) : v
     return nothing
 end
+# Shell faces (μ₁≠0) with a group of 8 lanes per face: lane q evaluates f̃ at the face (q=0)
+# or at its ±δⱼ neighbour (q=2j-1, 2j) when μ₁ⱼ≠0, all lanes running the same code; the
+# group's first lane combines them by shuffles in the order of band_face!.
+function k_shell!(nt, n, list, out, uin, u0, V, μ₀, μ₁, g::Grid{D}, dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool) where {D,T,F,A}
+    t0 = tid1() - i32
+    k = t0 ÷ Int32(8) + i32; q = t0 % Int32(8)
+    valid = t0 < nt
+    li = @inbounds list[valid ? k : i32]
+    iv = (li - i32) ÷ g.nc + i32
+    args = (q, valid, li, out, uin, u0, V, μ₀, μ₁, g, dt, ν, λ, per, acc, t, corr)
+    if iv == 1
+        shell_face!(Val(Int32(1)), args...)
+    elseif iv == 2
+        shell_face!(Val(Int32(2)), args...)
+    elseif D == 3
+        shell_face!(Val(Int32(3)), args...)
+    end
+    return nothing
+end
+@inline function shell_face!(::Val{i}, q, valid, li, out, uin, u0, V, μ₀, μ₁, g::Grid{D}, dt::T, ν, λ, per, acc, t, corr) where {i,D,T}
+    l = li - (i-i32)*g.nc
+    I = coords(g, l)
+    j = (q + i32) >> 1                                    # neighbour direction (0: the face)
+    sg = q == 0 ? Int32(0) : isodd(q) ? i32 : -i32
+    sj = j == i32 ? g.s[1] : j == Int32(2) ? g.s[2] : g.s[D]
+    μ = (valid & (q > 0) & (j <= Int32(D))) ? @inbounds(μ₁[li + (j-i32)*D*g.nc]) : zero(T)
+    Ip = ntuple(d-> I[d] + (d == j ? sg : Int32(0)), Val(D))
+    lp = l + sg*sj
+    need = valid & ((q == 0) | (μ != 0))
+    f = need ? ftilde(i, Ip, lp, uin, u0, V, g, dt, ν, λ, per, acc, t) : zero(T)
+    lane0 = ((threadIdx().x - i32) & ~Int32(7)) % Int32(32) + i32
+    f0 = shfl_sync(0xffffffff, f, lane0)
+    m = zero(T)
+    @unroll for jj in i32:Int32(D)
+        fp = shfl_sync(0xffffffff, f, lane0 + Int32(2)*jj - i32)
+        fm = shfl_sync(0xffffffff, f, lane0 + Int32(2)*jj)
+        if valid & (q == 0)
+            μj = @inbounds μ₁[li + (jj-i32)*D*g.nc]
+            μj != 0 && (m += μj*(fp-fm))
+        end
+    end
+    if valid & (q == 0)
+        μ0 = @inbounds μ₀[li]
+        @fastmath v = m*T(0.5) + @inbounds(V[li]) + μ0*f0
+        @inbounds out[li] = corr ? T(0.5)*(uin[li] + v) : v
+    end
+    return nothing
+end
 function mom_update!(a::TFlow{D,T}, out, uin, t, corr) where {D,T}
     g, dt = a.grid, a.Δt[end]
     launch_mom!(a, out, uin, t, corr)
     launch1(k_band!, a.nband, a.band, out, uin, a.u⁰, a.V, a.μ₀, a.μ₁, g, dt, a.ν, a.λ, a.per, a.acc, T(t), corr, false)
-    launch1(k_band!, a.nshell, a.shell, out, uin, a.u⁰, a.V, a.μ₀, a.μ₁, g, dt, a.ν, a.λ, a.per, a.acc, T(t), corr, true)
+    launch1(k_shell!, 8a.nshell, a.nshell, a.shell, out, uin, a.u⁰, a.V, a.μ₀, a.μ₁, g, dt, a.ν, a.λ, a.per, a.acc, T(t), corr)
 end
 
 # ---------------------------------------------------------------- boundary conditions

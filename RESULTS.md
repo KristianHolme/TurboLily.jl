@@ -3,6 +3,48 @@
 The paths in parentheses, such as `bench/suite/`, name the benchmark scripts. These are kept
 outside this repository.
 
+## WaterLily-Benchmarks cases on an A10, latest releases, October 23, 2026 (`_research/suite_latest.jl`)
+
+TurboLily 88185c4 against the latest registered releases, WaterLily 1.10.0 and BiotSavartBCs 1.1.0.
+Same cases (`src/cases.jl` at f6034df), machine (4× NVIDIA A10) and method as the next section:
+developed-flow checkpoints, a warm-up of at least 50 steps and 2 s, then 5 runs of 25 steps, each
+reset to the checkpoint; the minimum over the runs of the mean step. Float32, Julia 1.13.2,
+CUDA.jl 6.4.2. The reference and TurboLily runs of a case ran back to back on the same GPU, with
+two GPUs in use. Only the sizes with a checkpoint in the suite were run: the larger checkpoints
+of the next section are no longer available.
+
+| case | log2p | cells | reference [ms] | TurboLily [ms] | speedup | ref cost [ns/cell] | Turbo cost [ns/cell] |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| tgv | 6 | 262k | 3.15 | 0.62 | 5.1× | 12.0 | 2.4 |
+| tgv | 7 | 2.1M | 11.00 | 2.64 | 4.2× | 5.2 | 1.3 |
+| tgv | 8 | 16.8M | 75.85 | 18.02 | 4.2× | 4.5 | 1.1 |
+| tgv-periodic | 6 | 262k | 4.27 | 0.56 | 7.6× | 16.3 | 2.2 |
+| tgv-periodic | 7 | 2.1M | 12.38 | 2.43 | 5.1× | 5.9 | 1.2 |
+| sphere | 3 | 295k | 3.00 | 0.73 | 4.1× | 10.2 | 2.5 |
+| sphere | 4 | 2.4M | 11.76 | 2.88 | 4.1× | 5.0 | 1.2 |
+| sphere | 5 | 18.9M | 85.15 | 21.14 | 4.0× | 4.5 | 1.1 |
+| sphere-biotsavart | 3 | 295k | 4.96 | 1.39 | 3.6× | 16.8 | 4.7 |
+| sphere-biotsavart | 4 | 2.4M | 16.80 | 4.34 | 3.9× | 7.1 | 1.8 |
+| cylinder | 4 | 442k | 6.76 | 1.35 | 5.0× | 15.3 | 3.1 |
+| cylinder | 5 | 3.5M | 22.22 | 6.41 | 3.5× | 6.3 | 1.8 |
+| cylinder-biotsavart | 4 | 442k | 13.15 | — | — | 29.7 | — |
+| cylinder-biotsavart | 5 | 3.5M | 27.57 | — | — | 7.8 | — |
+| donut | 5 | 66k | 3.12 | 0.56 | 5.6× | 47.6 | 8.5 |
+| donut | 6 | 524k | 5.43 | 1.29 | 4.2× | 10.4 | 2.5 |
+| jelly-biotsavart | 5 | 131k | 6.53 | 2.03 | 3.2× | 49.8 | 15.5 |
+| jelly-biotsavart | 6 | 1.0M | 14.35 | 4.99 | 2.9× | 13.7 | 4.8 |
+| jelly-biotsavart | 7 | 8.4M | 68.29 | 24.38 | 2.8× | 8.1 | 2.9 |
+
+- **Against the previous section:** the references got faster, WaterLily by up to 7 % (sphere 5:
+  90.4 → 85.1 ms) and BiotSavartBCs by 11–21 % (jelly 7: 86.1 → 68.3 ms; it now keeps the pressure
+  cumulative and updates the vorticity and FMM only near the body). TurboLily got 12–30 % faster
+  from the kernel round of October 23, most on the small grids (sphere 5: 24.9 → 21.1 ms, jelly 7:
+  27.6 → 24.4 ms, tgv-periodic 6: 0.81 → 0.56 ms).
+- **Speedup:** 2.8–5.1× from 2M cells up, highest for the periodic TGV and lowest for jelly.
+  The jelly speedup fell from 3.1× to 2.8× with BiotSavartBCs 1.1.
+- **cylinder-biotsavart:** not supported by `TurboLily.BiotSimulation` (periodic z).
+- **Validation:** the test suite (220 tests) passes against these releases.
+
 ## WaterLily-Benchmarks cases on an A10, October 2026 (`bench/suite/`)
 
 These are the eight cases of [WaterLily-Benchmarks](https://github.com/WaterLily-jl/WaterLily-Benchmarks)

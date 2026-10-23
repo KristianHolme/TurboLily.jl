@@ -850,6 +850,9 @@ struct XBC{B,T}; bc::B; t::T; exit::Bool; end
 @inline projall(u, x, op::Op{3}, l, r, dt) =
     (projv(u, x, op, l, i32, r, dt), projv(u, x, op, l, Int32(2), r, dt), projv(u, x, op, l, Int32(3), r, dt))
 @inline projall(u, x, op::Op{2}, l, r, dt) = (projv(u, x, op, l, i32, r, dt), projv(u, x, op, l, Int32(2), r, dt))
+# regular flags of the upper neighbours, loaded before the projection that waits on them
+@inline upflags(op::Op{3}, l) = (isreg(op, l+op.g.s[1]), isreg(op, l+op.g.s[2]), isreg(op, l+op.g.s[3]))
+@inline upflags(op::Op{2}, l) = (isreg(op, l+op.g.s[1]), isreg(op, l+op.g.s[2]))
 @inline xfaces!(::Nothing, u, I, l, g, v) = nothing
 @inline function xfaces!(f::XBC{B,T}, u, I::NTuple{D,Int32}, l, g::Grid{D}, v) where {B,T,D}
     bc, t = f.bc, f.t
@@ -949,6 +952,7 @@ function k_proj_cfl!(lo, hi, ps, pm, unew, uold, x, op::Op{D}, dt::T, bc::B, t::
         g = op.g; per = op.per
         l = lin(g, I)
         r = isreg(op, l)
+        ru = upflags(op, l)
         vs = projall(uold, x, op, l, r, dt)
         @unroll for i in i32:Int32(D)
             @inbounds unew[l+(i-i32)*g.nc] = vs[i]
@@ -959,7 +963,7 @@ function k_proj_cfl!(lo, hi, ps, pm, unew, uold, x, op::Op{D}, dt::T, bc::B, t::
             v = vs[i]
             lw = ((Ii == Int32(2)) & !per[i]) ? bc(i, loc(i, I, T), t) : v
             up = if Ii < ni - i32
-                projv(uold, x, op, l+s, i, isreg(op, l+s), dt)
+                projv(uold, x, op, l+s, i, ru[i], dt)
             elseif per[i]
                 l2 = l - (ni-Int32(3))*s
                 projv(uold, x, op, l2, i, isreg(op, l2), dt)

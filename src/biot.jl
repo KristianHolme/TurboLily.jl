@@ -22,6 +22,7 @@ struct TBiotPoisson{T,S,V,D,P<:TPoisson,W,G,W1,K} <: AbstractPoisson{T,S,V}
     ω :: W                          # vorticity levels 2:NL
     g :: G                          # NTuple of level grids (level 1 first)
     tar :: Vector{CuVector{Int32}}  # target (face) linear indices per level
+    tadj :: CuVector{Int32}         # level-1 targets: the adjacent cell, negated for a lower face
     p :: S                          # pressure accumulator
     n :: Vector{Int16}
     perdir :: NTuple
@@ -49,13 +50,17 @@ function TBiotPoisson(flow::TFlow{D,T}; nonbiotfaces=(), fmm=true, symmetry=()) 
     g = map(a->Grid(Base.front(size(a))), Tuple(ml))
     tars = BiotSavartBCs.collect_targets(ml, (nonbiotfaces..., symmetry...))   # no targets on these faces
     tar = [CuVector{Int32}(Int32.(LinearIndices(size(ml[l]))[tars[l]])) for l in eachindex(ml)]
+    tadj = CuVector{Int32}(map(Array(tar[1])) do li
+        i, l, lower = face_of(li, g[1])
+        lower ? -(l + g[1].s[i]) : l - g[1].s[i]
+    end)
     p = copy(flow.p)
     # cells next to the domain boundary (the only cells whose residual a Biot update changes)
     n = size(flow.p)
     B = Int32[LinearIndices(n)[I] for I in CartesianIndices(map(m->2:m-1, n)) if any(d->I[d]==2 || I[d]==n[d]-1, 1:D)]
     dω = map(a->(z = similar(a); fill!(z, 0); z), Tuple(ml))
     b = TBiotPoisson{T,typeof(flow.p),typeof(flow.μ₀),D,typeof(pois),typeof(ω),typeof(g),typeof(dω),length(symmetry)}(
-        pois, pois.x, pois.L, pois.z, ω, g, tar, p, pois.n, flow.perdir, fmm, pois.red,
+        pois, pois.x, pois.L, pois.z, ω, g, tar, tadj, p, pois.n, flow.perdir, fmm, pois.red,
         [CuVector{Int32}(undef,256), CuVector{Int32}(undef,256), CuVector{Int32}(B)],
         dω, Any[], CUDA.zeros(UInt8, size(flow.p)), CUDA.zeros(Int32, 16), [0, 0],
         Int32.(Tuple(symmetry)))
@@ -449,16 +454,23 @@ fmm!(b::TBiotPoisson, ω1::AbstractArray) = fmm!(b, (ω1, b.ω...))
     lower = (l - i32) ÷ g.s[i] % g.n[i] == 0   # I[i]==1
     return i, l, lower
 end
+# The same from the precomputed adjacent cell `a` (negative for a lower face), without
+# divisions: the component, the u index of the boundary face, the adjacent cell, lower.
+@inline function face_adj(li, a, g::Grid)
+    i = li > Int32(2)*g.nc ? Int32(3) : li > g.nc ? Int32(2) : i32
+    lower = a < 0; la = abs(a)
+    l = li - (i-i32)*g.nc
+    return i, (lower ? la : l) + (i-i32)*g.nc, la, lower
+end
 # u = U + uᵥ; with `resid`, also r[adjacent] += Δuₙ·(lower ? -1 : 1)
-function k_biotbc!(n, tar, u, uv, r, U, g::Grid, resid::Bool)
+function k_biotbc!(n, tar, tadj, u, uv, r, U, g::Grid, resid::Bool)
     k = tid1(); k <= n || return
     li = @inbounds tar[k]
-    i, l, lower = face_of(li, g)
-    lu = (lower ? l + g.s[i] : l) + (i-i32)*g.nc
+    i, lu, la, lower = face_adj(li, @inbounds(tadj[k]), g)
     un = @inbounds U[i] + uv[li]
     if resid
         un0 = @inbounds u[lu]
-        CUDA.@atomic r[lower ? l + g.s[i] : l - g.s[i]] += (un - un0)*(lower ? -1f0 : 1f0)
+        CUDA.@atomic r[la] += (un - un0)*(lower ? -1f0 : 1f0)
     end
     @inbounds u[lu] = un
     return nothing
@@ -605,30 +617,28 @@ function list_norms!(b::TBiotPoisson, list, r, slot)
     finish!(red, nb, red.s, red.m, slot)
 end
 # boundary velocity u = U + uᵥ; r[adjacent] += Δuₙ·sgn·scale; partial Σ Δuₙ·sgn (net flux change)
-function k_biotbc2!(n, ps, pm, tar, u, uv, r, U, g::Grid, scale)
+function k_biotbc2!(n, ps, pm, tar, tadj, u, uv, r, U, g::Grid, scale)
     k = tid1()
     d = 0f0
     if k <= n
         li = @inbounds tar[k]
-        i, l, lower = face_of(li, g)
-        lu = (lower ? l + g.s[i] : l) + (i-i32)*g.nc
+        i, lu, la, lower = face_adj(li, @inbounds(tadj[k]), g)
         un = @inbounds U[i] + uv[li]
         d = (un - @inbounds(u[lu]))*(lower ? -1f0 : 1f0)
-        CUDA.@atomic r[lower ? l + g.s[i] : l - g.s[i]] += d*scale
+        CUDA.@atomic r[la] += d*scale
         @inbounds u[lu] = un
     end
     block_partial!(ps, pm, d, 0f0)
     return nothing
 end
 # global flux fix with fix = sums[slot]·fscale/n: u[face] += fix·(lower ? 1 : -1), r[adjacent] -= fix·rscale
-function k_fixresid2!(n, tar, u, r, sums, slot::Int32, fscale, rscale, g::Grid)
+function k_fixresid2!(n, tar, tadj, u, r, sums, slot::Int32, fscale, rscale, g::Grid)
     k = tid1(); k <= n || return
     fix = Float32(@inbounds(sums[slot]))*fscale / Float32(n)
     li = @inbounds tar[k]
-    i, l, lower = face_of(li, g)
-    lu = (lower ? l + g.s[i] : l) + (i-i32)*g.nc
+    i, lu, la, lower = face_adj(li, @inbounds(tadj[k]), g)
     @inbounds u[lu] += fix*(lower ? 1f0 : -1f0)
-    CUDA.@atomic r[lower ? l + g.s[i] : l - g.s[i]] -= fix*rscale
+    CUDA.@atomic r[la] -= fix*rscale
     return nothing
 end
 
@@ -659,10 +669,10 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w::Int, t; tol=2
     fill_ω!(b, a.f, a.u)
     correct_ω!(b, a.f, a.u, a.p, dt, false)
     fmm!(b, a.f)
-    launch1(k_biotbc!, nt, tar1, a.u, a.f, top.r, U, g, false)
+    launch1(k_biotbc!, nt, tar1, b.tadj, a.u, a.f, top.r, U, g, false)
     # residual r = (div(u) - δv·div(V))/Δt - A p (Σr in slot 1), global flux fix, norms
     red_launch(k_resid_src!, inside_lo(g), inside_hi(g), red, 1, top.r, a.p, a.u, a.V, op, idt, !a.Vzero, nothing)
-    launch1(k_fixresid2!, nt, tar1, a.u, top.r, red.s, Int32(1), dt, idt, g)
+    launch1(k_fixresid2!, nt, tar1, b.tadj, a.u, top.r, red.s, Int32(1), dt, idt, g)
     r₁, r∞ = norms!(b, top.r)
     nᵖ, nᵇ = 0, 0
     @log ", $nᵖ, $(r∞*dt), $(r₁*dt), $nᵇ\n"
@@ -681,9 +691,9 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w::Int, t; tol=2
         launch1(k_addtar!, nt, tar1, a.f, b.dω[1])
         list_norms!(b, b.lists[3], top.r, 5)
         nb = cld(nt, 256); checkcap(red, nb)
-        @cuda threads=256 blocks=nb k_biotbc2!(Int32(nt), red.ps, red.pm, tar1, a.u, a.f, top.r, U, g, idt)
+        @cuda threads=256 blocks=nb k_biotbc2!(Int32(nt), red.ps, red.pm, tar1, b.tadj, a.u, a.f, top.r, U, g, idt)
         finish!(red, nb, red.s, red.m, 6)
-        launch1(k_fixresid2!, nt, tar1, a.u, top.r, red.s, Int32(6), 1f0, idt, g)
+        launch1(k_fixresid2!, nt, tar1, b.tadj, a.u, top.r, red.s, Int32(6), 1f0, idt, g)
         list_norms!(b, b.lists[3], top.r, 7)
         fetch!(red)
         r₁ = r₁mg - getsum(red, 5) + getsum(red, 7); r∞ = max(r∞in, getmax(red, 7)); nᵇ += 1

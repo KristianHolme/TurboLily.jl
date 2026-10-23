@@ -436,7 +436,9 @@ function fmm!(b::TBiotPoisson{T,S,V,D}, ωs, boxes=nothing) where {T,S,V,D}
     nl = length(ωs)
     for l in 1:nl
         n = length(b.tar[l])
-        P = clamp(prevpow(2, max(1, 65536 ÷ n)), 1, 32)
+        # lanes per target (measured on the benchmark cases): about 32k lanes per level, 1 to 16
+        # per target, and at least one per image sum, which keeps the sources per warp small
+        P = clamp(prevpow(2, max(1, 32768 ÷ n)), min(2^length(b.images), 16), 16)
         blo, bhi = boxes === nothing ? (ntuple(_->1,D), Int.(b.g[l].n)) : boxes[l]
         @cuda threads=256 blocks=cld(n*P, 256) k_interact!(Int32(n), b.tar[l], ωs[l], b.g[l], l == 1, l == nl, Int32(P), Int32.(blo), Int32.(bhi), b.images)
     end

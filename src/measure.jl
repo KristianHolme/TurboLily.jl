@@ -64,42 +64,45 @@ function k_measure!(lo, hi, μ₀, μ₁, V, σ, near_prev, body::B, t::T, d²::
     ok && (@inbounds near_prev[l] = near ? 0x01 : d < 0 ? 0x02 : 0x00)
     return nothing
 end
-function k_measure_near!(cap, nearl, μ₀, μ₁, V, σ, body::B, t::T, ϵ::T, d²::T, g::Grid{D},
+# One thread per (listed cell, component): the components are measured at different faces
+# and are independent. All lanes append outside the component dispatch (warp ballots).
+function k_measure_near!(nt, cap, nearl, μ₀, μ₁, V, σ, body::B, t::T, ϵ::T, d²::T, g::Grid{D},
                          stat, band, shell, bdimlow::NTuple{D,Bool}) where {B,T,D}
-    k = tid1()
-    ok = k <= min(@inbounds(stat[4]), cap)
+    t0 = tid1() - i32
+    k = t0 ÷ Int32(D) + i32; i = t0 % Int32(D) + i32
+    ok = (t0 < nt) & (k <= min(@inbounds(stat[4]), cap))
     l = ok ? @inbounds(nearl[k]) : i32
-    I = coords(g, l)
-    d = ok ? @inbounds(σ[l]) : zero(T)
-    vnz = false
-    @unroll for i in i32:Int32(D)
-        li = l + (i-i32)*g.nc
-        cls = 0
-        if ok
-            dᵢ, nᵢ, Vᵢ = WaterLily.measure(body, loc(i, I, T), t; fastd²=d²)
-            dᵢ = abs(dᵢ) ≤ T(0.5) ? dᵢ : copysign(dᵢ, d)
-            @inbounds V[li] = Vᵢ[i]
-            vnz |= Vᵢ[i] != 0
-            m0 = WaterLily.μ₀(dᵢ, ϵ)
-            @inbounds μ₀[li] = m0
-            m1 = WaterLily.μ₁(dᵢ, ϵ)
-            sh = false
-            @unroll for j in i32:Int32(D)
-                v = m1*nᵢ[j]
-                @inbounds μ₁[li + (j-i32)*D*g.nc] = v
-                sh |= v != 0
-            end
-            cls = sh ? 2 : m0 != 1 ? 1 : 0
-            # lower boundary face: BC! overwrites u there, except where `bdimlow` (an interior
-            # face in a periodic direction, or a non-Biot-Savart face of a Biot-Savart
-            # simulation, where μ₀ is zeroed after this kernel by vecBC0!)
-            I[i] == 2i32 && (cls = bdimlow[i] ? max(cls, 1) : 0)
-        end
-        wappend!(band, stat, 1, cls == 1, li)
-        wappend!(shell, stat, 2, cls == 2, li)
-    end
+    args = (l, μ₀, μ₁, V, σ, body, t, ϵ, d², g, bdimlow)
+    cls, vnz = !ok ? (0, false) : i == i32 ? near_face!(Val(Int32(1)), args...) :
+               (D == 2 || i == Int32(2)) ? near_face!(Val(Int32(2)), args...) : near_face!(Val(Int32(D)), args...)
+    li = l + (i-i32)*g.nc
+    wappend!(band, stat, 1, cls == 1, li)
+    wappend!(shell, stat, 2, cls == 2, li)
     vnz && (@inbounds stat[3] = Int32(1))
     return nothing
+end
+@inline function near_face!(::Val{i}, l, μ₀, μ₁, V, σ, body, t::T, ϵ, d², g::Grid{D}, bdimlow) where {i,T,D}
+    I = coords(g, l)
+    d = @inbounds σ[l]
+    li = l + (i-i32)*g.nc
+    dᵢ, nᵢ, Vᵢ = WaterLily.measure(body, loc(i, I, T), t; fastd²=d²)
+    dᵢ = abs(dᵢ) ≤ T(0.5) ? dᵢ : copysign(dᵢ, d)
+    @inbounds V[li] = Vᵢ[i]
+    m0 = WaterLily.μ₀(dᵢ, ϵ)
+    @inbounds μ₀[li] = m0
+    m1 = WaterLily.μ₁(dᵢ, ϵ)
+    sh = false
+    @unroll for j in i32:Int32(D)
+        v = m1*nᵢ[j]
+        @inbounds μ₁[li + (j-i32)*D*g.nc] = v
+        sh |= v != 0
+    end
+    cls = sh ? 2 : m0 != 1 ? 1 : 0
+    # lower boundary face: BC! overwrites u there, except where `bdimlow` (an interior
+    # face in a periodic direction, or a non-Biot-Savart face of a Biot-Savart
+    # simulation, where μ₀ is zeroed after this kernel by vecBC0!)
+    I[i] == 2i32 && (cls = bdimlow[i] ? max(cls, 1) : 0)
+    return cls, Vᵢ[i] != 0
 end
 
 # zero boundary values for vector fields (WaterLily.BC!(a, zeros, saveexit, perdir))
@@ -118,8 +121,8 @@ function WaterLily.measure!(a::TFlow{D,T}, body::AbstractBody; t=zero(T), ϵ=1) 
         d² = T((2+ϵ)^2)
         launch(k_measure!, inside_lo(g), inside_hi(g), a.μ₀, a.μ₁, a.V, a.σ, a.near, body, T(t),
                d², g, a.mstat, a.band, a.nearl, a.bdimlow)
-        # one thread per entry of the near list; threads past the count (on the device) return
-        launch1(k_measure_near!, length(a.nearl), a.nearl, a.μ₀, a.μ₁, a.V, a.σ, body, T(t), T(ϵ),
+        # one thread per (near-list entry, component); threads past the count (on the device) idle
+        launch1(k_measure_near!, D*length(a.nearl), length(a.nearl), a.nearl, a.μ₀, a.μ₁, a.V, a.σ, body, T(t), T(ϵ),
                 d², g, a.mstat, a.band, a.shell, a.bdimlow)
         vecBC0!(a.μ₀, g, a.per, false)
         vecBC0!(a.V, g, a.per, a.exitBC)

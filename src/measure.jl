@@ -188,7 +188,10 @@ function WaterLily.update!(p::TPoisson{T}) where T
         if l > 1
             f = p.levels[l-1]
             launch(k_restrictL!, inside_lo(g), inside_hi(g), op.L, g, f.op.L, f.op.g, f.c)
-            vecBC0!(op.L, g, p.per, false)
+            # Without periodic directions BC! changes nothing that is read: the boundary
+            # faces at index 2 are restricted from zero fine faces, those at n are never
+            # written, and no stencil reads the tangential ghosts of L.
+            any(j-> p.per[j], 1:length(g.n)) && vecBC0!(op.L, g, p.per, false)
         end
         checkcap(p.red, nblocks(inside_lo(g), inside_hi(g)))
         nb = launch(k_diag!, inside_lo(g), inside_hi(g), p.red.ps, p.red.pm, op.L, op.Dg, op.iD, op.reg, g, op.Lreg)

@@ -22,5 +22,14 @@ CUDA-only, Float32 rewrite of the WaterLily time step and the BiotSavartBCs proj
 - One thread per cell beat both a z-marching shared-memory kernel and naive temporal blocking of red-black GS: L1 captures the reuse, and occupancy matters more.
 - CUDA graph capture must use `STREAM_CAPTURE_MODE_THREAD_LOCAL` when other threads use the GPU.
 - GeForce cards here have no P2P, so multi-GPU domain decomposition does not pay off.
+- Loads that follow a branch on a loaded flag wait for that flag. Load the stencil values before branching on cell flags (`Pre` in `poisson.jl`): 6–13% on the multigrid kernels.
+- Above 64 registers a 256-thread kernel drops from 4 to 3 blocks per SM. Runtime `Bool` tuples (periodic flags) inflate registers; as type parameters (`Per`) the code compiles away. A `maxregs` cap instead spills.
+- FP64 runs at 1/32 rate on GeForce: a single block summing 73k partials in Float64 took 66 µs. Reduce many partials in two levels (`finish!`).
+- `copyto!` from a `CuArray` to an `Array` waits cooperatively (a worker thread wakes the task): 50–200 µs of GPU idle per small read. On the critical path, block in the driver (`hostcopy!`).
+- Strided writes to x faces (BC!) are DRAM-sector bound (partial sectors, scattered rows); more threads do not help. Do them in a kernel that already holds those lines.
+- Latency-bound per-item work (vorticity corrections, BDIM shell faces): give each item a group of lanes running the same code with data-dependent offsets, and combine by shuffles in a fixed order, so the result stays bitwise equal.
+- Multigrid levels of ≤ 2k cells run faster as one single-block kernel with barriers (`k_bottom!`); on 16³ levels one block is slower than separate launches.
+- Two red-black half sweeps fused in a z wavefront: the second pair is 15–25% faster than two launches, the first (init) pair is not faster.
+- The momentum core is issue-bound (~700 SASS instructions per cell, half of them limiter min/max): computing each face flux once, even only in x by shuffles, was no faster.
 
 After every kernel change, run `test/runtests.jl` against the reference codes.

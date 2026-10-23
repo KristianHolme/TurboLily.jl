@@ -30,6 +30,6 @@ CUDA-only, Float32 rewrite of the WaterLily time step and the BiotSavartBCs proj
 - Latency-bound per-item work (vorticity corrections, BDIM shell faces): give each item a group of lanes running the same code with data-dependent offsets, and combine by shuffles in a fixed order, so the result stays bitwise equal. Not for code with local memory (a body's `measure`, ~400 B/thread): more threads in flight thrash the cache (4× slower).
 - Multigrid levels of ≤ 2k cells run faster as one single-block kernel with barriers (`k_bottom!`); on 16³ levels one block is slower than separate launches.
 - Two red-black half sweeps fused in a z wavefront: the second pair is 15–25% faster than two launches, the first (init) pair is not faster.
-- The momentum core is issue-bound (~700 SASS instructions per cell, half of them limiter min/max): computing each face flux once, even only in x by shuffles, was no faster.
+- The momentum core is FP32-pipe bound: ~440 FP instructions per cell, 144 of them the `quick` limiter's min/max. Integer address math runs alongside: Int64 indices (constant offsets folded into the loads) cut it from 140 to 29 instructions and registers from 61 to 45, with no speedup. Computing each face flux once, even only in x by shuffles, was no faster either.
 
 After every kernel change, run `test/runtests.jl` against the reference codes.

@@ -63,10 +63,10 @@ end
     p = (f(shift(I,1,1), nbp(g,I,l,1,per)), f(shift(I,2,1), nbp(g,I,l,2,per)))
     return Pre(I, f(I, l), m, p)
 end
-"Preloaded values times a constant (`RiDc` on preloaded r)."
+"Preloaded values times a constant (r·iDreg around a cell flagged `isdeep`)."
 struct Scaled{P,T}; p::P; s::T; end
 @inline (f::Scaled)(Ip, lp) = f.p(Ip, lp)*f.s
-"Preloaded values, corrected and scaled (`RcDc` on preloaded r)."
+"Preloaded values, corrected and scaled ((r-s)·iDreg around a cell flagged `isdeep`)."
 struct ShiftScaled{P,T}; p::P; s::T; apply::Bool; iD::T; end
 @inline (f::ShiftScaled)(Ip, lp) = (f.apply ? f.p(Ip, lp) - f.s : f.p(Ip, lp))*f.iD
 
@@ -207,9 +207,6 @@ end
 # Jacobi: ϵ=r·iD, r ← r-Aϵ (written to rn), x += ϵ
 struct RiD{S,O}; r::S; op::O; end
 @inline (f::RiD)(I, l) = @inbounds(f.r[l])*getiD(f.op, l)
-"`RiD` around a cell flagged `isdeep`, where every iD is iDreg."
-struct RiDc{S,T}; r::S; iD::T; end
-@inline (f::RiDc)(I, l) = @inbounds(f.r[l])*f.iD
 # Jacobi at cell I: ϵ=r·iD, new residual r-Aϵ into rn (returned), x += ϵ
 @inline function jacobi_cell!(I, rn, r, x, op::Op, assign::Bool)
     l = lin(op.g, I)
@@ -524,9 +521,6 @@ struct Rc{S,O}; r::S; op::O; s::Float32; apply::Bool; end
 end
 struct RcD{S,O}; rc::Rc{S,O}; end
 @inline (f::RcD)(I, l) = f.rc(I, l)*getiD(f.rc.op, l)
-"`RcD` around a cell flagged `isdeep`: every iD is iDreg ≠ 0."
-struct RcDc{S,T}; r::S; s::T; apply::Bool; iD::T; end
-@inline (f::RcDc)(I, l) = (f.apply ? @inbounds(f.r[l]) - f.s : @inbounds(f.r[l]))*f.iD
 @inline function make_rc(r, op, fixd)
     s = @inbounds fixd[1]
     return Rc(r, op, s, abs(s) > @inbounds(fixd[2]))

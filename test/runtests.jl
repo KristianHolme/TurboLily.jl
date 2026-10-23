@@ -317,10 +317,10 @@ end
 @testset "Fused Gauss-Seidel pair equals two half sweeps" begin
     # sizes that are not multiples of the 30×6 tiles or the 16-plane chunks; the body gives
     # cells with irregular coefficients
-    for dims in ((64, 64, 62), (64, 72, 56))
-        @testset "$dims" begin
+    for (dims, perdir) in (((64, 64, 62), ()), ((64, 72, 56), ()), ((64, 64, 64), (3,)), ((64, 64, 64), (1, 2, 3)), ((64, 72, 56), (2,)))
+        @testset "$dims perdir=$perdir" begin
             c = SA[24f0, 30f0, 28f0]
-            sim = TurboLily.Simulation(dims, (1, 0, 0), 8; T, body = AutoBody((x, t) -> √sum(abs2, x .- c) - 10f0))
+            sim = TurboLily.Simulation(dims, (1, 0, 0), 8; T, perdir, body = AutoBody((x, t) -> √sum(abs2, x .- c) - 10f0))
             lv = sim.pois.levels[1]; op = lv.op
             @test TurboLily.usegs2(op)
             r = zeros(T, size(lv.r))

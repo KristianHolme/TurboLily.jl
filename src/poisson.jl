@@ -397,7 +397,8 @@ end
 # red at plane z and black at plane z-1 (in-plane neighbours in shared memory, the column in
 # registers, the next planes prefetched). ϵ is read from `ϵi` and written to `ϵo`, so blocks
 # never see each other's updates. offdiag_f is called with the neighbour values, so the
-# result equals two k_gs! launches.
+# result equals two k_gs! launches. In a periodic direction (even length) the halo column or
+# plane at index 1 or n stands for the wrapped cell n-1 or 2, which nbm/nbp would read.
 const GS2_TX, GS2_TY, GS2_CH = 32, 8, 16
 const GS2_CELLS = 2^18
 "Neighbour values of cell I for offdiag_f, identified by the neighbour's index tuple."
@@ -409,7 +410,10 @@ struct Flag <: AbstractVector{UInt8}; v::UInt8; end
 @inline Base.getindex(f::Flag, i::Integer) = f.v
 Base.size(::Flag) = (1,)
 @inline withflag(op::Op, f::UInt8) = Op(op.L, op.Dg, op.iD, Flag(f), op.Lreg, op.Dreg, op.iDreg, op.g, op.per)
+# index k in direction j as the cell it stands for (wrapped in a periodic direction)
+@inline wrapk(k, n, per::Bool) = per ? (k < Int32(2) ? k + n - Int32(2) : k > n - i32 ? k - n + Int32(2) : k) : k
 @inline function gs2_ld(ϵi, r, op, act, lc, z, n3, sz)
+    z = wrapk(z, n3, op.per[3])
     ok = act & (z >= i32) & (z <= n3)
     l = lc + (z - i32)*sz
     return (ok ? @inbounds(r[l]) : 0f0), (ok ? @inbounds(op.reg[l]) : 0x00), (ok ? @inbounds(ϵi[l]) : 0f0)
@@ -425,34 +429,46 @@ function k_gs2!(ϵi, ϵo, r, op::Op{3}, k0::Int32)
     zc0 = Int32(2) + (blockIdx().z - i32)*CH
     zc1 = min(zc0 + CH - i32, n3 - i32)
     act = (x <= n1) & (y <= n2)
+    outt = act & (x >= Int32(2)) & (x <= n1 - i32) & (y >= Int32(2)) & (y <= n2 - i32) &
+           (tx > i32) & (tx < TX) & (ty > i32) & (ty < TY)
+    # the last active column or row (index n) has its upper neighbour outside the tile too
+    xl = tx == i32; xr = (tx == TX) | (x == n1)
+    yl = ty == i32; yr = (ty == TY) | (y == n2)
+    x = wrapk(x, n1, op.per[1]); y = wrapk(y, n2, op.per[2])     # the cell this column stands for
     inxy = act & (x >= Int32(2)) & (x <= n1 - i32) & (y >= Int32(2)) & (y <= n2 - i32)
-    outt = inxy & (tx > i32) & (tx < TX) & (ty > i32) & (ty < TY)
-    ho = tx == i32 ? -i32 : tx == TX ? i32 : Int32(0)    # offset of the neighbour outside the tile
-    vo = ty == i32 ? -sy : ty == TY ? sy : Int32(0)
+    # offset of the neighbour outside the tile (edge threads), wrapped as nbm/nbp
+    ho = xl ? (op.per[1] & (x == Int32(2)) ? (n1-Int32(3)) : -i32) :
+         xr ? (op.per[1] & (x == n1 - i32) ? -(n1-Int32(3)) : i32) : Int32(0)
+    vo = yl ? (op.per[2] & (y == Int32(2)) ? (n2-Int32(3))*sy : -sy) :
+         yr ? (op.per[2] & (y == n2 - i32) ? -(n2-Int32(3))*sy : sy) : Int32(0)
     lc = act ? lin(g, (x, y, i32)) : i32                 # this column at z=1
     _, _, em = gs2_ld(ϵi, r, op, act, lc, zc0 - Int32(2), n3, sz)
     r0, f0, e0 = gs2_ld(ϵi, r, op, act, lc, zc0 - i32, n3, sz)
     r1, f1, ep = gs2_ld(ϵi, r, op, act, lc, zc0, n3, sz)
-    l0 = lc + (zc0 - Int32(2))*sz
-    ok0 = inxy & (zc0 - i32 >= Int32(2))
+    z0 = wrapk(zc0 - i32, n3, op.per[3])
+    l0 = lc + (z0 - i32)*sz
+    ok0 = inxy & (z0 >= Int32(2))
     hh = (ok0 & (ho != 0)) ? @inbounds(ϵi[l0 + ho]) : 0f0
     hv = (ok0 & (vo != 0)) ? @inbounds(ϵi[l0 + vo]) : 0f0
     Em2 = 0f0; Em1 = 0f0; rprev = 0f0; fprev = 0x00
     for zz in zc0-i32:zc1+i32
-        l = lc + (zz - i32)*sz
+        zw = wrapk(zz, n3, op.per[3])                       # the plane zz stands for
+        l = lc + (zw - i32)*sz
         @inbounds Sin[tx, ty] = e0
         r2, f2, epn = gs2_ld(ϵi, r, op, act, lc, zz + Int32(2), n3, sz)
-        okn = inxy & (zz + i32 <= n3 - i32)
-        hhn = (okn & (ho != 0)) ? @inbounds(ϵi[l + sz + ho]) : 0f0
-        hvn = (okn & (vo != 0)) ? @inbounds(ϵi[l + sz + vo]) : 0f0
+        zn = wrapk(zz + i32, n3, op.per[3])
+        okn = inxy & (zn >= Int32(2)) & (zn <= n3 - i32)
+        ln = lc + (zn - i32)*sz
+        hhn = (okn & (ho != 0)) ? @inbounds(ϵi[ln + ho]) : 0f0
+        hvn = (okn & (vo != 0)) ? @inbounds(ϵi[ln + vo]) : 0f0
         sync_threads()
         E = e0
-        if inxy & (zz >= Int32(2)) & (zz <= n3 - i32) & isodd(x + y + zz + k0)
-            xm = tx > i32 ? @inbounds(Sin[tx-1, ty]) : hh
-            xp = tx < TX ? @inbounds(Sin[tx+1, ty]) : hh
-            ym = ty > i32 ? @inbounds(Sin[tx, ty-1]) : hv
-            yp = ty < TY ? @inbounds(Sin[tx, ty+1]) : hv
-            I = (x, y, zz); o = withflag(op, f0)
+        if inxy & (zw >= Int32(2)) & (zw <= n3 - i32) & isodd(x + y + zw + k0)
+            xm = xl ? hh : @inbounds(Sin[tx-1, ty])
+            xp = (xr & !xl) ? hh : @inbounds(Sin[tx+1, ty])
+            ym = yl ? hv : @inbounds(Sin[tx, ty-1])
+            yp = (yr & !yl) ? hv : @inbounds(Sin[tx, ty+1])
+            I = (x, y, zw); o = withflag(op, f0)
             E = (r0 - offdiag_f(o, I, l, NBV(I, xm, xp, ym, yp, em, ep)))*getiD(o, l)
         end
         b = (zz & i32) + i32
@@ -460,7 +476,7 @@ function k_gs2!(ϵi, ϵo, r, op::Op{3}, k0::Int32)
         sync_threads()
         zb = zz - i32
         if outt & (zb >= zc0)
-            lb = l - sz
+            lb = lc + (zb - i32)*sz
             v = Em1
             if iseven(x + y + zb + k0)
                 bo = Int32(3) - b
@@ -475,8 +491,8 @@ function k_gs2!(ϵi, ϵo, r, op::Op{3}, k0::Int32)
     end
     return nothing
 end
-"Use the fused pair on this level: 3D, no periodic direction, at least GS2_CELLS cells."
-usegs2(op::Op{3,T,S,V,R,Per{(false,false,false)}}) where {T,S,V,R} = prod(Int.(op.g.n)) >= GS2_CELLS
+"Use the fused pair on this level: 3D, at least GS2_CELLS cells, no odd periodic length."
+usegs2(op::Op{3}) = prod(Int.(op.g.n)) >= GS2_CELLS && !oddper(op)
 usegs2(op::Op) = false
 function gs2!(ϵi, ϵo, r, op::Op{3}, k0)
     g = op.g

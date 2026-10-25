@@ -177,6 +177,26 @@ pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
         du, dp, na, nb = compare(w->circle(w), 10; udf=drag!)
         @test du < 1e-4 && na == nb
     end
+    @testset "poisson_kwargs go to the solver, not to udf" begin   # WaterLily#245
+        grav!(flow, t; g=0.01f0) = (WaterLily.@loop flow.f[Ii] += g*(last(Ii)==2) over Ii in CartesianIndices(flow.f); nothing)
+        b = circle(:turbo); sim_step!(b; remeasure=false)
+        for kw in ((;), (; udf=grav!, g=0.02f0))
+            WaterLily.mom_step!(b.flow, b.pois; poisson_kwargs=(; itmx=1), kw...)
+            @test b.pois.n[end-1:end] == [1, 1]
+            WaterLily.mom_step!(b.flow, b.pois; poisson_kwargs=(; tol=1f-6), kw...)
+            @test all(>(1), b.pois.n[end-1:end])
+        end
+        c = TurboLily.BiotSimulation((64,64), (1,0), 8; ν=8/200f0, T,
+            body=AutoBody((x,t)->√sum(abs2, x .- SA[32f0,32f0])-8f0))
+        sim_step!(c; remeasure=false)
+        WaterLily.mom_step!(c.flow, c.pois; poisson_kwargs=(; itmx=2))
+        @test all(<=(2), c.pois.n[end-1:end])
+        # through sim_step!, against a WaterLily whose sim_step! takes poisson_kwargs (after 1.10.0)
+        if any(m -> :poisson_kwargs in Base.kwarg_decl(m), methods(WaterLily.sim_step!))
+            du, dp, na, nb = compare(w->circle(w), 5; udf=grav!, g=0.02f0, poisson_kwargs=(; tol=1f-4))
+            @test du < 1e-4 && na == nb
+        end
+    end
     @testset "thin grids: reduction scratch" begin
         # the block count of a launch depends on the rounded-up extent in each direction,
         # so thin grids need more partials than cld(cells, 64)

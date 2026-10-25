@@ -982,7 +982,8 @@ end
 # and the step is Δt/w with w=1 in the predictor and w=2 in the corrector)
 # `cfl=true`: the CFL flux maximum of the final velocity goes to b.red slot 5 (see `cfl!`),
 # from the projection kernel, which then writes to `a.f` (swapped into `a.u`)
-function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t; cfl=false) where {D,T}
+# `kwargs` (`tol`, `itmx`) go to `solve!` at scale `Δt/w`, as WaterLily forwards them to `solver!`.
+function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t; cfl=false, kwargs...) where {D,T}
     # x faces of BC! (non-periodic x) in the residual and projection kernels, the rest of BC! after them
     xf = a.per[1] ? nothing : XBC(a.bc, T(t), a.exitBC)
     xf === nothing && BC!(a, a.u, t)
@@ -990,7 +991,7 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t; cfl=false
     dt = a.Δt[end]/T(w); g = a.grid; lv = b.levels[1]
     red_launch(k_resid_src!, inside_lo(g), inside_hi(g), b.red, 1, lv.r, lv.x, a.u, a.V, lv.op, inv(dt), !a.Vzero, xf)
     xf === nothing || BC!(a, a.u, t; jfirst=2)
-    solve!(b, dt)
+    solve!(b, dt; kwargs...)
     if cfl
         red_launch(k_proj_cfl!, inside_lo(g), inside_hi(g), b.red, 5, a.f, a.u, b.x, lv.op, dt, a.bc, T(t), a.exitBC, xf)
         copy_exit!(a, a.f, a.u)

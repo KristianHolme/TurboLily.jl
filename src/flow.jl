@@ -467,25 +467,27 @@ end
 
 # ---------------------------------------------------------------- time step
 using WaterLily: @log
-function WaterLily.mom_step!(a::TFlow{D,T}, b::AbstractPoisson; udf=nothing, kwargs...) where {D,T}
-    isnothing(udf) || return mom_step_udf!(a, b; udf, kwargs...)
+# `poisson_kwargs` (`tol`, `itmx`) go to `mom_project!`. `kwargs` go only to `udf!`.
+# The empty default is the WaterLily v1.10.0 call, which does not pass the keyword.
+function WaterLily.mom_step!(a::TFlow{D,T}, b::AbstractPoisson; udf=nothing, poisson_kwargs=(;), kwargs...) where {D,T}
+    isnothing(udf) || return mom_step_udf!(a, b; udf, poisson_kwargs, kwargs...)
     a.u, a.u⁰ = a.u⁰, a.u                     # u⁰ ← u (no copy)
     copy_exit!(a, a.u, a.u⁰)
     t₁ = sum(a.Δt); t₀ = t₁ - a.Δt[end]
     # predictor
     @log "p"
     mom_update!(a, a.u, a.u⁰, t₀, false)
-    WaterLily.mom_project!(a, b, 1, t₁)
+    WaterLily.mom_project!(a, b, 1, t₁; poisson_kwargs...)
     # corrector
     @log "c"
     mom_update!(a, a.f, a.u, t₁, true)
     copy_exit!(a, a.f, a.u)
     a.u, a.f = a.f, a.u
     if b isa TPoisson
-        WaterLily.mom_project!(a, b, 2, t₁; cfl=true)
+        WaterLily.mom_project!(a, b, 2, t₁; cfl=true, poisson_kwargs...)
         push!(a.Δt, cfl!(a, b))
     else
-        WaterLily.mom_project!(a, b, 2, t₁)
+        WaterLily.mom_project!(a, b, 2, t₁; poisson_kwargs...)
         push!(a.Δt, WaterLily.CFL(a))
     end
 end
@@ -561,7 +563,7 @@ function k_zero_u!(lo, hi, u, g::Grid{D}) where D
     end
     return nothing
 end
-function mom_step_udf!(a::TFlow{D,T}, b::AbstractPoisson; udf, kwargs...) where {D,T}
+function mom_step_udf!(a::TFlow{D,T}, b::AbstractPoisson; udf, poisson_kwargs=(;), kwargs...) where {D,T}
     a.aux === nothing && (a.aux = similar(a.u))
     a.u, a.u⁰ = a.u⁰, a.u
     copy_exit!(a, a.u, a.u⁰)
@@ -570,11 +572,11 @@ function mom_step_udf!(a::TFlow{D,T}, b::AbstractPoisson; udf, kwargs...) where 
     launch(k_zero_u!, inside_lo(a.grid), inside_hi(a.grid), a.u, a.grid)
     @log "p"
     udf_update!(a, a.u, a.u⁰, t₀, false, udf; kwargs...)
-    WaterLily.mom_project!(a, b, 1, t₁)
+    WaterLily.mom_project!(a, b, 1, t₁; poisson_kwargs...)
     @log "c"
     udf_update!(a, a.aux, a.u, t₁, true, udf; kwargs...)
     copy_exit!(a, a.aux, a.u)
     a.u, a.aux = a.aux, a.u
-    WaterLily.mom_project!(a, b, 2, t₁)
+    WaterLily.mom_project!(a, b, 2, t₁; poisson_kwargs...)
     push!(a.Δt, WaterLily.CFL(a))
 end

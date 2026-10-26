@@ -1,0 +1,31 @@
+# GitHub-hosted runners have no GPU. TurboLily cannot be precompiled or loaded there:
+# WaterLily's CUDA extension asserts `CUDA.functional()` when it loads. This job only checks
+# that the dependencies resolve, for the newest and the oldest supported WaterLily and
+# BiotSavartBCs. The tests need a CUDA GPU and are run by hand (see README.md, Tests).
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  resolve:
+    name: Resolve - Julia ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['1.11', '1.13']
+    env:
+      JULIA_PKG_PRECOMPILE_AUTO: 0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: ${{ matrix.version }}
+      - name: Newest WaterLily and BiotSavartBCs
+        run: julia --project -e 'using Pkg; Pkg.instantiate(); Pkg.status()'
+      - name: Oldest WaterLily and BiotSavartBCs
+        run: |
+          julia -e 'using Pkg; Pkg.activate(temp=true); Pkg.develop(path=".");
+                    Pkg.add([PackageSpec(name="WaterLily", version="1.9.1"),
+                             PackageSpec(name="BiotSavartBCs", version="1.0.0")]); Pkg.status()'

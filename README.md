@@ -26,9 +26,27 @@ using Pkg
 Pkg.add(url="https://github.com/KristianHolme/TurboLily.jl")
 ```
 
-It requires WaterLily 1.9 (1.9.1 or later) or 1.10, and BiotSavartBCs 1.0 or later. The test
-suite passes against WaterLily 1.9.1 with BiotSavartBCs 1.0.0, and against WaterLily 1.10.0
-with BiotSavartBCs 1.1.0, with Julia 1.13 and CUDA.jl 6.4.
+It requires WaterLily 1.9 (1.9.1 or later) or 1.10, and BiotSavartBCs 1.0 or later.
+
+Tested with:
+
+- WaterLily 1.9.1 with BiotSavartBCs 1.0.0, and WaterLily 1.10.0 with BiotSavartBCs 1.1.0;
+- Julia 1.13 and CUDA.jl 6.4;
+- NVIDIA RTX 2080 Ti (compute capability 7.5) and A10 (8.6) GPUs.
+
+### Other WaterLily packages
+
+Bodies from other packages work if they can be measured on the GPU. Bodies that hold arrays
+must be built with `mem=CuArray`, because TurboLily ignores the `mem` of the simulation. These
+were checked over five steps against WaterLily, with the same body:
+
+| package | status |
+|---|---|
+| [ParametricBodies.jl](https://github.com/WaterLily-jl/ParametricBodies.jl): `ParametricBody`, `HashedBody` | agrees with WaterLily on the CPU to rounding (2D, static and moving) |
+| [WaterLilyMeshBodies.jl](https://github.com/WaterLily-jl/WaterLilyMeshBodies.jl): `MeshBody` | agrees with WaterLily on the GPU to rounding (3D). `MeshBody` itself measures slightly differently on the CPU and the GPU (μ₀ differs by 3e-4). |
+| [Pathlines.jl](https://github.com/WaterLily-jl/Pathlines.jl) | not tested |
+| [WaterLilyNarrowBand.jl](https://github.com/WaterLily-jl/WaterLilyNarrowBand.jl) | not supported (see 3.4) |
+| [InterfaceAdvection.jl](https://github.com/WaterLily-jl/InterfaceAdvection.jl), [LilyPad.jl](https://github.com/WaterLily-jl/LilyPad.jl) | not applicable: they have their own flow or simulation type |
 
 Symmetry planes take the same `symmetry` keyword as `BiotSavartBCs.BiotSimulation`:
 
@@ -77,7 +95,7 @@ Every configuration is stepped side by side with the reference implementation, a
 must agree to rounding: `test/runtests.jl` contains checks against WaterLily and BiotSavartBCs
 (1.9.1 with 1.0.0, and 1.10.0 with 1.1.0). These cover 2D and 3D, `exitBC`, periodic
 directions (including a fully periodic Taylor-Green vortex and grids with odd periodic
-multigrid levels), `uBC(i,x,t)`, `g`,
+multigrid levels), `uBC(i,x,t)`, `g`, `λ=cds`,
 moving and deforming bodies (WaterLily's pulsating-circle test bodies) with `remeasure=true`,
 `measure!` after a jump in time, `udf` (body force, the Smagorinsky `sgs!`, and the state of
 `flow.u` that the callback sees), thin grids such as 2×128, `setproperties(flow; uBC)`,
@@ -534,12 +552,19 @@ NVLink):
 
 ## Tests
 
-The tests step every case with TurboLily on the GPU and with WaterLily or BiotSavartBCs on the
-CPU, so they need a CUDA GPU:
+The tests need a CUDA GPU. `test/runtests.jl` steps every case with TurboLily on the GPU and
+with WaterLily or BiotSavartBCs on the CPU, and requires agreement to rounding.
+`test/waterlily_tests.jl` runs WaterLily's own simulation tests (Taylor-Green decay, body
+forces, rotating frame, added mass, moving and deforming bodies, forces, `MeanFlow`) on
+`TurboLily.Simulation`.
 
 ```sh
 julia --project -e 'using Pkg; Pkg.test()'
 ```
+
+CI on GitHub Actions only checks that the dependencies resolve, on Julia 1.11 and 1.13. GitHub's
+runners have no GPU, and WaterLily's CUDA extension does not load without one, so the tests
+are run by hand.
 
 The benchmark scripts are not part of this repository. [`RESULTS.md`](RESULTS.md) has the full
 tables, the method of each benchmark, and earlier comparisons against WaterLily and

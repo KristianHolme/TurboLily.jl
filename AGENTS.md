@@ -6,6 +6,8 @@ CUDA-only, Float32 rewrite of the WaterLily time step and the BiotSavartBCs proj
 
 - `src/`: `flow.jl` (momentum step), `poisson.jl` (multigrid), `biot.jl` (Biot-Savart FMM), `measure.jl`, `util.jl` (reductions, index helpers).
 - `test/runtests.jl`: steps every case side by side with WaterLily / BiotSavartBCs on CPU and requires agreement to rounding level. Needs a GPU.
+- `test/waterlily_tests.jl`: WaterLily's simulation-level tests (analytic checks) on `TurboLily.Simulation`.
+- `.github/workflows/CI.yml`: dependency resolution only; hosted runners have no GPU.
 - `examples/`: usage examples.
 - `RESULTS.md`: benchmark tables and their method.
 

@@ -85,6 +85,7 @@ pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
     for (name, mk, nstep, rem, tolu, tolp) in [
         ("2D circle", w->circle(w), 10, false, 1e-4, 1e-2),
         ("2D circle exitBC", w->circle(w; exitBC=true), 10, false, 1e-4, 1e-2),
+        ("2D circle λ=cds", w->circle(w; λ=WaterLily.cds), 10, false, 1e-4, 1e-2),
         ("2D oscillating body", oscillating, 10, true, 1e-4, 1e-2),
         ("3D sphere", w->sphere(w), 5, false, 1e-4, 1e-2),
         # 66³ cells: large enough for the fused Gauss-Seidel pair (non-periodic 3D levels)
@@ -437,3 +438,5 @@ end
         end
     end
 end
+
+include("waterlily_tests.jl")

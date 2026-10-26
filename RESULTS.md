@@ -1,11 +1,8 @@
 # Benchmarks
 
-The paths in parentheses, such as `bench/suite/`, name the benchmark scripts. These are kept
-outside this repository.
+## WaterLily-Benchmarks cases on an A10, latest releases, October 23, 2026
 
-## WaterLily-Benchmarks cases on an A10, latest releases, October 23, 2026 (`_research/suite_latest.jl`)
-
-TurboLily 88185c4 against the latest registered releases, WaterLily 1.10.0 and BiotSavartBCs 1.1.0.
+TurboLily 8c9f71a against the latest registered releases, WaterLily 1.10.0 and BiotSavartBCs 1.1.0.
 Same cases (`src/cases.jl` at f6034df), machine (4× NVIDIA A10) and method as the next section:
 developed-flow checkpoints, a warm-up of at least 50 steps and 2 s, then 5 runs of 25 steps, each
 reset to the checkpoint; the minimum over the runs of the mean step. Float32, Julia 1.13.2,
@@ -45,7 +42,7 @@ of the next section are no longer available.
 - **cylinder-biotsavart:** not supported by `TurboLily.BiotSimulation` (periodic z).
 - **Validation:** the test suite (220 tests) passes against these releases.
 
-## WaterLily-Benchmarks cases on an A10, October 2026 (`bench/suite/`)
+## WaterLily-Benchmarks cases on an A10, October 2026
 
 These are the eight cases of [WaterLily-Benchmarks](https://github.com/WaterLily-jl/WaterLily-Benchmarks)
 (`src/cases.jl` at f6034df), on the GPU only, from the smallest default size up to the largest
@@ -59,12 +56,11 @@ reset to the checkpoint. A step is timed with a device synchronisation, and the 
 minimum over the runs of the mean step. Both codes load the same checkpoint.
 
 The suite has checkpoints up to tgv 8, tgv-periodic 7, sphere 5, sphere-biotsavart 4,
-cylinder 5, donut 6 and jelly 7. `bench/suite/develop.jl` makes the larger ones. It upsamples
-the next smaller checkpoint 2× (trilinear on the staggered grid) and develops it with
+cylinder 5, donut 6 and jelly 7. The larger checkpoints were made by upsampling
+the next smaller checkpoint 2× (trilinear on the staggered grid) and developing it with
 TurboLily for 5 convective times; the TGVs get 1 and jelly gets 2 swimming cycles. The cases
 from 4M cells up ran four at a time, one per GPU. The smaller cases ran again one at a time
-on an idle machine, and those runs are the ones shown. The two passes agree within ±5 %
-(`bench/suite/results*`).
+on an idle machine, and those runs are the ones shown. The two passes agree within ±5 %.
 
 | case | log2p | cells | reference [ms] | TurboLily [ms] | speedup | ref cost [ns/cell] | Turbo cost [ns/cell] |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -123,13 +119,12 @@ on an idle machine, and those runs are the ones shown. The two passes agree with
   hid this. This is fixed, with a test, and all moving-body cases were rerun after the
   fix.
 
-## Against WaterLily master + BiotSavartBCs main, October 2026, RTX 2080 Ti (`bench/`)
+## Against WaterLily master + BiotSavartBCs main, October 2026, RTX 2080 Ti
 
 References: WaterLily master eb1ace3 (1.9.1; contains #346, which supersedes #337) and
 BiotSavartBCs main c7b6ffd (1.0.0; contains #13's stopping criterion and the `fill_ω!` part
 of #14, but not #14's FMM `interaction` rewrite). One RTX 2080 Ti, Float32, Julia 1.13.1,
-CUDA.jl 6.4, ms per step. The pressure-iteration counts are identical in both codes. Logs are
-in `bench/oct8/`. The sweeps and the standard cases ran at the same time on separate GPUs;
+CUDA.jl 6.4, ms per step. The pressure-iteration counts are identical in both codes. The sweeps and the standard cases ran at the same time on separate GPUs;
 the sphere 256×128×128 rows are from a rerun on an idle machine (two runs, mean).
 
 | case | grid | reference | TurboLily | speedup |
@@ -142,7 +137,7 @@ the sphere 256×128×128 rows are from a rerun on an idle machine (two runs, mea
 | Biot-Savart, moving sphere | 256×128×128 | 45.25 | 11.04 | 4.1× |
 | Biot-Savart, 2D circle | 1024×512 | 5.03 | 2.23 | 2.3× |
 
-Size sweep (`bench_stack/sweep.jl` run in `bench/`), sphere Re=3700, ms per step (peak GPU
+Size sweep, sphere Re=3700, ms per step (peak GPU
 memory):
 
 | WaterLily grid | cells | WL | TurboLily | speedup |
@@ -197,7 +192,7 @@ Long runs, sphere Re=3700, 192×96×96, t = 0…20:
 The sections below predate WaterLily 1.9.1 and the BiotSavartBCs `symmetry` and residual
 changes. They are kept for the comparison against the PR branches.
 
-### Against BiotSavartBCs 1.0 (`bench_release/`)
+### Against BiotSavartBCs 1.0
 
 BiotSavartBCs 1.0 is `main` (ce98bf2): #13's stopping criterion and the `fill_ω!` part of #14,
 but not #14's FMM `interaction` rewrite. WaterLily is #337 as in the stack below, because
@@ -215,9 +210,9 @@ WaterLily master did not run on GPUs at that time (fixed in 1.9.1, see the last 
 | 560×224×224 | 28.1M | 173.4 | 179.9 | 48.4 | 3.6× | 3.7× |
 | 640×256×256 | 41.9M | 258.2 | 273.3 | 72.4 | 3.5× | 3.8× |
 
-The #14-PR column and its speedup come from the `bench_stack` run; the 1.0 column and its
-speedup from the `bench_release` run (TurboLily is within ±10 % between the two runs). The
-three `bench_release` runs (sweep, standard case, long run) ran at the same time on three
+The #14-PR column and its speedup come from the run against the PR stack below; the 1.0 column
+and its speedup from a separate run (TurboLily is within ±10 % between the two runs). The
+three runs against 1.0 (sweep, standard case, long run) ran at the same time on three
 GPUs; the smallest grids are partly host-bound and may be affected by the shared CPU.
 
 Standard case, sphere 256×128×128: BSBC 1.0 30.52 ms/step, TurboLily 8.88 ms/step (3.4×).
@@ -225,7 +220,7 @@ Standard case, sphere 256×128×128: BSBC 1.0 30.52 ms/step, TurboLily 8.88 ms/s
 Long run, sphere Re=3700, 192×96×96, t = 0…20: BSBC 1.0 26.1 s, TurboLily 5.3 s (4.9×);
 mean C_d (t>10) 0.3893 and 0.3898.
 
-### Against WaterLily#337 + BiotSavartBCs#13+#14 (`bench_stack/`)
+### Against WaterLily#337 + BiotSavartBCs#13+#14
 
 Reference: WaterLily PR #337 (3f1de92, on 55b2f5d) and BiotSavartBCs PR #14 (5aeb5c5, which
 contains #13). TurboLily follows #13's stopping criterion (`max|r| < 2e-3`, `Σ|r|/N < 2e-4`)
@@ -245,7 +240,7 @@ and has the same pressure-iteration counts as this stack. One RTX 2080 Ti, ms pe
 | Biot-Savart, sphere | 320×128×128 | 32.34 | 9.59 | 3.4× |
 | Biot-Savart, sphere | 480×192×192 | 98.86 | 30.80 | 3.2× |
 
-Size sweep (`bench_stack/sweep.jl`), sphere Re=3700, ms per step (peak GPU memory):
+Size sweep, sphere Re=3700, ms per step (peak GPU memory):
 
 | WaterLily grid | cells | stack | TurboLily | speedup |
 |---|---|---|---|---|
@@ -284,7 +279,7 @@ Long runs, sphere Re=3700, 192×96×96, t = 0…20:
 | WaterLily#337 | 13.1 s | 852 | 0.4141 |
 | TurboLily.Simulation | 2.5 s (5.2×) | 852 | 0.4141 |
 
-### Against WaterLily master + BiotSavartBCs main, September 2026 (`bench/`)
+### Against WaterLily master + BiotSavartBCs main, September 2026
 
 These used BiotSavartBCs' old stopping criterion (`Σr² < 1e-4`), so the Biot-Savart iteration
 counts differ from the stack above.
@@ -294,7 +289,7 @@ The references are WaterLily `main` (4da089f, with the GPU fix for `mom_project!
 and BiotSavartBCs `master` (6ffe945), run on the same GPU. Timings are wall-clock ms per time
 step after warm-up. GPU boost clocks vary by about ±10 % between runs.
 
-#### Sphere, Re=3700, D = N/2 (`bench/bench.jl`, `bench/bench2.jl`)
+#### Sphere, Re=3700, D = N/2
 
 | case | grid | reference | TurboLily | speedup |
 |---|---|---|---|---|
@@ -305,7 +300,7 @@ step after warm-up. GPU boost clocks vary by about ±10 % between runs.
 | Biot-Savart, moving body (`remeasure=true`) | 256×128×128 | 66.82 | 14.42 | 4.6× |
 | Biot-Savart, 2D circle | 1024×512 | 4.83 | 2.22 | 2.2× |
 
-#### Size scaling, developed flow (`bench/bigbench.jl`)
+#### Size scaling, developed flow
 
 | case | grid | cells | reference | TurboLily | speedup |
 |---|---|---|---|---|---|
@@ -320,7 +315,7 @@ The pressure-iteration counts are the same in both codes.
 Taylor-Green vortex, Re=1600, 256³, periodic in all directions: WaterLily 77.6 ms/step,
 TurboLily 20.4 ms/step (3.8×).
 
-#### Long runs (`bench/longrun.jl`): sphere, Re=3700, 192×96×96, t = 0…20
+#### Long runs: sphere, Re=3700, 192×96×96, t = 0…20
 
 | | wall | steps | ms/step | mean C_d (t>10) | std C_d |
 |---|---|---|---|---|---|

@@ -134,8 +134,7 @@ L₂(a) = WaterLily.L₂(a)
         @test sim.flow.Δt ≈ ref.flow.Δt
         @test maximum(abs, Array(sim.flow.u) .- ref.flow.u) < 1f-4
         Fp = WaterLily.pressure_force(sim); Fv = WaterLily.viscous_force(sim)
-        # Float32 since WaterLily 1.10, Float64 in 1.9
-        @test typeof(Fp) == typeof(WaterLily.pressure_force(ref)) && typeof(Fv) == typeof(WaterLily.viscous_force(ref))
+        @test Fp isa Vector{Float32} && Fv isa Vector{Float32}
         @test Fp ≈ WaterLily.pressure_force(ref) rtol=1e-4
         @test Fv ≈ WaterLily.viscous_force(ref) rtol=1e-4
         @test WaterLily.total_force(sim) ≈ WaterLily.total_force(ref) rtol=1e-4

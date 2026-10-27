@@ -1,6 +1,5 @@
 # TurboLily tests: every case is stepped side by side with the reference implementation
 # (WaterLily / BiotSavartBCs on CPU, TurboLily on CUDA) and must agree to rounding level.
-# The reference smoother is patched below for odd levels (WaterLily #353).
 using Test, TurboLily, WaterLily, BiotSavartBCs, CUDA, StaticArrays
 
 const T = Float32
@@ -20,27 +19,6 @@ end
 # BiotSavartBCs runs), so pressure is not compared there
 fluid(sim) = dropdims(minimum(Array(sim.flow.μ₀), dims=ndims(sim.flow.μ₀)), dims=ndims(sim.flow.μ₀)) .> 0
 piters(sim) = sim.pois isa BiotSavartPoisson ? sim.pois.ml.n : sim.pois.n
-
-# Keep ϵ first: @loop uses the first captured argument to select the backend.
-@inline function reference_gauss_rb!(ϵ, r, L, iD, k, I)
-    if isodd(sum(Tuple(I)) + k)
-        ϵ[I] = WaterLily.gauss(I, r, L, iD, ϵ)
-    end
-    return nothing
-end
-# The reference smoother must visit every cell on odd levels (WaterLily #353).
-# Even levels use WaterLily's implementation; odd levels scan the full interior.
-function WaterLily.GaussSeidelRB!(p::WaterLily.Poisson{T, S}; it = 4, ω = 1) where {T, S <: Union{Array, CuArray}}
-    if iseven(size(p.x, ndims(p.x)))
-        return invoke(WaterLily.GaussSeidelRB!, Tuple{WaterLily.Poisson{T}}, p; it, ω)
-    end
-    WaterLily.@inside p.ϵ[I] = p.r[I] * p.iD[I]
-    WaterLily.perBC!(p.ϵ, p.perdir)
-    for k in 1:it
-        WaterLily.@loop reference_gauss_rb!(p.ϵ, p.r, p.L, p.iD, k, I) over I ∈ WaterLily.inside(p.x)
-    end
-    return WaterLily.increment!(p; ω)
-end
 
 # runs `nstep` steps of both simulations and returns (max |Δu|, max |Δp - mean| on fluid cells)
 function compare(mk, nstep; remeasure=false, kw...)
@@ -91,18 +69,15 @@ pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
         # 66³ cells: large enough for the fused Gauss-Seidel pair (non-periodic 3D levels)
         ("3D sphere 64³", w->sphere(w; n=64, m=64, R=10f0), 3, false, 1e-4, 1e-2),
         ("3D sphere periodic z + exitBC", w->sphere(w; perdir=(3,), exitBC=true), 5, false, 2e-3, 1e-2),
-        # uBC starts at 0, so the second step is Δt≈5.5; WaterLily 1.9.1 and 1.10.0 differ by
-        # 1.9e-4 here, so the velocity tolerance is wider than for the other cases
+        # uBC starts at 0, so the second step is Δt≈5.5. After 5 steps WaterLily with a 1e-6 velocity
+        # perturbation differs from WaterLily by 2.0e-4, so the velocity tolerance is wider here
         ("3D sphere uBC(t) + g", w->ctor(w)((64,32,32), Ufun, 6f0; U=1, ν=0.02, T,
             g=(i,x,t)->i==2 ? 0.01f0 : 0f0, body=AutoBody((x,t)->√sum(abs2,x .- SA[16f0,16f0,16f0])-6f0)), 5, false, 3e-4, 1e-2),
         ("3D periodic box, no body", w->ctor(w)((32,32,32),(1,0,0),8; ν=0.01, perdir=(2,3), T), 5, false, 2e-3, 1e-2),
         ("3D Taylor-Green vortex (fully periodic)", tgv, 10, false, 2e-3, 1e-2),
-        # TurboLily includes the deforming-body source term of WaterLily#328; compare only
-        # against a WaterLily that has it
-        (isdefined(WaterLily, :δv) ? [
         ("2D deforming body", w->ctor(w)((64,64),(0,0),2Rd; ν=2Rd/250, T, body=pulsing(SA_F32[32,32], sd)), 8, true, 1e-4, 1e-2),
         ("2D anti-phase deforming pair", w->ctor(w)((128,64),(0,0),2Rd; ν=2Rd/250, T,
-            body=pulsing(SA_F32[32,32], sd)+pulsing(SA_F32[96,32], t->√(2-sd(t)^2))), 8, true, 1e-4, 1e-2)] : [])...]
+            body=pulsing(SA_F32[32,32], sd)+pulsing(SA_F32[96,32], t->√(2-sd(t)^2))), 8, true, 1e-4, 1e-2)]
         du, dp, na, nb = compare(mk, nstep; remeasure=rem)
         @testset "$name" begin
             @test du < tolu

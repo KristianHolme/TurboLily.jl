@@ -175,9 +175,14 @@ saved per step splits as follows:
 
 | | share of the time saved, from 4.2M cells up | at 66k cells |
 |---|---|---|
-| computational changes (groups 2 and 3) | 77–92 % | |
-| algorithmic changes (group 1) | 8 % (WaterLily BCs), 10–11 % (Biot-Savart BCs), 14–17 % (moving body) | |
-| host gaps (fewer launches and host syncs, CUDA graphs) | 0–6 % | 42–72 % |
+| kernel efficiency (group 3, and the kernels of group 2) | 77–92 % | 25 % (WaterLily BCs), 51 % (Biot-Savart BCs) |
+| algorithmic changes (group 1) | 8 % (WaterLily BCs), 10–11 % (Biot-Savart BCs), 14–17 % (moving body) | 3 % (WaterLily BCs), 7–20 % (Biot-Savart BCs) |
+| host gaps (fewer launches and host syncs, CUDA graphs) | 0–6 % | 72 % (WaterLily BCs), 42 % (Biot-Savart BCs) |
+
+The moving-body cases were measured from 524k cells up. With Biot-Savart BCs the algorithmic
+share is a range: it depends on whether the skipped work is priced at the reference's kernel
+speed or at TurboLily's, and the kernel-efficiency share moves by the same amount (the table
+shows it for TurboLily's speed).
 
 Both codes are limited by memory bandwidth on grids above about 1M cells. The reference kernels
 run close to the bandwidth of a plain copy; they are slower because they read and write the grid

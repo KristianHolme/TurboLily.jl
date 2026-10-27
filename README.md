@@ -259,8 +259,8 @@ step.
 - Σr is invariant under multigrid: Σ_I (Aϵ)_I = 0, because each interior face contributes
   with both signs and L = 0 on the domain faces.
 
-**Relies on:** non-periodic domains (`TurboLily.BiotSimulation` does not support periodic
-directions, see 4.4) and L = 0 on the domain faces.
+**Relies on:** L = 0 on the non-periodic domain faces. A periodic face adds with both signs,
+like an interior face.
 
 **Saves:** 3 full reductions and 2 host syncs per Biot update, 0.74 ms (5.0 ms) per step. The remaining reductions run
 over about N^(2/3) cells.
@@ -504,7 +504,8 @@ These raise an `ArgumentError`:
 
 - `fmm=false` (the tree sum).
 - Biot-Savart BCs on grids too small for a second Biot-Savart level, e.g. 8×8.
-- Periodic directions with Biot-Savart BCs. BiotSavartBCs supports one periodic direction.
+- Periodic directions with Biot-Savart BCs. BiotSavartBCs supports one periodic direction in
+  3D; TurboLily's FMM has no periodic image sum.
 
 Also not implemented: `T=Float64` and non-CUDA arrays.
 

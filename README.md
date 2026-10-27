@@ -188,6 +188,20 @@ run close to the bandwidth of a plain copy; they are slower because they read an
 many more times. The measured savings below are per step at 4.2M cells, with 33.6M cells in
 parentheses.
 
+The largest single changes, by time saved. Each was measured in the configuration it applies to,
+so the savings are not additive.
+
+| change | section | saved | applies to |
+|---|---|---|---|
+| fused momentum step | 3.1 | 8.6 ms (65 ms) per step | both |
+| FMM kernel | 3.4 | 4.9 ms (17 ms) per step | Biot-Savart |
+| multigrid kernels and compressed stencil | 3.2, 3.3 | 1.45 ms (14 ms) per V-cycle | both |
+| `measure!` only in the body band | 1.5 | 1.5 ms per step | moving body |
+| residual norms and flux fix from the boundary cells | 1.2 | 0.74 ms (5.0 ms) per step | Biot-Savart |
+| residual correction folded into the next kernel | 1.4 | 0.68 ms (5.0 ms) per step | both |
+| level-1 vorticity only where the FMM reads it | 1.1 | 0.66 ms (6.0 ms) per step | Biot-Savart |
+| pressure solved in physical units | 1.3 | 0.49 ms (4.0 ms) per step | both |
+
 ### 1. Algorithmic changes (same result in exact arithmetic, less work)
 
 WL 1.10 and BSBC 1.1 do this work; TurboLily skips it. Each change relies on a property of the
@@ -440,6 +454,9 @@ cells.
   residual and projection kernels write the x faces of the domain BCs. The convective exit
   runs over the whole exit plane in three launches.
 - All index arithmetic is Int32. Note that Julia's `sum` over Int32 widens to Int64.
+  WaterLily's `@loop` gets each work-item's Cartesian index from KernelAbstractions with Int64
+  divisions; on streaming kernels at 18.9M cells this costs about a third of the bandwidth
+  (≈350 against ≈530 GB/s).
 - Loops over the dimensions are fully unrolled, so tuples indexed by the dimension stay in
   registers.
 - Kernels on a domain face run threads over the two in-plane directions, as in WaterLily.

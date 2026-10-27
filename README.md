@@ -85,9 +85,8 @@ that has a checkpoint in the suite. All sizes are in [`RESULTS.md`](RESULTS.md).
 Over all sizes, from 66k cells up, the speedup is 2.8–7.6×; from 2M cells up it is 2.8–5.1×.
 On large grids both codes are limited by memory bandwidth, and on small grids (below about 1M
 cells) by per-step overhead. Both codes need about the same GPU memory. The
-`cylinder-biotsavart` case is not supported (see 4.4). BiotSavartBCs 1.1 has adopted some of
-TurboLily's algorithmic changes; where both use the same algorithm, TurboLily is faster through
-its kernels (see section 2).
+`cylinder-biotsavart` case is not supported (see 4.4). Where BiotSavartBCs 1.1 uses the same
+algorithm as TurboLily, TurboLily is faster through its kernels (see section 2).
 
 ## Validation
 
@@ -154,13 +153,13 @@ bitwise reproducible.
 
 The discretisation and the solvers are WaterLily's and BiotSavartBCs': QUICK/CDS convection,
 BDIM, the predictor-corrector step, the multigrid V-cycle (Jacobi pre-smoothing, red-black
-Gauss-Seidel post-smoothing, adaptive ω), the stopping criteria ([BiotSavartBCs#13](https://github.com/WaterLily-jl/BiotSavartBCs.jl/pull/13)), and the
+Gauss-Seidel post-smoothing, adaptive ω), the stopping criteria, and the
 FMℓM Biot-Savart sum. The changes fall into four groups:
 
 1. algorithmic changes, which skip work that cannot change the result, and which the references
    do not have;
-2. algorithms that BiotSavartBCs 1.1 has adopted in its own form, where TurboLily is faster only
-   through its kernels;
+2. algorithms shared with BiotSavartBCs 1.1, where TurboLily is faster only through its
+   kernels;
 3. computational changes, which do the same arithmetic faster;
 4. places where the results are not identical to the reference.
 
@@ -170,7 +169,7 @@ cells. A "pass" is one sweep over a full-grid array.
 ### Where the speedup comes from
 
 Both codes were instrumented phase by phase, and single TurboLily optimizations were switched off,
-for the sphere at Re=3700 on one A10 (TurboLily 8c9f71a, grids of 66k to 33.6M cells). The time
+for the sphere at Re=3700 on one A10 (grids of 66k to 33.6M cells). The time
 saved per step splits as follows:
 
 | | share of the time saved, from 4.2M cells up | at 66k cells |
@@ -197,8 +196,8 @@ it could break.
 
 #### 1.1 Level-1 vorticity only where the FMM reads it (Biot-Savart)
 
-**BSBC.** The first Biot update of each projection calls `fill_ω!` (later ones refresh only a box
-around the body, see 2.2):
+**BSBC.** The first Biot update of each projection calls `fill_ω!` (later ones refresh only the
+body box, see 2):
 
 1. zero the level-1 vorticity array (`flow.f`, 3N values in 3D);
 2. compute the centred curl in every cell 3..N-2 and write it;
@@ -321,85 +320,25 @@ sphere it saves 1.5 ms per step at 4.2M cells, 9 % of the time saved.
 
 ### 2. Algorithms shared with BiotSavartBCs 1.1 (same work, faster kernels)
 
-BiotSavartBCs 1.1 has adopted the idea of 2.1 and its own versions of 2.2 and 2.3
-([BiotSavartBCs#31](https://github.com/WaterLily-jl/BiotSavartBCs.jl/pull/31)). Priced in the same
-kernels, the two codes do about the same work here. TurboLily is faster only where its FMM kernel
-(3.4) is faster.
+TurboLily uses these algorithms of BSBC 1.1 (Biot-Savart only):
 
-#### 2.1 Cumulative pressure, one velocity update at the end (Biot-Savart)
+- **Cumulative pressure.** The multigrid continues on the total pressure p, and `u −= Δt·L∇p`
+  is applied once at the end of the projection.
+- **Vorticity in the body box.** After the first Biot update of a projection, the vorticity of
+  `u − Δt·L∇p` is recomputed only in the body box: the bounding box of the cells with
+  0 < μ₀ < 1, plus one cell, coarsened on every level. Outside it curl(L∇p) is zero.
+- **FMM in the body box.** Later updates re-sum only the targets whose sources on their level
+  overlap the body box; the other targets keep their sums from the first update.
 
-**Both.** The multigrid continues on the total pressure p, with the residual kept consistent.
-`u` is not touched during the projection, and the single update `u −= Δt·L∇p` is applied once at
-the end, instead of applying each round's increment to `u` and accumulating the pressure
-separately.
+Differences in TurboLily's implementation:
 
-**Why equal.** The residual after applying an increment is `div(u − Δt·L∇x)/Δt − ... = z − A·p`
-either way. A V-cycle on the increment from zero adds the same correction as a V-cycle on the
-total, because the V-cycle only adds corrections computed from r.
+- `u − Δt·L∇p` is evaluated on the fly and never written, with p in physical units (1.3);
+- level-1 vorticity is computed only in the layer that the FMM reads (1.1);
+- a target is also re-summed when one of its symmetry images sees the body box.
 
-**Difference.** BSBC still scales the pressure by Δt before and after the solve, which 1.3
-removes.
-
-#### 2.2 Vorticity recomputed only next to the body (Biot-Savart)
-
-**BSBC.** After the first evaluation, `body_ω!` recomputes the vorticity of `u − μ₀∇p` only
-in the bounding box of the cells with 0 < μ₀ < 1 (plus one cell), on every level.
-
-**TurboLily.** Within a projection, `u` is left unchanged (2.1), and the vorticity is that
-of `u − Δt·L∇p`, evaluated on the fly. At the start of the projection the full curl of `u` is
-computed once (1.1). After that, only the "affected" cells are recomputed with the current p:
-cells whose curl stencil reads a face where L ≠ 1, and their level-2 parents. Levels 3 and
-coarser are rebuilt from level 2, which is small. This list is smaller than the body's bounding
-box.
-
-**Why equal.** The curl is linear, so curl(u − Δt·L∇p) = curl(u) − Δt·curl(L∇p). Where L = 1
-on every face the stencil reads, curl(L∇p) is the centred curl of a discrete gradient. That is
-identically zero: both cross terms reduce to
-`(p[I+δj+δk] − p[I+δj−δk] − p[I−δj+δk] + p[I−δj−δk])/4`. So ω can only change where some L ≠ 1,
-which is next to the body. L = μ₀ is exactly 1 away from the body, because μ₀(d,ϵ) = 1 for
-d ≥ ϵ, and is 0 inside it.
-
-A check with a random pressure on 160×64×64: recomputing 1,088 of 94,792 level-2 cells
-reproduces the direct computation to 2e-6, which is Float32
-rounding of `u − Δt∇p`. Skipping them gives errors of 7.7.
-
-**Relies on:**
-
-- the centred curl stencil and the staggered `L∇p` update being the ones above;
-- μ₀ being exactly 1 away from the body;
-- interior `u` not changing between Biot updates. The curl of cells 3..N-2 never reads the
-  boundary-normal faces, which the Biot update does change.
-
-The affected list is rebuilt whenever μ₀ changes (`update!` after `measure!`).
-
-**Cost.** A vorticity update takes 0.09 ms in both codes at 4.2M cells (0.43 ms in BSBC and
-0.57 ms in TurboLily at 33.6M cells).
-
-#### 2.3 Incremental FMM (Biot-Savart)
-
-**BSBC.** The first update of each projection evaluates the full sum and stores each level's
-own target sums. Later updates re-sum only the targets that can see the body's bounding box
-(2.2) and keep the stored sums elsewhere.
-
-**TurboLily.** The first update of each projection does the same. After that, ω changes only
-in the affected cells (2.2), so the sum is evaluated on Δω (new minus old):
-
-1. the curl kernels write Δω at the affected cells;
-2. levels 3 and coarser are restricted from Δω;
-3. each target sums only over its source box intersected with the bounding box of the nonzero
-   Δω on that level, so most targets exit immediately;
-4. the coarse-to-fine projection runs on the Δ values, and the result is added to the stored
-   boundary velocities.
-
-**Why equal.** Both the interaction sums and the projection are linear in ω.
-
-**Relies on:** the boundary velocities of the previous update staying stored, in the target
-slots of `flow.f`, for the duration of the projection.
-
-**Cost.** A later FMM update takes 0.74 ms in BSBC and 0.13 ms in TurboLily (1.34 and 0.45 ms),
-a full FMM evaluation 2.23 and 0.40 ms (9.1 and 1.8 ms). Priced in the same kernels, the two
-updates do about the same work, so the difference is the FMM kernel (3.4). Within TurboLily, a
-full FMM in every update would make the step 7 % (5 %) slower.
+**Cost.** At 4.2M cells (33.6M cells), a vorticity update takes 0.09 ms in BSBC and 0.11 ms in
+TurboLily (0.43 and 0.44 ms). A later FMM update takes 0.74 and 0.12 ms (1.34 and 0.32 ms); the
+difference is the FMM kernel (3.4).
 
 ### 3. Computational changes (same arithmetic, faster execution)
 
@@ -476,20 +415,16 @@ from 4.2M cells up, and 30 % of TurboLily's step at 66k cells.
 
 - **FMM interaction.** Each source x-line is split around the near-field hole, so the inner
   loop has no exclusion test, and the target's velocity component is a compile-time constant,
-  so only the two vorticity components that enter are loaded. This idea was proposed in the
-  [BiotSavartBCs#14](https://github.com/WaterLily-jl/BiotSavartBCs.jl/pull/14), but that part was not merged: BiotSavartBCs keeps the per-source loop
-  with a `S ∉ Rinner` test. The split keeps the summation order, so the two differ only by
+  so only the two vorticity components that enter are loaded. BiotSavartBCs tests every source
+  with `S ∉ Rinner` instead. The split keeps the summation order, so the two differ only by
   rounding. TurboLily also computes 1/r³ with `rsqrt`. On coarse levels, where there are few
   targets with large source boxes, several threads (up to 16, chosen from measurements) share
   one target and reduce with warp shuffles.
-- **Vorticity corrections.** One thread per (cell, component, fine cell), combined by warp
-  shuffles.
 - **Residual source and flux fix.** The residual kernel computes the source from `u` directly,
   so z is never stored. The boundary-velocity kernel also updates the residual next to the
   boundary and sums the net flux change. The boundary kernels read precomputed adjacent-cell
   indices, with no integer divisions.
-- **`pflowBC!`.** One kernel per direction (tangential components, then normal). BSBC 1.1 also
-  uses one kernel per pair of faces ([BiotSavartBCs#28](https://github.com/WaterLily-jl/BiotSavartBCs.jl/pull/28)).
+- **`pflowBC!`.** One kernel per direction (tangential components, then normal), as in BSBC.
 
 **Measured:** the FMM kernel saves 4.9 ms (17 ms) per step, 25 % of the time saved at 4.2M
 cells.
@@ -499,7 +434,7 @@ cells.
 - Reductions write per-block partial sums, which are reduced in Float64 in two levels (Float64
   runs at 1/32 rate on GeForce cards). There are no atomics on a single address.
 - The host reads the sums and maxima of a reduction in one copy, after a stream sync that
-  blocks in the driver. CUDA.jl's default wait wakes the task from a worker thread, which left
+  blocks in the driver. CUDA.jl's default wait wakes the task from a worker thread, which leaves
   the GPU idle for 50–200 µs per read.
 - The corrector projection also computes the CFL flux of the projected velocity, and the
   residual and projection kernels write the x faces of the domain BCs. The convective exit
@@ -507,8 +442,7 @@ cells.
 - All index arithmetic is Int32. Note that Julia's `sum` over Int32 widens to Int64.
 - Loops over the dimensions are fully unrolled, so tuples indexed by the dimension stay in
   registers.
-- Kernels on a domain face run threads over the two in-plane directions (WaterLily does the
-  same since [#346](https://github.com/WaterLily-jl/WaterLily.jl/pull/346)).
+- Kernels on a domain face run threads over the two in-plane directions, as in WaterLily.
 - The BDIM band lists are built with warp-aggregated atomics instead of `findall`.
 
 ### 4. Where results are not identical to the reference
@@ -519,7 +453,7 @@ Groups 1–3 change the order of floating-point operations:
 
 - block-wise Float64 reductions;
 - `rsqrt` and a different summation order in the FMM;
-- vorticity and pressure accumulated incrementally.
+- pressure accumulated over the projection.
 
 Velocities therefore agree with the reference to rounding, not bit for bit. The 3D flows
 amplify these differences exactly as they amplify a 1e-6 perturbation of the reference itself
@@ -547,8 +481,8 @@ have the same red-black colour. A wrapped read would then race with the update o
 neighbour. These levels therefore use WaterLily's method: ghosts filled once, no wrap. Odd
 levels occur also for even grids: a periodic 48 or 96 coarsens to a 3-cell level.
 
-**Effect.** Results agree to the solver tolerance rather than to rounding. Measured against
-WaterLily 52b2207 (master after 1.10.0):
+**Effect.** Results agree to the solver tolerance rather than to rounding. Against WaterLily
+1.10:
 
 | case | steps | max \|Δu\|, default tol | max \|Δu\|, tol=1e-6 | V-cycles per solve at tol=1e-6, WL / TurboLily |
 |---|---|---|---|---|
@@ -570,15 +504,14 @@ These raise an `ArgumentError`:
 
 - `fmm=false` (the tree sum).
 - Biot-Savart BCs on grids too small for a second Biot-Savart level, e.g. 8×8.
-- Periodic directions with Biot-Savart BCs ([BiotSavartBCs#19](https://github.com/WaterLily-jl/BiotSavartBCs.jl/pull/19)).
+- Periodic directions with Biot-Savart BCs. BiotSavartBCs supports one periodic direction.
 
 Also not implemented: `T=Float64` and non-CUDA arrays.
 
 Not supported: bodies wrapped in
 [WaterLilyNarrowBand.jl](https://github.com/WaterLily-jl/WaterLilyNarrowBand.jl)'s
-`NarrowBand` cache. TurboLily already measures only near the body, and an experimental
-integration gave little gain: about 5% per step for a 16-ring composite body and 69% slower
-for a sphere.
+`NarrowBand` cache. TurboLily already measures only near the body (1.5), so the cache would
+add little.
 
 ## Multi-GPU
 
@@ -590,9 +523,6 @@ NVLink):
   Exchanging halos inside every multigrid smoothing step would cost more than one whole
   V-cycle takes on one GPU (1.45 ms at 4.2M cells). So domain decomposition only pays off for
   problems that do not fit in one card's 11 GB, which is roughly 60M cells.
-- Reactant.jl (XLA) runs on these sm_75 cards. A 7-point stencil sweep in Reactant takes
-  about 3× as long as a hand-written CUDA kernel. Sharding it over 4 GPUs gave no speedup, and
-  the sharded result differed from the single-device one by 2e-3.
 - Independent simulations, one per GPU from one Julia process, work as they are: see
   `examples/multigpu_sweep.jl`, started with `julia -t 4`.
 
@@ -613,8 +543,7 @@ runners have no GPU, and WaterLily's CUDA extension does not load without one, s
 are run by hand.
 
 The benchmark scripts are not part of this repository. [`RESULTS.md`](RESULTS.md) has the full
-tables, the method of each benchmark, and earlier comparisons against WaterLily and
-BiotSavartBCs pull requests.
+table and its method.
 
 ## License
 

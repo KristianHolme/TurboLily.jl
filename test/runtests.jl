@@ -389,7 +389,7 @@ end
     end
 end
 
-@testset "Biot increments after body motion" begin
+@testset "Biot body-box updates after body motion" begin
     for D in (2, 3)
         @testset "$(D)D" begin
             dims = ntuple(d -> d == 1 ? 64 : 32, D)
@@ -404,30 +404,40 @@ end
             u = reshape(sin.(T.(1:length(a.u))), size(a.u))
             p = reshape(cos.(T.(1:length(a.p))), size(a.p))
             copyto!(a.u, u)
+            restrict_all!(ωs) = for l in 3:length(b.g)
+                TurboLily.launch(
+                    TurboLily.k_vrestrict!, TurboLily.inside_lo(b.g[l]),
+                    TurboLily.inside_hi(b.g[l]), ωs[l], b.g[l], ωs[l - 1], b.g[l - 1]
+                )
+            end
+            tar1 = Array(b.tar[1])
             for t in (0.0f0, 12.0f0, 80.0f0, 0.0f0)
                 measure!(sim, t)
                 copyto!(a.p, p)
                 TurboLily.fill_ω!(b, a.f, a.u)
-                TurboLily.correct_ω!(b, a.f, a.u, a.p, 0.25f0, false)
-                previous = map(Array, (a.f, b.ω...))
+                TurboLily.body_ω!(b, a.f, a.u, a.p, 0.25f0; full = true)
+                TurboLily.fmm!(b, a.f)
                 a.p .*= 2.0f0
-                TurboLily.correct_ω!(b, a.f, a.u, a.p, 0.25f0, true)
-                for l in 1:2
-                    current = l == 1 ? a.f : b.ω[1]
-                    @test maxdiff(b.dω[l], Array(current) .- previous[l]) == 0
+                # the box refresh against the vorticity of u - Δt·L∇p everywhere
+                TurboLily.body_ω!(b, a.f, a.u, a.p, 0.25f0)
+                boxed = map(Array, (a.f, b.ω...))
+                TurboLily.fill_ω!(b, a.f, TurboLily.UC(a.u, a.p, b.levels[1].op, 0.25f0))
+                restrict_all!((a.f, b.ω...))
+                for l in eachindex(boxed)
+                    ref = Array(l == 1 ? a.f : b.ω[l - 1])
+                    l == 1 && (ref[tar1] .= boxed[1][tar1])   # target slots hold velocities
+                    @test maxdiff(boxed[l], ref) < 2.0f-5
                 end
-                full = map(copy, (a.f, b.ω...))
-                for l in 3:length(b.g)
-                    TurboLily.launch(
-                        TurboLily.k_vrestrict!, TurboLily.inside_lo(b.g[l]),
-                        TurboLily.inside_hi(b.g[l]), full[l], b.g[l], full[l - 1], b.g[l - 1]
-                    )
-                    @test maxdiff(b.dω[l], Array(full[l]) .- previous[l]) < 2.0f-5
-                end
+                # the near-target update against a full FMM evaluation
+                copyto!(a.f, boxed[1]); foreach(copyto!, b.ω, boxed[2:end])
+                TurboLily.fmm!(b, a.f; update = true)
+                updated = Array(a.f)[tar1]
+                TurboLily.fmm!(b, a.f)
+                @test maxdiff(updated, Array(a.f)[tar1]) < 1.0f-5
                 if t == 80.0f0
-                    @test b.nA == [0, 0]
+                    @test all(==(0), b.nnear)
                 else
-                    @test all(>(0), b.nA)
+                    @test 0 < sum(b.nnear) < sum(length, b.tar)
                 end
             end
         end

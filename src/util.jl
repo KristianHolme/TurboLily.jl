@@ -97,27 +97,31 @@ end
 threads_for(::Val{1}) = (256,1,1)
 threads_for(::Val{2}) = (32,8,1)
 threads_for(::Val{3}) = (32,4,2)
+# block shape of `launch` for kernel `k`
+kernel_threads(k, ::Val{D}) where D = threads_for(Val(D))
 
 """
     launch(k, lo, hi, args...)
 
 Launch kernel `k(lo,hi,args...)` with one thread per cell of the box `lo:hi`.
 """
-function launch(k::K, lo::NTuple{D,<:Integer}, hi::NTuple{D,<:Integer}, args...) where {K,D}
-    th, bl = launch_dims(lo, hi)
+function launch(k::K, lo::NTuple{D,<:Integer}, hi::NTuple{D,<:Integer}, args...; th=kernel_threads(k, Val(D))) where {K,D}
+    th, bl = launch_dims(lo, hi, th)
     prod(bl) == 0 && return 0
     @cuda threads=th blocks=bl k(Int32.(lo), Int32.(hi), args...)
     return prod(bl)
 end
 # threads and blocks of `launch` over the box `lo:hi` (zero blocks for an empty box)
-function launch_dims(lo::NTuple{D,<:Integer}, hi::NTuple{D,<:Integer}) where D
+function launch_dims(lo::NTuple{D,<:Integer}, hi::NTuple{D,<:Integer}, th=threads_for(Val(D))) where D
     ext = hi .- lo .+ 1
-    th = threads_for(Val(D))
     any(ext .<= 0) && return th, (0, 0, 0)
     ext3 = (ext..., ntuple(_->1, 3-D)...)
     return th, cld.(ext3, th)
 end
-nblocks(lo, hi) = prod(launch_dims(lo, hi)[2])
+# the most blocks any block shape of `launch` gives over the box (room for the block partials)
+nblocks(lo, hi) = maximum(th -> prod(launch_dims(lo, hi, th)[2]), shapes(Val(length(lo))))
+shapes(::Val{D}) where D = (threads_for(Val(D)),)
+shapes(::Val{3}) = ((32,4,2), (32,8,1), (32,1,8))
 """
     launch_face(k, lo, hi, j, args...)
 

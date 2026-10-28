@@ -1003,3 +1003,9 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t; cfl=false
 end
 "WaterLily.CFL of the velocity projected by `mom_project!(...; cfl=true)`."
 cfl!(a::TFlow, b::TPoisson; Δt_max=10) = (fetch!(b.red); min(Δt_max, inv(getmax(b.red, 5) + 5a.ν)))
+
+# Streaming kernels (no shared-memory sums): 32×8×1 blocks are 3–7 % faster than 32×4×2.
+# The Jacobi kernels keep 32×4×2, whose blocks hold whole 2ᵈ coarsening blocks (`FusedR`).
+for k in (:k_gs!, :k_incr!, :k_prol_incr!, :k_resid_src!, :k_proj!, :k_proj_cfl!)
+    @eval kernel_threads(::typeof($k), ::Val{3}) = (32, 8, 1)
+end

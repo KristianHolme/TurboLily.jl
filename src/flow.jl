@@ -241,6 +241,9 @@ function k_momc!(lo, hi, out, uin, u0, g::AGrid{D}, dt::T, ν::T, λ::F, per, ac
     end
     return nothing
 end
+# 32×1×8 blocks: the ±2-cell stencil reloads each z plane once per 8 planes instead of per 2, and
+# the reloads then stay in L2 (core 2.26 → 1.68 ms at 512×192×192 on an A10)
+kernel_threads(::typeof(k_momc!), ::Val{3}) = (32, 1, 8)
 launch_core!(a::TFlow{D,T}, lo, hi, out, uin, t, corr) where {D,T} =
     launch(k_momc!, lo, hi, out, uin, a.u⁰, SGrid(a.grid), a.Δt[end], a.ν, a.λ, a.per, a.acc, T(t), corr)
 # all boundary slabs in one launch: thread t takes cell t-start[b] of slab b (x fastest)

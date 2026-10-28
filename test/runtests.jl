@@ -68,6 +68,9 @@ pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
         ("3D sphere", w->sphere(w), 5, false, 1e-4, 1e-2),
         # 66³ cells: large enough for the fused Gauss-Seidel pair (non-periodic 3D levels)
         ("3D sphere 64³", w->sphere(w; n=64, m=64, R=10f0), 3, false, 1e-4, 1e-2),
+        # x-y planes of 49k cells: the block shapes for planes that do not fit in L2 (`BIG_PLANE`)
+        ("3D sphere, large x-y planes", w->ctor(w)((256,192,16), (1,0,0), 6f0; ν=0.02, T,
+            body=AutoBody((x,t)->√sum(abs2,x .- SA[64f0,96f0,8f0])-6f0)), 3, false, 1e-4, 1e-2),
         ("3D sphere periodic z + exitBC", w->sphere(w; perdir=(3,), exitBC=true), 5, false, 2e-3, 1e-2),
         # uBC starts at 0, so the second step is Δt≈5.5. After 5 steps WaterLily with a 1e-6 velocity
         # perturbation differs from WaterLily by 2.0e-4, so the velocity tolerance is wider here
@@ -445,3 +448,32 @@ end
 end
 
 include("waterlily_tests.jl")
+
+function fill_k!(lo, hi, a)
+    I, ok = TurboLily.cellidx(lo, hi)
+    ok && (@inbounds a[I...] = 1f0)
+    return nothing
+end
+nofill_k!(lo, hi, a) = fill_k!(lo, hi, a)
+TurboLily.shrinkable(::typeof(fill_k!)) = true
+@testset "Block shape safeguards" begin
+    fit = TurboLily.fit_threads
+    # the shapes of large planes are used by the "large x-y planes" case above, not by small grids
+    @test TurboLily.kernel_threads(TurboLily.k_momc!, Val(3), (254, 188, 12)) == (32, 1, 8)
+    @test TurboLily.kernel_threads(TurboLily.k_proj!, Val(3), (254, 190, 14)) == (32, 8, 1)
+    @test TurboLily.kernel_threads(TurboLily.k_momc!, Val(3), (62, 30, 30)) == (32, 4, 2)
+    @test fit((32, 1, 8), 256) == (32, 1, 8)
+    @test fit((32, 1, 8), 100) == (32, 1, 2)
+    @test fit((32, 8, 1), 100) == (32, 2, 1)
+    @test fit((512,), 334) == (256,)
+    @test fit((32, 4, 2), 1) == (1, 1, 1)
+    @test_throws ArgumentError fit((32, 4, 2), 0)
+    # a shrinkable kernel launched with a block larger than the device allows still fills its box
+    a = CUDA.zeros(Float32, 40, 33, 17)
+    TurboLily.launch(fill_k!, (2, 2, 2), (39, 32, 16), a; th=(32, 32, 2))
+    @test sum(Array(a)) == 38 * 31 * 15 && all(==(1), Array(a)[2:39, 2:32, 2:16])
+    # a kernel that is not shrinkable reports the register limit instead of a launch failure
+    @test_throws ErrorException TurboLily.launch(nofill_k!, (2, 2, 2), (39, 32, 16), a; th=(32, 32, 2))
+    # more blocks than the caller has room for
+    @test_throws ArgumentError TurboLily.launch(fill_k!, (2, 2, 2), (39, 32, 16), a; cap=3)
+end

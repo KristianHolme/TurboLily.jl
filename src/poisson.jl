@@ -721,9 +721,9 @@ end
 function bottom!(p::TPoisson, lb)
     lv = Tuple(DLevel(v.op, v.x, v.ϵ, v.r, v.c) for v in p.levels[lb:end])
     kern = @cuda launch=false k_bottom!(lv, p.ωd)
-    # 512 threads, fewer where the kernel's registers do not allow a block of that size (sm_90: 196 per thread);
-    # the passes stride by blockDim, so the thread count does not change the result
-    kern(lv, p.ωd; threads=min(512, CUDA.maxthreads(kern) ÷ 32 * 32))
+    # 512 threads, fewer where the kernel's registers do not allow a block of that size (196 per
+    # thread on sm_90); the passes stride by blockDim, so the thread count does not change the result
+    kern(lv, p.ωd; threads=fit_threads((512,), CUDA.maxthreads(kern)))
     for l in lb:length(p.levels)-1
         v = p.levels[l]; v.r, v.ϵ = v.ϵ, v.r
     end
@@ -1010,5 +1010,6 @@ cfl!(a::TFlow, b::TPoisson; Δt_max=10) = (fetch!(b.red); min(Δt_max, inv(getma
 # Streaming kernels (no shared-memory sums): 32×8×1 blocks are 3–7 % faster than 32×4×2.
 # The Jacobi kernels keep 32×4×2, whose blocks hold whole 2ᵈ coarsening blocks (`FusedR`).
 for k in (:k_gs!, :k_incr!, :k_prol_incr!, :k_resid_src!, :k_proj!, :k_proj_cfl!)
-    @eval kernel_threads(::typeof($k), ::Val{3}) = (32, 8, 1)
+    @eval kernel_threads(::typeof($k), ::Val{3}, ext) = ext[1]*ext[2] >= BIG_PLANE ? (32, 8, 1) : threads_for(Val(3))
+    @eval shrinkable(::typeof($k)) = true
 end

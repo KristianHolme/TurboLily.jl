@@ -97,20 +97,59 @@ end
 threads_for(::Val{1}) = (256,1,1)
 threads_for(::Val{2}) = (32,8,1)
 threads_for(::Val{3}) = (32,4,2)
-# block shape of `launch` for kernel `k`
-kernel_threads(k, ::Val{D}) where D = threads_for(Val(D))
+# block shape of `launch` for kernel `k` over a box of extent `ext`
+kernel_threads(k, ::Val{D}, ext) where D = threads_for(Val(D))
+# From this many cells in an x-y plane, the halo planes of a stencil kernel no longer stay in a
+# 6 MB L2 between neighbouring blocks (see AGENTS.md); smaller boxes keep the default shape.
+const BIG_PLANE = 40_000
 
 """
     launch(k, lo, hi, args...)
 
-Launch kernel `k(lo,hi,args...)` with one thread per cell of the box `lo:hi`.
+Launch kernel `k(lo,hi,args...)` with one thread per cell of the box `lo:hi`, in blocks of
+`kernel_threads(k, Val(D), ext)`. A block of more than `SAFE_THREADS` threads may exceed what the
+compiled kernel can run (its register use limits the block size, more so on some architectures):
+then the shape is halved in its last dimension until it fits if `shrinkable(k)`, and it is an
+error otherwise. `cap`: most blocks the caller has room for.
 """
-function launch(k::K, lo::NTuple{D,<:Integer}, hi::NTuple{D,<:Integer}, args...; th=kernel_threads(k, Val(D))) where {K,D}
+function launch(k::K, lo::NTuple{D,<:Integer}, hi::NTuple{D,<:Integer}, args...;
+                th=kernel_threads(k, Val(D), hi .- lo .+ 1), cap=typemax(Int)) where {K,D}
     th, bl = launch_dims(lo, hi, th)
     prod(bl) == 0 && return 0
+    if prod(th) > SAFE_THREADS
+        kern = @cuda launch=false k(Int32.(lo), Int32.(hi), args...)
+        maxthr = CUDA.maxthreads(kern)
+        if prod(th) > maxthr
+            shrinkable(k) || error("$k needs blocks of $(prod(th)) threads, but its register use allows $maxthr")
+            th, bl = launch_dims(lo, hi, fit_threads(th, maxthr))
+        end
+    end
+    prod(bl) <= cap || throw(ArgumentError("$k needs $(prod(bl)) blocks, there is room for $cap"))
     @cuda threads=th blocks=bl k(Int32.(lo), Int32.(hi), args...)
     return prod(bl)
 end
+# A block of up to 256 threads always fits: the register file holds 64k registers per block and a
+# thread uses at most 255. The query of the kernel's limit is only made above that, which keeps
+# the host cost of the common launch what a plain `@cuda` has.
+const SAFE_THREADS = 256
+"""
+    fit_threads(th, maxthr)
+
+The block shape `th` with its last dimension above 1 halved (repeatedly) until it has at most
+`maxthr` threads.
+"""
+function fit_threads(th::NTuple{N,Int}, maxthr::Integer) where N
+    maxthr >= 1 || throw(ArgumentError("a block of at most $maxthr threads"))
+    while prod(th) > maxthr
+        j = something(findlast(>(1), th), 1)
+        th = Base.setindex(th, th[j] ÷ 2, j)
+    end
+    return th
+end
+# Whether `launch` may shrink the block shape of `k`: true for kernels that index cells by
+# `cellidx` and reduce with `block_partial!`, false where the shape is part of the algorithm
+# (the Jacobi kernels' fused restriction needs whole 2ᵈ coarsening blocks).
+shrinkable(k) = false
 # threads and blocks of `launch` over the box `lo:hi` (zero blocks for an empty box)
 function launch_dims(lo::NTuple{D,<:Integer}, hi::NTuple{D,<:Integer}, th=threads_for(Val(D))) where D
     ext = hi .- lo .+ 1
@@ -308,7 +347,7 @@ into `b.s[slot]`, `b.m[slot]`.
 """
 function red_launch(k::K, lo, hi, b::RedBuf, slot, args...) where K
     checkcap(b, nblocks(lo, hi))
-    nb = launch(k, lo, hi, b.ps, b.pm, args...)
+    nb = launch(k, lo, hi, b.ps, b.pm, args...; cap=length(b.ps))
     nb == 0 && return nothing
     finish!(b, nb, b.s, b.m, slot)
     return nothing

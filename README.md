@@ -32,7 +32,8 @@ Tested with:
 
 - WaterLily 1.10.0 and master (52b2207), with BiotSavartBCs 1.1.0;
 - Julia 1.13 and CUDA.jl 6.4;
-- NVIDIA RTX 2080 Ti (compute capability 7.5) and A10 (8.6) GPUs.
+- NVIDIA RTX 2080 Ti (compute capability 7.5) and A10 (8.6) GPUs. A GH200 (9.0) runs the
+  benchmarks, but the test suite has not been run on it.
 
 ### Other WaterLily packages
 
@@ -74,11 +75,11 @@ that has a checkpoint in the suite. All sizes are in [`RESULTS.md`](RESULTS.md).
 
 | case | grid | cells | reference | TurboLily | speedup |
 |---|---|---|---|---|---|
-| tgv | 256³ | 16.8M | 75.9 | 18.0 | 4.2× |
+| tgv | 256³ | 16.8M | 75.9 | 17.4 | 4.4× |
 | tgv-periodic | 128³ | 2.1M | 12.4 | 2.4 | 5.1× |
-| sphere | 512×192×192 | 18.9M | 85.1 | 21.1 | 4.0× |
+| sphere | 512×192×192 | 18.9M | 85.1 | 19.9 | 4.3× |
 | sphere-biotsavart | 256×96×96 | 2.4M | 16.8 | 4.3 | 3.9× |
-| cylinder (moving) | 288×192×64 | 3.5M | 22.2 | 6.4 | 3.5× |
+| cylinder (moving) | 288×192×64 | 3.5M | 22.2 | 6.3 | 3.5× |
 | donut | 128×64×64 | 524k | 5.4 | 1.3 | 4.2× |
 | jelly-biotsavart (moving) | 128×128×512 | 8.4M | 68.3 | 24.4 | 2.8× |
 
@@ -174,8 +175,8 @@ saved per step splits as follows:
 
 | | share of the time saved, from 4.2M cells up | at 66k cells |
 |---|---|---|
-| kernel efficiency (group 3, and the kernels of group 2) | 77–92 % | 25 % (WaterLily BCs), 51 % (Biot-Savart BCs) |
-| algorithmic changes (group 1) | 8 % (WaterLily BCs), 10–11 % (Biot-Savart BCs), 14–17 % (moving body) | 3 % (WaterLily BCs), 7–20 % (Biot-Savart BCs) |
+| kernel efficiency (group 3, and the kernels of group 2) | 77–93 % | 25 % (WaterLily BCs), 51 % (Biot-Savart BCs) |
+| algorithmic changes (group 1) | 7–8 % (WaterLily BCs), 10–11 % (Biot-Savart BCs), 14–17 % (moving body) | 3 % (WaterLily BCs), 7–20 % (Biot-Savart BCs) |
 | host gaps (fewer launches and host syncs, CUDA graphs) | 0–6 % | 72 % (WaterLily BCs), 42 % (Biot-Savart BCs) |
 
 The moving-body cases were measured from 524k cells up. With Biot-Savart BCs the algorithmic
@@ -193,12 +194,12 @@ so the savings are not additive.
 
 | change | section | saved | applies to |
 |---|---|---|---|
-| fused momentum step | 3.1 | 8.6 ms (65 ms) per step | both |
+| fused momentum step | 3.1 | 8.6 ms (66 ms) per step | both |
 | FMM kernel | 3.4 | 4.9 ms (17 ms) per step | Biot-Savart |
 | multigrid kernels and compressed stencil | 3.2, 3.3 | 1.45 ms (14 ms) per V-cycle | both |
 | `measure!` only in the body band | 1.5 | 1.5 ms per step | moving body |
 | residual norms and flux fix from the boundary cells | 1.2 | 0.74 ms (5.0 ms) per step | Biot-Savart |
-| residual correction folded into the next kernel | 1.4 | 0.68 ms (5.0 ms) per step | both |
+| residual correction folded into the next kernel | 1.4 | 0.68 ms (4.1 ms) per step | both |
 | level-1 vorticity only where the FMM reads it | 1.1 | 0.66 ms (6.0 ms) per step | Biot-Savart |
 | pressure solved in physical units | 1.3 | 0.49 ms (4.0 ms) per step | both |
 
@@ -306,7 +307,7 @@ through x, then `b.x ./= Δt` (another full pass). BSBC scales `p` the same way.
 - The mean correction is applied on the fly by the first Jacobi kernel of the first V-cycle,
   which also produces the initial L₁ and L∞.
 
-**Saves:** 2 passes, 3 reductions and 3 host syncs per solve, 0.68 ms (5.0 ms) per step.
+**Saves:** 2 passes, 3 reductions and 3 host syncs per solve, 0.68 ms (4.1 ms) per step.
 
 #### 1.5 `measure!` rewrites only the body band (both)
 
@@ -379,8 +380,12 @@ difference is the FMM kernel (3.4).
 - The core kernel covers the full x range. Its x faces use a branch-free boundary flux, and the
   periodic flags and the grid strides are compile-time constants (type parameters), which keeps
   it at 64 registers. The y and z boundary layers run as one thin kernel.
-- The core kernel is limited by its floating-point instructions, not by memory: about 440 per
-  cell, 144 of them the minima and maxima of the QUICK limiter (RTX 2080 Ti).
+- The core kernel runs with 32×1×8 blocks when an x-y plane has at least 40,000 cells (3.5). It
+  executes about 440 floating-point instructions per cell, 144 of them the minima and maxima
+  of the QUICK limiter (RTX 2080 Ti), but the limiter does not set its time: on an A10, a
+  three-operation scheme with the same loads takes the same time. What counts is the traffic
+  of the ±2-cell stencil. At 512×192×192 the kernel moves its nine passes at 84 % of the
+  bandwidth of a plain copy (1.68 ms).
 - The full BDIM update (μ₀, μ₁, V) runs only on two precomputed lists:
   - faces with μ₀ ≠ 1 and μ₁ = 0, where faces fully inside the body reduce to u = V;
   - faces with μ₁ ≠ 0, the shell.
@@ -390,7 +395,7 @@ difference is the FMM kernel (3.4).
   combined by warp shuffles in a fixed order.
 - `u⁰ ← u` and the corrector output are pointer swaps.
 
-**Measured:** the momentum step takes 9.6 ms in WL and 1.0 ms in TurboLily (74 and 8.7 ms):
+**Measured:** the momentum step takes 9.6 ms in WL and 1.0 ms in TurboLily (74 and 7.6 ms):
 43–58 % of all the time saved.
 
 #### 3.2 Compressed Poisson stencil
@@ -406,7 +411,7 @@ from about 6–7 values to about 2–3. A second bit marks cells whose neighbour
 so the Jacobi step and the first Gauss-Seidel sweep read no neighbour flags. All kernels load
 their stencil values before branching on the flags, so the loads do not wait for the flag.
 
-**Measured:** saves 1.9 ms (21 ms) per step. Without it the TurboLily step is 37 % (55 %) slower.
+**Measured:** saves 1.9 ms (24 ms) per step. Without it the TurboLily step is 38 % (66 %) slower.
 
 #### 3.3 Multigrid kernels
 
@@ -422,7 +427,7 @@ their stencil values before branching on the flags, so the loads do not wait for
 | each V-cycle is about 70 launches with host overhead | the whole V-cycle + smoothing is replayed as one cached CUDA graph |
 
 **Measured:** one V-cycle with its smoothing and norms takes 2.92 ms in WL and 1.47 ms in
-TurboLily (24.5 and 10.2 ms), with the same iteration counts. CUDA graphs save 0.08 ms per step
+TurboLily (24.5 and 10.1 ms), with the same iteration counts. CUDA graphs save 0.08 ms per step
 from 4.2M cells up, and 30 % of TurboLily's step at 66k cells.
 
 #### 3.4 Biot-Savart kernels
@@ -453,6 +458,17 @@ cells.
 - The corrector projection also computes the CFL flux of the projected velocity, and the
   residual and projection kernels write the x faces of the domain BCs. The convective exit
   runs over the whole exit plane in three launches.
+- Block shapes. A kernel with a ±2-cell stencil and 32×4×2 blocks reads every z plane three
+  times, and when an x-y plane is large (65k cells or more) the reloads leave the 6 MB L2 of an
+  A10 or 2080 Ti. The momentum core uses 32×1×8 blocks and the streaming multigrid and
+  projection kernels 32×8×1, on boxes with at least 40,000 cells per x-y plane; smaller boxes
+  and the Jacobi kernels keep 32×4×2. The results are identical. At 512×192×192 the step takes
+  21.1 ms with the old shapes and 20.0 ms with the new on an A10 (18.98 and 18.03 ms on a
+  2080 Ti). A GH200, with 50 MB of L2, shows no difference.
+- Block sizes above 256 threads are checked against the compiled kernel's register limit
+  (a block of up to 256 threads always fits). `k_bottom!` needs 196 registers per thread on
+  sm_90, so its 512 threads would fail there; it halves the block until it fits, as do the
+  kernels marked `shrinkable`.
 - All index arithmetic is Int32. Note that Julia's `sum` over Int32 widens to Int64.
   WaterLily's `@loop` gets each work-item's Cartesian index from KernelAbstractions with Int64
   divisions; on streaming kernels at 18.9M cells this costs about a third of the bandwidth

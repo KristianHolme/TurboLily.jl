@@ -720,7 +720,10 @@ function bottom_index(p::TPoisson)
 end
 function bottom!(p::TPoisson, lb)
     lv = Tuple(DLevel(v.op, v.x, v.ϵ, v.r, v.c) for v in p.levels[lb:end])
-    @cuda threads=512 k_bottom!(lv, p.ωd)
+    kern = @cuda launch=false k_bottom!(lv, p.ωd)
+    # 512 threads, fewer where the kernel's registers do not allow a block of that size (sm_90: 196 per thread);
+    # the passes stride by blockDim, so the thread count does not change the result
+    kern(lv, p.ωd; threads=min(512, CUDA.maxthreads(kern) ÷ 32 * 32))
     for l in lb:length(p.levels)-1
         v = p.levels[l]; v.r, v.ϵ = v.ϵ, v.r
     end

@@ -87,20 +87,23 @@ struct ShiftScaled{P,T}; p::P; s::T; apply::Bool; iD::T; end
     end
     return s
 end
-# A·f at cell I
+# A·f at cell I: Σ_nb L·(f_nb − f), as WaterLily.mult. D is unused, so a constant
+# field gives 0 in Float32 where the stored diagonal is not −ΣL.
 @inline function mult_f(op::Op{D}, I, l, f::F) where {D,F}
     g, per = op.g, op.per
+    fc = f(I, l)
     if isreg(op, l)
-        s = f(I,l)*op.Dreg
+        s = zero(op.Lreg)
         @unroll for j in i32:Int32(D)
-            s += f(shift(I,j,-1), nbm(g,I,l,j,per))*op.Lreg + f(shift(I,j,1), nbp(g,I,l,j,per))*op.Lreg
+            s += op.Lreg*(f(shift(I,j,-1), nbm(g,I,l,j,per)) - fc) +
+                 op.Lreg*(f(shift(I,j,1), nbp(g,I,l,j,per)) - fc)
         end
     else
-        s = f(I,l)*@inbounds(op.Dg[l])
+        s = zero(op.Lreg)
         @unroll for j in i32:Int32(D)
             cj = (j-i32)*g.nc
-            s += f(shift(I,j,-1), nbm(g,I,l,j,per))*@inbounds(op.L[l+cj]) +
-                 f(shift(I,j,1), nbp(g,I,l,j,per))*@inbounds(op.L[l+g.s[j]+cj])
+            s += @inbounds(op.L[l+cj])*(f(shift(I,j,-1), nbm(g,I,l,j,per)) - fc) +
+                 @inbounds(op.L[l+g.s[j]+cj])*(f(shift(I,j,1), nbp(g,I,l,j,per)) - fc)
         end
     end
     return s

@@ -472,7 +472,7 @@ end
 # ---------------------------------------------------------------- time step
 using WaterLily: @log
 # `poisson_kwargs` (`tol`, `itmx`) go to `mom_project!`. `kwargs` go only to `udf!`.
-# The empty default is the WaterLily v1.10.0 call, which does not pass the keyword.
+# `sim_step!` passes `poisson_kwargs` (WaterLily ≥ 1.11); a direct `mom_step!` call may leave it out.
 function WaterLily.mom_step!(a::TFlow{D,T}, b::AbstractPoisson; udf=nothing, poisson_kwargs=(;), kwargs...) where {D,T}
     isnothing(udf) || return mom_step_udf!(a, b; udf, poisson_kwargs, kwargs...)
     a.u, a.u⁰ = a.u⁰, a.u                     # u⁰ ← u (no copy)

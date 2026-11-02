@@ -169,11 +169,9 @@ pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
         sim_step!(c; remeasure=false)
         WaterLily.mom_step!(c.flow, c.pois; poisson_kwargs=(; itmx=2))
         @test all(<=(2), c.pois.n[end-1:end])
-        # through sim_step!, against a WaterLily whose sim_step! takes poisson_kwargs (after 1.10.0)
-        if any(m -> :poisson_kwargs in Base.kwarg_decl(m), methods(WaterLily.sim_step!))
-            du, dp, na, nb = compare(w->circle(w), 5; udf=grav!, g=0.02f0, poisson_kwargs=(; tol=1f-4))
-            @test du < 1e-4 && na == nb
-        end
+        # through sim_step!
+        du, dp, na, nb = compare(w->circle(w), 5; udf=grav!, g=0.02f0, poisson_kwargs=(; tol=1f-4))
+        @test du < 1e-4 && na == nb
     end
     @testset "thin grids: reduction scratch" begin
         # the block count of a launch depends on the rounded-up extent in each direction,

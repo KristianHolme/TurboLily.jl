@@ -26,12 +26,12 @@ using Pkg
 Pkg.add(url="https://github.com/KristianHolme/TurboLily.jl")
 ```
 
-It requires WaterLily 1.10 and BiotSavartBCs 1.1: TurboLily follows the latest minor versions.
+It requires WaterLily 1.11 and BiotSavartBCs 1.1: TurboLily follows the latest minor versions.
 
 Tested with:
 
-- WaterLily 1.10.0 and master (52b2207), with BiotSavartBCs 1.1.0;
-- Julia 1.13 and CUDA.jl 6.4;
+- WaterLily 1.11.0 with BiotSavartBCs 1.1.0;
+- Julia 1.13, CUDA.jl 6.5 and KernelAbstractions 0.10;
 - NVIDIA RTX 2080 Ti (compute capability 7.5) and A10 (8.6) GPUs. A GH200 (9.0) runs the
   benchmarks, but the test suite has not been run on it.
 
@@ -69,21 +69,25 @@ planes cost about 28 % more FMM time, about 3 % of a time step.
 These are the GPU cases of
 [WaterLily-Benchmarks](https://github.com/WaterLily-jl/WaterLily-Benchmarks), with the suite's
 method: developed-flow checkpoints, and the minimum over 5 runs of 25 steps. The reference is
-WaterLily 1.10.0, or BiotSavartBCs 1.1.0 for the `-biotsavart` cases, on the same GPU. One
-NVIDIA A10 (22.5 GB), Float32, times in ms per step. Each row is the largest size of the case
-that has a checkpoint in the suite. All sizes are in [`RESULTS.md`](RESULTS.md).
+WaterLily 1.11.0, or BiotSavartBCs 1.1.0 for the `-biotsavart` cases, on the same GPU. One
+NVIDIA RTX 2080 Ti (11 GB), Float32, CUDA.jl 6.5, times in ms per step. Each row is the largest
+size of the case that has a checkpoint in the suite. All sizes, and A10 times, are in
+[`RESULTS.md`](RESULTS.md).
 
 | case | grid | cells | reference | TurboLily | speedup |
 |---|---|---|---|---|---|
-| tgv | 256³ | 16.8M | 75.9 | 17.4 | 4.4× |
-| tgv-periodic | 128³ | 2.1M | 12.4 | 2.4 | 5.1× |
-| sphere | 512×192×192 | 18.9M | 85.1 | 19.9 | 4.3× |
-| sphere-biotsavart | 256×96×96 | 2.4M | 16.8 | 4.3 | 3.9× |
-| cylinder (moving) | 288×192×64 | 3.5M | 22.2 | 6.3 | 3.5× |
-| donut | 128×64×64 | 524k | 5.4 | 1.3 | 4.2× |
-| jelly-biotsavart (moving) | 128×128×512 | 8.4M | 68.3 | 24.4 | 2.8× |
+| tgv | 256³ | 16.8M | 61.2 | 15.9 | 3.9× |
+| tgv-periodic | 128³ | 2.1M | 11.0 | 2.2 | 5.0× |
+| sphere | 512×192×192 | 18.9M | 70.0 | 17.9 | 3.9× |
+| sphere-biotsavart | 256×96×96 | 2.4M | 14.4 | 4.1 | 3.5× |
+| cylinder (moving) | 288×192×64 | 3.5M | 17.9 | 5.8 | 3.1× |
+| donut | 128×64×64 | 524k | 3.8 | 1.5 | 2.6× |
+| jelly-biotsavart (moving) | 128×128×512 | 8.4M | 60.2 | 24.0 | 2.5× |
 
-Over all sizes, from 66k cells up, the speedup is 2.8–7.6×; from 2M cells up it is 2.8–5.1×.
+Over all sizes, from 66k cells up, the speedup is 2.5–5.0×.
+On an A10 the largest grids give 2.6–3.9×. The speedups are lower than against WaterLily 1.10:
+on small grids CUDA.jl 6.5 alone makes WaterLily 1.11 9–29 % faster than CUDA.jl 6.4, and on the
+largest A10 grids WaterLily 1.11 with CUDA.jl 6.5 is 8–9 % faster than WaterLily 1.10 with 6.4.
 On large grids both codes are limited by memory bandwidth, and on small grids (below about 1M
 cells) by per-step overhead. Both codes need about the same GPU memory. The
 `cylinder-biotsavart` case is not supported (see 4.4). Where BiotSavartBCs 1.1 uses the same
@@ -92,7 +96,7 @@ algorithm as TurboLily, TurboLily is faster through its kernels (see section 2).
 ## Validation
 
 Every configuration is stepped side by side with the reference implementation, and the results
-must agree to rounding: `test/runtests.jl` contains checks against WaterLily 1.10 and BiotSavartBCs
+must agree to rounding: `test/runtests.jl` contains checks against WaterLily 1.11 and BiotSavartBCs
 1.1. These cover 2D and 3D, `exitBC`, periodic
 directions (including a fully periodic Taylor-Green vortex and grids with odd periodic
 multigrid levels), `uBC(i,x,t)`, `g`, `λ=cds`,
@@ -165,7 +169,9 @@ FMℓM Biot-Savart sum. The changes fall into four groups:
 4. places where the results are not identical to the reference.
 
 Below, "WL" means WaterLily 1.10.0 and "BSBC" means BiotSavartBCs 1.1.0. N is the number of
-cells. A "pass" is one sweep over a full-grid array.
+cells. A "pass" is one sweep over a full-grid array. The measurements in this section were made
+against these versions with CUDA.jl 6.4. WaterLily 1.11 changes none of the work described here;
+with CUDA.jl 6.5 a WaterLily 1.11 step is 8–29 % faster (see [`RESULTS.md`](RESULTS.md)).
 
 ### Where the speedup comes from
 

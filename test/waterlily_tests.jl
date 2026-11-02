@@ -1,5 +1,5 @@
 # WaterLily's own simulation-level tests (test_flow.jl, test_simulation.jl, test_float32.jl,
-# test_metrics.jl of WaterLily 1.10), run with TurboLily.Simulation. They check the flow against
+# test_metrics.jl of WaterLily 1.11), run with TurboLily.Simulation. They check the flow against
 # analytic results, not against a reference run. Float32 throughout; where WaterLily's test
 # uses Float64 the tolerance is noted.
 using Test, TurboLily, WaterLily, CUDA, StaticArrays
@@ -14,7 +14,9 @@ L₂(a) = WaterLily.L₂(a)
             i == 1 ? -sin(x)*cos(y)*d : cos(x)*sin(y)*d)
         sim = TS((L,L), TGV, L; U=1, ν, T=Float32, perdir=(1,2))
         sim_step!(sim, π/100)
-        ue = zeros(Float32, size(sim.flow.u)); apply!((i,x)->TGV(i, x, WaterLily.time(sim)), ue)
+        # capture the time, not `sim`: KernelAbstractions 0.10 compiles CPU kernels and needs isbits closures
+        t = WaterLily.time(sim)
+        ue = zeros(Float32, size(sim.flow.u)); apply!((i,x)->TGV(i, x, t), ue)
         u = Array(sim.flow.u)
         @test L₂(u[:,:,1] .- ue[:,:,1]) < 1e-4
         @test L₂(u[:,:,2] .- ue[:,:,2]) < 1e-4
@@ -96,6 +98,10 @@ L₂(a) = WaterLily.L₂(a)
         @test sim_time(sim) == 0
         sim_step!(sim, 0.1, remeasure=false)
         @test sim_time(sim) ≥ 0.1 > sum(sim.flow.Δt[1:end-2])*sim.U/sim.L
+        # poisson_kwargs reach both projections and not udf; the impulsive start needs more than one V-cycle
+        sim = TS(nm, (1,0), r; body=AutoBody(circle), ν, T=Float32)
+        sim_step!(sim; udf=(a,t)->nothing, poisson_kwargs=(; itmx=1))
+        @test sim.pois.n == [1, 1]
         for exitBC in (true, false)
             # remeasure is exact when V = U = 1
             sim = TS(nm, (1,0), r; body=AutoBody(circle, (x,t) -> x - SA[t,0]), ν, T=Float32, exitBC)

@@ -1,21 +1,56 @@
 # Benchmarks
 
-## WaterLily-Benchmarks cases on an A10
+## WaterLily-Benchmarks cases
 
 These are the cases of [WaterLily-Benchmarks](https://github.com/WaterLily-jl/WaterLily-Benchmarks)
 (`src/cases.jl` at f6034df), on the GPU only, at every size that has a checkpoint in the suite.
-TurboLily runs against the latest registered releases, WaterLily 1.10.0 and
-BiotSavartBCs 1.1.0. The machine has 4× NVIDIA A10 (22.5 GB, 600 GB/s). Float32, Julia 1.13.2,
-CUDA.jl 6.4.2.
 
 The method is the suite's. Each case runs in its own process and starts from a developed-flow
 checkpoint. It warms up for at least 50 steps and 2 s, then does 5 runs of 25 steps, each run
 reset to the checkpoint. A step is timed with a device synchronisation, and the time is the
 minimum over the runs of the mean step. Both codes load the same checkpoint. The reference and
-TurboLily runs of a case ran back to back on the same GPU, with two GPUs in use.
+TurboLily runs of a case ran back to back on the same GPU, with two GPUs of the host in use.
 
 The rows with x-y planes of 40,000 cells or more (tgv p=8, sphere p=5, cylinder p=5) use the larger
 block shapes of README section 3.5.
+
+### RTX 2080 Ti, WaterLily 1.11.0
+
+TurboLily against the latest registered releases, WaterLily 1.11.0 and BiotSavartBCs 1.1.0, on
+nam-shub-01: 4× NVIDIA RTX 2080 Ti (11 GB, 616 GB/s), an otherwise idle host. Float32, Julia
+1.13.3, CUDA.jl 6.5.0, KernelAbstractions 0.10.4.
+
+
+
+- **Speedup:** 2.5–5.0× over all sizes, highest for the periodic TGV and lowest for jelly.
+- **Small grids:** below 1M cells both codes are limited by per-step overhead, so the cost per
+  cell rises.
+- **cylinder-biotsavart:** TurboLily has no time because `TurboLily.BiotSimulation` does not
+  support periodic directions.
+- **CUDA.jl 6.5:** with WaterLily 1.11 on the same GPU, CUDA.jl 6.5.0 instead of 6.4.2 makes the
+  reference 9–29 % faster on the small cases above (tgv p=6 and 7, tgv-periodic p=6, sphere p=3,
+  sphere-biotsavart p=3, cylinder p=4, donut p=5) and TurboLily 0–10 % faster.
+- **Validation:** the test suite passes against these releases.
+
+### A10, WaterLily 1.11.0
+
+nam-shub-02: 4× NVIDIA A10 (22.5 GB, 600 GB/s), same software. During the run another user's
+jobs kept about 34 of the 64 CPU threads busy. That slows the host side of a step, so only the
+three largest grids, which are limited by the GPU, are given:
+
+| case | log2p | cells | reference [ms] | TurboLily [ms] | speedup | WaterLily 1.10 [ms] |
+|---|---:|---:|---:|---:|---:|---:|
+| tgv | 8 | 16.8M | 68.84 | 17.76 | 3.9× | 75.85 |
+| sphere | 5 | 18.9M | 78.63 | 20.35 | 3.9× | 85.15 |
+| jelly-biotsavart | 7 | 8.4M | 67.74 | 25.86 | 2.6× | 68.29 |
+
+The last column is the reference time with WaterLily 1.10.0 and CUDA.jl 6.4.2 from the table
+below. TurboLily times are 2–6 % above that table (CUDA.jl 6.4.2 then), which may be the host load.
+
+### A10, WaterLily 1.10.0
+
+The previous full run: WaterLily 1.10.0 and BiotSavartBCs 1.1.0 on nam-shub-02, Float32, Julia
+1.13.2, CUDA.jl 6.4.2.
 
 | case | log2p | cells | reference [ms] | TurboLily [ms] | speedup | ref cost [ns/cell] | Turbo cost [ns/cell] |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -38,10 +73,3 @@ block shapes of README section 3.5.
 | jelly-biotsavart | 5 | 131k | 6.53 | 2.03 | 3.2× | 49.8 | 15.5 |
 | jelly-biotsavart | 6 | 1.0M | 14.35 | 4.99 | 2.9× | 13.7 | 4.8 |
 | jelly-biotsavart | 7 | 8.4M | 68.29 | 24.38 | 2.8× | 8.1 | 2.9 |
-
-- **Speedup:** 2.8–5.1× from 2M cells up, highest for the periodic TGV and lowest for jelly.
-- **Small grids:** below 1M cells both codes are limited by per-step overhead, so the cost per
-  cell rises.
-- **cylinder-biotsavart:** TurboLily has no time because `TurboLily.BiotSimulation` does not
-  support periodic directions.
-- **Validation:** the test suite passes against these releases.

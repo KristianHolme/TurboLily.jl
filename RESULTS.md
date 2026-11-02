@@ -34,18 +34,34 @@ nam-shub-01: 4× NVIDIA RTX 2080 Ti (11 GB, 616 GB/s), an otherwise idle host. F
 
 ### A10, WaterLily 1.11.0
 
-nam-shub-02: 4× NVIDIA A10 (22.5 GB, 600 GB/s), same software. During the run another user's
-jobs kept about 34 of the 64 CPU threads busy. That slows the host side of a step, so only the
-three largest grids, which are limited by the GPU, are given:
+nam-shub-02: 4× NVIDIA A10 (22.5 GB, 600 GB/s), same software, a quiet host (load average 2–3).
 
-| case | log2p | cells | reference [ms] | TurboLily [ms] | speedup | WaterLily 1.10 [ms] |
-|---|---:|---:|---:|---:|---:|---:|
-| tgv | 8 | 16.8M | 68.84 | 17.76 | 3.9× | 75.85 |
-| sphere | 5 | 18.9M | 78.63 | 20.35 | 3.9× | 85.15 |
-| jelly-biotsavart | 7 | 8.4M | 67.74 | 25.86 | 2.6× | 68.29 |
+| case | log2p | cells | reference [ms] | TurboLily [ms] | speedup | ref cost [ns/cell] | Turbo cost [ns/cell] |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| tgv | 6 | 262k | 2.26 | 0.59 | 3.9× | 8.6 | 2.2 |
+| tgv | 7 | 2.1M | 9.90 | 2.58 | 3.8× | 4.7 | 1.2 |
+| tgv | 8 | 16.8M | 67.36 | 17.28 | 3.9× | 4.0 | 1.0 |
+| tgv-periodic | 6 | 262k | 3.67 | 0.53 | 6.9× | 14.0 | 2.0 |
+| tgv-periodic | 7 | 2.1M | 10.85 | 2.39 | 4.5× | 5.2 | 1.1 |
+| sphere | 3 | 295k | 2.53 | 0.69 | 3.7× | 8.6 | 2.3 |
+| sphere | 4 | 2.4M | 10.80 | 2.85 | 3.8× | 4.6 | 1.2 |
+| sphere | 5 | 18.9M | 77.12 | 19.89 | 3.9× | 4.1 | 1.1 |
+| sphere-biotsavart | 3 | 295k | 4.46 | 1.42 | 3.1× | 15.1 | 4.8 |
+| sphere-biotsavart | 4 | 2.4M | 15.59 | 4.40 | 3.5× | 6.6 | 1.9 |
+| cylinder | 4 | 442k | 5.62 | 1.32 | 4.2× | 12.7 | 3.0 |
+| cylinder | 5 | 3.5M | 20.56 | 6.32 | 3.3× | 5.8 | 1.8 |
+| cylinder-biotsavart | 4 | 442k | 12.94 | — | — | 29.3 | — |
+| cylinder-biotsavart | 5 | 3.5M | 26.72 | — | — | 7.6 | — |
+| donut | 5 | 66k | 2.25 | 0.52 | 4.3× | 34.4 | 7.9 |
+| donut | 6 | 524k | 4.05 | 1.27 | 3.2× | 7.7 | 2.4 |
+| jelly-biotsavart | 5 | 131k | 5.45 | 2.03 | 2.7× | 41.6 | 15.5 |
+| jelly-biotsavart | 6 | 1.0M | 13.43 | 5.09 | 2.6× | 12.8 | 4.9 |
+| jelly-biotsavart | 7 | 8.4M | 65.90 | 24.68 | 2.7× | 7.9 | 2.9 |
 
-The last column is the reference time with WaterLily 1.10.0 and CUDA.jl 6.4.2 from the table
-below. TurboLily times are 2–6 % above that table (CUDA.jl 6.4.2 then), which may be the host load.
+- **Speedup:** 2.6–6.9× over all sizes, 2.7–4.5× from 2M cells up.
+- **Against WaterLily 1.10:** compared with WaterLily 1.10.0 and CUDA.jl 6.4.2 (table below), the
+  WaterLily reference is 7–28 % faster, most on small grids, and the BiotSavartBCs reference 2–17 %.
+  TurboLily times are within −7 % to +2 % of that table.
 
 ### A10, WaterLily 1.10.0
 

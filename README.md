@@ -574,7 +574,7 @@ with WaterLily or BiotSavartBCs on the CPU, and requires agreement to rounding.
 module per file) on `TurboLily.Simulation`: bodies, flow (Taylor-Green, body forces, rotating
 frame, added mass, deforming bodies), Float32, metrics, `udf`, I/O extensions and the rest.
 The copies differ from upstream only where TurboLily cannot do what the test does, and every
-change is commented in place. The result is 422 passed and 4 broken, no failures.
+change is commented in place. Nothing fails; the tests marked broken are the ones listed below.
 
 What the suite shows TurboLily does not do (the broken tests, and the changes to the copies):
 

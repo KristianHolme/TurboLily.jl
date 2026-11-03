@@ -445,7 +445,7 @@ end
     end
 end
 
-include("waterlily_tests.jl")
+include("waterlily_suite.jl")
 
 function fill_k!(lo, hi, a)
     I, ok = TurboLily.cellidx(lo, hi)

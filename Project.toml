@@ -19,7 +19,12 @@ WaterLily = "~1.11"
 julia = "1.11"
 
 [extras]
+ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
+GPUArrays = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
+JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+ReadVTK = "dc215faf-f008-4882-a9f7-a79a826fadc3"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+WriteVTK = "64499a7a-5c06-52f2-abe2-ccb03c286192"
 
 [targets]
-test = ["Test"]
+test = ["ForwardDiff", "GPUArrays", "JLD2", "ReadVTK", "Test", "WriteVTK"]

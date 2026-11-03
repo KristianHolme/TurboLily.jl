@@ -570,9 +570,20 @@ NVLink):
 
 The tests need a CUDA GPU. `test/runtests.jl` steps every case with TurboLily on the GPU and
 with WaterLily or BiotSavartBCs on the CPU, and requires agreement to rounding.
-`test/waterlily_tests.jl` runs WaterLily's own simulation tests (Taylor-Green decay, body
-forces, rotating frame, added mass, moving and deforming bodies, forces, `MeanFlow`) on
-`TurboLily.Simulation`.
+`test/waterlily_suite.jl` runs WaterLily 1.11.0's own test files (`test/waterlily/`, one
+module per file) on `TurboLily.Simulation`: bodies, flow (Taylor-Green, body forces, rotating
+frame, added mass, deforming bodies), Float32, metrics, `udf`, I/O extensions and the rest.
+The copies differ from upstream only where TurboLily cannot do what the test does, and every
+change is commented in place. The result is 422 passed and 4 broken, no failures.
+
+What the suite shows TurboLily does not do (the broken tests, and the changes to the copies):
+
+- Float32 only. `T=Float64` raises an `ArgumentError`, so tests that use Float64 run in Float32 (same tolerances) or check the error (`test_bodies.jl`).
+- CUDA arrays only. Simulations with `mem=Array`, and AMDGPU or Metal arrays, are not supported: the suite's CPU references are WaterLily itself.
+- No automatic differentiation through a simulation: a `ForwardDiff.Dual` element type is rejected (3 broken tests in `test_forwarddiff.jl`).
+- The multigrid solver has its own layout: WaterLily's `pois.levels[1].r`, `.iD` and `residual!` do not exist (1 broken test in `test_flow.jl`).
+- `test_alloc.jl` is not run: it needs WaterLily's SIMD backend.
+- `test_core.jl`, `test_util.jl` and `test_poisson.jl` test WaterLily's own CPU code, not TurboLily's.
 
 ```sh
 julia --project -e 'using Pkg; Pkg.test()'

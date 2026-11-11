@@ -22,7 +22,10 @@ function Simulation end
 
 Same signature as `WaterLily.Simulation`; arrays live on the current CUDA device.
 """
-Simulation(args...; mem=CuArray, kwargs...) = WaterLily.Simulation(args...; mem=CuArray,
-    flow_ctor=(dims,uBC;kw...)->TFlow(dims,uBC;kw...), pois_ctor=TPoisson, kwargs...)
+function Simulation(args...; mem=CuArray, kwargs...)
+    check_mem(mem)
+    return WaterLily.Simulation(args...; mem=CuArray,
+        flow_ctor=(dims,uBC;kw...)->TFlow(dims,uBC;kw...), pois_ctor=TPoisson, kwargs...)
+end
 
 end # module

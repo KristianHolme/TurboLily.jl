@@ -166,6 +166,15 @@ function set_reg!(lv::Level{D,T}) where {D,T}
     lv.op = Op(op.L, op.Dg, op.iD, op.reg, Lreg, Dreg, inv(Dreg), g, op.per)
 end
 
+# Slots of the solver's reduction buffer `red` (see `RedBuf`); biot.jl uses slots 5 to 8.
+const SLOT_RSUM = 1       # Σr of the fine residual set by the caller of `solve!`
+const SLOT_R0 = 2         # Σ|r|, max|r| of the corrected residual before the first iteration
+const SLOT_R = 3          # Σ|r|, max|r| after an iteration
+const SLOT_PROJ_CFL = 4   # max of the CFL flux of the projected velocity (`cfl!`)
+
+# key of a cached graph: (`iteration!` flags, objectid of the fine residual buffer)
+const GraphKey = Tuple{NTuple{3,Bool},UInt}
+
 """
     TPoisson
 
@@ -183,21 +192,21 @@ struct TPoisson{T,S,V,D,R,P} <: AbstractPoisson{T,S,V}
     per :: P
     n :: Vector{Int16}
     perdir :: NTuple
-    nsolve :: Base.RefValue{Int}     # number of solved rows (count(!iszero, iD))
     red :: RedBuf
     ωd :: CuVector{Float32}          # [ω, r₁]: relaxation and previous Σ|r| (device side)
     fixd :: CuVector{Float32}        # [s, tiny] for the lazy residual correction, s = Σr/nsolve
     nsd :: CuVector{Float64}         # number of solved rows, count(iD≠0), on the device
-    graphs :: Dict{Any,CuGraphExec}
-    seen :: Set{Any}
+    graphs :: Dict{GraphKey,Union{Nothing,CuGraphExec}}   # see `graphed!`
+    seen :: Set{GraphKey}
 end
 function TPoisson(x::AbstractArray{T,D}, L, z; perdir=()) where {T,D}
     ml = MultiLevelPoisson(x, L, z; perdir)
     nl = length(ml.levels)
     per = Per(ntuple(j->j ∈ perdir, D))
     levels = [Level(ml.levels[l], l < nl ? coarsen_mask(ml.levels[l].x, ml.levels[l+1].x) : ntuple(_->false,D), per) for l in 1:nl]
-    p = TPoisson{T,typeof(x),typeof(L),D,typeof(levels[1].op.reg),typeof(per)}(x, L, z, ml, levels, per, Int16[], perdir, Ref(0), RedBuf(Grid(x)),
-        CUDA.ones(Float32, 2), CUDA.zeros(Float32, 2), CUDA.zeros(Float64, 1), Dict{Any,CuGraphExec}(), Set{Any}())
+    p = TPoisson{T,typeof(x),typeof(L),D,typeof(levels[1].op.reg),typeof(per)}(x, L, z, ml, levels, per, Int16[], perdir, RedBuf(Grid(x)),
+        CUDA.ones(Float32, 2), CUDA.zeros(Float32, 2), CUDA.zeros(Float64, 1),
+        Dict{GraphKey,Union{Nothing,CuGraphExec}}(), Set{GraphKey}())
     finish_update!(p)
 end
 TPoisson(flow::AbstractFlow) = TPoisson(flow.p, flow.μ₀, flow.σ; perdir=flow.perdir)
@@ -211,7 +220,7 @@ end
 struct RiD{S,O}; r::S; op::O; end
 @inline (f::RiD)(I, l) = @inbounds(f.r[l])*getiD(f.op, l)
 # Jacobi at cell I: ϵ=r·iD, new residual r-Aϵ into rn (returned), x += ϵ
-@inline function jacobi_cell!(I, rn, r, x, op::Op, assign::Bool)
+@inline function jacobi_cell!(I, rn, r, x, op::Op)
     l = lin(op.g, I)
     pr = Pre(AV(r), op, I, l)
     if isdeep(op, l)
@@ -224,12 +233,12 @@ struct RiD{S,O}; r::S; op::O; end
         w = @inbounds(r[l]) - mult_f(op, I, l, f)
     end
     @inbounds rn[l] = w
-    @inbounds x[l] = assign ? e : x[l] + e
+    @inbounds x[l] += e
     return w
 end
-function k_jacobi!(lo, hi, rn, r, x, op::Op, assign::Bool, fr)
+function k_jacobi!(lo, hi, rn, r, x, op::Op, fr)
     I, ok = cellidx(lo, hi)
-    w = ok ? jacobi_cell!(I, rn, r, x, op, assign) : 0f0
+    w = ok ? jacobi_cell!(I, rn, r, x, op) : 0f0
     restrict_block!(fr, I, ok, w)
     return nothing
 end
@@ -324,7 +333,6 @@ end
     @inbounds x[l] += ω*e
     return nothing
 end
-# increment with stored ϵ (optionally the block partials of Σ|r|, max|r|)
 # increment with stored ϵ (optionally the block partials of Σ|r| and max|r|; with `exclb`
 # the max skips the cells next to the domain boundary, which a Biot-Savart update changes)
 function k_incr!(lo, hi, ps, pm, r, x, ϵ, op::Op{D}, ωd, ::Val{norms}, ::Val{exclb}) where {D, norms, exclb}
@@ -412,82 +420,115 @@ Base.size(::Flag) = (1,)
 @inline withflag(op::Op, f::UInt8) = Op(op.L, op.Dg, op.iD, Flag(f), op.Lreg, op.Dreg, op.iDreg, op.g, op.per)
 # index k in direction j as the cell it stands for (wrapped in a periodic direction)
 @inline wrapk(k, n, per::Bool) = per ? (k < Int32(2) ? k + n - Int32(2) : k > n - i32 ? k - n + Int32(2) : k) : k
-@inline function gs2_ld(ϵi, r, op, act, lc, z, n3, sz)
+# (r, regular flag, ϵ) of the column starting at `lcol` on plane z (zeros outside the array)
+@inline function gs2_ld(ϵi, r, op, inarray, lcol, z, n3, sz)
     z = wrapk(z, n3, op.per[3])
-    ok = act & (z >= i32) & (z <= n3)
-    l = lc + (z - i32)*sz
+    ok = inarray & (z >= i32) & (z <= n3)
+    l = lcol + (z - i32)*sz
     return (ok ? @inbounds(r[l]) : 0f0), (ok ? @inbounds(op.reg[l]) : 0x00), (ok ? @inbounds(ϵi[l]) : 0f0)
 end
+# ϵ of the neighbour outside the tile, at offset `off` from cell `l` (0 where there is none)
+@inline gs2_halo(ϵi, l, off, ok) = (ok & (off != 0)) ? @inbounds(ϵi[l + off]) : 0f0
+# Each thread owns one x-y column and walks up its z planes. At plane z it holds, in registers,
+# the values of its column around z (suffixes: `_dn` = z-1, `_c` = z, `_up` = z+1, `_up2` = z+2):
+#   e_*    ϵ before the sweeps        r_*, f_*   residual and regular flag
+#   red_*  ϵ after the red half sweep (`red_dn2` = z-2)
+#   hx, hy ϵ of the neighbour outside the tile in x and y (edge threads only)
+# and the block shares, per plane, ϵ before the sweeps (`plane`) and after the red half sweep
+# of planes z and z-1 (`redp`, two alternating slots).
 function k_gs2!(ϵi, ϵo, r, op::Op{3}, k0::Int32)
     TX, TY, CH = Int32(GS2_TX), Int32(GS2_TY), Int32(GS2_CH)
     g = op.g; n1, n2, n3 = g.n; sy, sz = g.s[2], g.s[3]
-    Sin = CuStaticSharedArray(Float32, (GS2_TX, GS2_TY))
-    SE = CuStaticSharedArray(Float32, (GS2_TX, GS2_TY, 2))
+    plane = CuStaticSharedArray(Float32, (GS2_TX, GS2_TY))
+    redp = CuStaticSharedArray(Float32, (GS2_TX, GS2_TY, 2))
+
+    # ---- the column of this thread. Tiles overlap by two columns: the first and last thread
+    # in x and y hold the halo (tx=1 is the column left of the tile's first cell).
     tx = threadIdx().x; ty = threadIdx().y
-    x = (blockIdx().x - i32)*(TX - Int32(2)) + tx          # tx=1 is the halo column x0-1
+    x = (blockIdx().x - i32)*(TX - Int32(2)) + tx
     y = (blockIdx().y - i32)*(TY - Int32(2)) + ty
-    zc0 = Int32(2) + (blockIdx().z - i32)*CH
-    zc1 = min(zc0 + CH - i32, n3 - i32)
-    act = (x <= n1) & (y <= n2)
-    outt = act & (x >= Int32(2)) & (x <= n1 - i32) & (y >= Int32(2)) & (y <= n2 - i32) &
-           (tx > i32) & (tx < TX) & (ty > i32) & (ty < TY)
-    # the last active column or row (index n) has its upper neighbour outside the tile too
-    xl = tx == i32; xr = (tx == TX) | (x == n1)
-    yl = ty == i32; yr = (ty == TY) | (y == n2)
+    zfirst = Int32(2) + (blockIdx().z - i32)*CH             # the z chunk of this block
+    zlast = min(zfirst + CH - i32, n3 - i32)
+    inarray = (x <= n1) & (y <= n2)
+    # this thread writes its column: an interior cell that is not in the halo of the tile
+    writes = inarray & (x >= Int32(2)) & (x <= n1 - i32) & (y >= Int32(2)) & (y <= n2 - i32) &
+             (tx > i32) & (tx < TX) & (ty > i32) & (ty < TY)
+    # edge threads: one neighbour is outside the tile (the last active column or row, index n,
+    # has its upper neighbour outside the tile too)
+    xlo = tx == i32; xhi = (tx == TX) | (x == n1)
+    ylo = ty == i32; yhi = (ty == TY) | (y == n2)
     x = wrapk(x, n1, op.per[1]); y = wrapk(y, n2, op.per[2])     # the cell this column stands for
-    inxy = act & (x >= Int32(2)) & (x <= n1 - i32) & (y >= Int32(2)) & (y <= n2 - i32)
+    interior = inarray & (x >= Int32(2)) & (x <= n1 - i32) & (y >= Int32(2)) & (y <= n2 - i32)
     # offset of the neighbour outside the tile (edge threads), wrapped as nbm/nbp
-    ho = xl ? (op.per[1] & (x == Int32(2)) ? (n1-Int32(3)) : -i32) :
-         xr ? (op.per[1] & (x == n1 - i32) ? -(n1-Int32(3)) : i32) : Int32(0)
-    vo = yl ? (op.per[2] & (y == Int32(2)) ? (n2-Int32(3))*sy : -sy) :
-         yr ? (op.per[2] & (y == n2 - i32) ? -(n2-Int32(3))*sy : sy) : Int32(0)
-    lc = act ? lin(g, (x, y, i32)) : i32                 # this column at z=1
-    _, _, em = gs2_ld(ϵi, r, op, act, lc, zc0 - Int32(2), n3, sz)
-    r0, f0, e0 = gs2_ld(ϵi, r, op, act, lc, zc0 - i32, n3, sz)
-    r1, f1, ep = gs2_ld(ϵi, r, op, act, lc, zc0, n3, sz)
-    z0 = wrapk(zc0 - i32, n3, op.per[3])
-    l0 = lc + (z0 - i32)*sz
-    ok0 = inxy & (z0 >= Int32(2))
-    hh = (ok0 & (ho != 0)) ? @inbounds(ϵi[l0 + ho]) : 0f0
-    hv = (ok0 & (vo != 0)) ? @inbounds(ϵi[l0 + vo]) : 0f0
-    Em2 = 0f0; Em1 = 0f0; rprev = 0f0; fprev = 0x00
-    for zz in zc0-i32:zc1+i32
-        zw = wrapk(zz, n3, op.per[3])                       # the plane zz stands for
-        l = lc + (zw - i32)*sz
-        @inbounds Sin[tx, ty] = e0
-        r2, f2, epn = gs2_ld(ϵi, r, op, act, lc, zz + Int32(2), n3, sz)
-        zn = wrapk(zz + i32, n3, op.per[3])
-        okn = inxy & (zn >= Int32(2)) & (zn <= n3 - i32)
-        ln = lc + (zn - i32)*sz
-        hhn = (okn & (ho != 0)) ? @inbounds(ϵi[ln + ho]) : 0f0
-        hvn = (okn & (vo != 0)) ? @inbounds(ϵi[ln + vo]) : 0f0
+    xoff = xlo ? (op.per[1] & (x == Int32(2)) ? (n1-Int32(3)) : -i32) :
+           xhi ? (op.per[1] & (x == n1 - i32) ? -(n1-Int32(3)) : i32) : Int32(0)
+    yoff = ylo ? (op.per[2] & (y == Int32(2)) ? (n2-Int32(3))*sy : -sy) :
+           yhi ? (op.per[2] & (y == n2 - i32) ? -(n2-Int32(3))*sy : sy) : Int32(0)
+    lcol = inarray ? lin(g, (x, y, i32)) : i32               # this column at z=1
+
+    # ---- fill the registers for the first plane of the loop, z = zfirst-1
+    _, _, e_dn = gs2_ld(ϵi, r, op, inarray, lcol, zfirst - Int32(2), n3, sz)
+    r_c, f_c, e_c = gs2_ld(ϵi, r, op, inarray, lcol, zfirst - i32, n3, sz)
+    r_up, f_up, e_up = gs2_ld(ϵi, r, op, inarray, lcol, zfirst, n3, sz)
+    zw = wrapk(zfirst - i32, n3, op.per[3])
+    l = lcol + (zw - i32)*sz
+    ok = interior & (zw >= Int32(2))
+    hx = gs2_halo(ϵi, l, xoff, ok)
+    hy = gs2_halo(ϵi, l, yoff, ok)
+    red_dn2 = 0f0; red_dn = 0f0; r_dn = 0f0; f_dn = 0x00
+
+    # ---- march: red half sweep at plane z, black half sweep at plane z-1. The loop starts
+    # one plane below the chunk and ends one above, as the black sweep reads the red values
+    # of both z neighbours.
+    for z in zfirst-i32:zlast+i32
+        zw = wrapk(z, n3, op.per[3])                        # the plane z stands for
+        l = lcol + (zw - i32)*sz
+        # share this plane and, while the block synchronises, load what the next plane needs
+        @inbounds plane[tx, ty] = e_c
+        r_up2, f_up2, e_up2 = gs2_ld(ϵi, r, op, inarray, lcol, z + Int32(2), n3, sz)
+        zn = wrapk(z + i32, n3, op.per[3])
+        okn = interior & (zn >= Int32(2)) & (zn <= n3 - i32)
+        ln = lcol + (zn - i32)*sz
+        hx_up = gs2_halo(ϵi, ln, xoff, okn)
+        hy_up = gs2_halo(ϵi, ln, yoff, okn)
         sync_threads()
-        E = e0
-        if inxy & (zw >= Int32(2)) & (zw <= n3 - i32) & isodd(x + y + zw + k0)
-            xm = xl ? hh : @inbounds(Sin[tx-1, ty])
-            xp = (xr & !xl) ? hh : @inbounds(Sin[tx+1, ty])
-            ym = yl ? hv : @inbounds(Sin[tx, ty-1])
-            yp = (yr & !yl) ? hv : @inbounds(Sin[tx, ty+1])
-            I = (x, y, zw); o = withflag(op, f0)
-            E = (r0 - offdiag_f(o, I, l, NBV(I, xm, xp, ym, yp, em, ep)))*getiD(o, l)
+
+        # red half sweep (colour k0) at plane z: all six neighbours hold ϵ from before the sweeps
+        red_c = e_c
+        if interior & (zw >= Int32(2)) & (zw <= n3 - i32) & isodd(x + y + zw + k0)
+            xm = xlo ? hx : @inbounds(plane[tx-1, ty])
+            xp = (xhi & !xlo) ? hx : @inbounds(plane[tx+1, ty])
+            ym = ylo ? hy : @inbounds(plane[tx, ty-1])
+            yp = (yhi & !ylo) ? hy : @inbounds(plane[tx, ty+1])
+            I = (x, y, zw); o = withflag(op, f_c)
+            red_c = (r_c - offdiag_f(o, I, l, NBV(I, xm, xp, ym, yp, e_dn, e_up)))*getiD(o, l)
         end
-        b = (zz & i32) + i32
-        @inbounds SE[tx, ty, b] = E
+        slot = (z & i32) + i32                               # alternates between planes
+        @inbounds redp[tx, ty, slot] = red_c
         sync_threads()
-        zb = zz - i32
-        if outt & (zb >= zc0)
-            lb = lc + (zb - i32)*sz
-            v = Em1
+
+        # black half sweep (colour k0+1) at plane z-1: all six neighbours are red-swept. The
+        # in-plane ones come from the other slot of `redp`, written one plane ago.
+        zb = z - i32
+        if writes & (zb >= zfirst)
+            lb = lcol + (zb - i32)*sz
+            v = red_dn
             if iseven(x + y + zb + k0)
-                bo = Int32(3) - b
-                I = (x, y, zb); o = withflag(op, fprev)
-                v = (rprev - offdiag_f(o, I, lb, NBV(I, @inbounds(SE[tx-1, ty, bo]), @inbounds(SE[tx+1, ty, bo]),
-                        @inbounds(SE[tx, ty-1, bo]), @inbounds(SE[tx, ty+1, bo]), Em2, E)))*getiD(o, lb)
+                below = Int32(3) - slot
+                I = (x, y, zb); o = withflag(op, f_dn)
+                nb = NBV(I, @inbounds(redp[tx-1, ty, below]), @inbounds(redp[tx+1, ty, below]),
+                         @inbounds(redp[tx, ty-1, below]), @inbounds(redp[tx, ty+1, below]), red_dn2, red_c)
+                v = (r_dn - offdiag_f(o, I, lb, nb))*getiD(o, lb)
             end
             @inbounds ϵo[lb] = v
         end
-        Em2 = Em1; Em1 = E; em = e0; e0 = ep; ep = epn
-        rprev = r0; fprev = f0; r0 = r1; f0 = f1; r1 = r2; f1 = f2; hh = hhn; hv = hvn
+
+        # move the registers up one plane
+        red_dn2 = red_dn; red_dn = red_c
+        e_dn = e_c; e_c = e_up; e_up = e_up2
+        r_dn = r_c; r_c = r_up; r_up = r_up2
+        f_dn = f_c; f_c = f_up; f_up = f_up2
+        hx = hx_up; hy = hy_up
     end
     return nothing
 end
@@ -530,7 +571,7 @@ struct RcD{S,O}; rc::Rc{S,O}; end
 end
 # s = Σr/nsolve, once per solve (a Float64 division per thread is slow on GeForce cards)
 function k_mkfix!(fixd, sums, nsd)
-    @inbounds fixd[1] = Float32(sums[1] / nsd[1])
+    @inbounds fixd[1] = Float32(sums[SLOT_RSUM] / nsd[1])
     return nothing
 end
 # Jacobi on the corrected residual; partial Σ|rc|, max|rc| (the initial residual norms)
@@ -558,9 +599,9 @@ function k_jacobi_fix!(lo, hi, ps, pm, rn, r, x, op::Op, fixd, fr)
 end
 
 # ---------------------------------------------------------------- solver pieces
-function jacobi!(lv::Level, assign::Bool=false, fr=nothing)
+function jacobi!(lv::Level, fr=nothing)
     g = lv.op.g
-    launch(k_jacobi!, inside_lo(g), inside_hi(g), lv.ϵ, lv.r, lv.x, lv.op, assign, fr)
+    launch(k_jacobi!, inside_lo(g), inside_hi(g), lv.ϵ, lv.r, lv.x, lv.op, fr)
     lv.r, lv.ϵ = lv.ϵ, lv.r
 end
 gs_range(g::Grid{D}) where D = (inside_lo(g), ntuple(d-> d==D ? cld(Int(g.n[d]),2) : Int(g.n[d])-1, D))
@@ -597,22 +638,22 @@ function smooth!(lv::Level{D,T}, ωd, red::RedBuf, norms::Bool=false; it=4, excl
         end
     end
     if norms
-        red_launch(k_incr!, inside_lo(g), inside_hi(g), red, 3, lv.r, lv.x, lv.ϵ, lv.op, ωd, Val(true), Val(exclb))
+        red_launch(k_incr!, inside_lo(g), inside_hi(g), red, SLOT_R, lv.r, lv.x, lv.ϵ, lv.op, ωd, Val(true), Val(exclb))
     else
         launch(k_incr!, inside_lo(g), inside_hi(g), red.ps, red.pm, lv.r, lv.x, lv.ϵ, lv.op, ωd, Val(false), Val(false))
     end
 end
-# V-cycle below level l; `fix` = (nsolve, tiny): the fine residual still needs the
-# global correction, which is applied inside the fine Jacobi (norms into slot 2)
-function vcycle!(p::TPoisson{T}, l, fix=nothing; assign=false) where T
+# V-cycle below level l. With `fix`, the fine residual still needs the global correction
+# (see `Rc`), which is applied inside the fine Jacobi (norms into SLOT_R0).
+function vcycle!(p::TPoisson{T}, l, fix::Bool=false) where T
     fine, coarse = p.levels[l], p.levels[l+1]
     fr = fused_restrict(fine, coarse)
-    if fix === nothing
-        jacobi!(fine, assign, fr)
+    if !fix
+        jacobi!(fine, fr)
     else
         g = fine.op.g
         @cuda k_mkfix!(p.fixd, p.red.s, p.nsd)
-        red_launch(k_jacobi_fix!, inside_lo(g), inside_hi(g), p.red, 2, fine.ϵ, fine.r, fine.x, fine.op, p.fixd, fr)
+        red_launch(k_jacobi_fix!, inside_lo(g), inside_hi(g), p.red, SLOT_R0, fine.ϵ, fine.r, fine.x, fine.op, p.fixd, fr)
         fine.r, fine.ϵ = fine.ϵ, fine.r
     end
     gc = coarse.op.g
@@ -650,7 +691,7 @@ end
 @inline function b_jacobi!(op::Op, rn, r, x)
     lo, e = inner(op.g); k = threadIdx().x - i32
     while k < boxlen(e)
-        jacobi_cell!(unravel(k, lo, e), rn, r, x, op, false)
+        jacobi_cell!(unravel(k, lo, e), rn, r, x, op)
         k += blockDim().x
     end
     sync_threads()
@@ -732,11 +773,12 @@ function bottom!(p::TPoisson, lb)
     end
 end
 
-# ω update on the device (WaterLily.solver! rule); r₁ comes from slot 2 on the first iteration
+# ω update on the device (WaterLily.solver! rule); the previous Σ|r| is the initial one
+# (SLOT_R0) on the first iteration
 function k_omega!(ωd, sums, first::Bool)
     ω = @inbounds ωd[1]
-    r₁ = first ? Float32(@inbounds(sums[2])) : @inbounds(ωd[2])
-    rnew = Float32(@inbounds(sums[3]))
+    r₁ = first ? Float32(@inbounds(sums[SLOT_R0])) : @inbounds(ωd[2])
+    rnew = Float32(@inbounds(sums[SLOT_R]))
     @inbounds ωd[1] = rnew ≥ r₁ ? max(0.2f0, 0.9f0ω) : min(1f0, 1.02f0ω)
     @inbounds ωd[2] = rnew
     return nothing
@@ -744,61 +786,81 @@ end
 swap_levels!(p::TPoisson) = for l in 1:length(p.levels)-1
     lv = p.levels[l]; lv.r, lv.ϵ = lv.ϵ, lv.r
 end
+# CUDA.jl's kernel compile/load lock (internal to CUDA.jl, so looked up defensively);
+# `nothing` if this CUDA.jl version has none under a known name
+const CUFUNCTION_LOCK = isdefined(CUDA, :cufunction_lock) ? CUDA.cufunction_lock :
+    isdefined(CUDA, :CUDACore) && isdefined(CUDA.CUDACore, :cufunction_lock) ?
+    CUDA.CUDACore.cufunction_lock : nothing
 """
     graphed!(f, p, key)
 
 Run `f()` (a fixed sequence of launches that swaps the level buffers like one V-cycle)
 through a cached CUDA graph: plain execution the first time a (key, buffer state) is
-seen, capture on the second, graph replay afterwards.
+seen, capture on the second, graph replay afterwards. If the capture fails, that
+(key, buffer state) keeps running `f()` plainly.
 """
-# (internal to CUDA.jl, looked up defensively)
-const CUFUNCTION_LOCK = isdefined(CUDA, :cufunction_lock) ? CUDA.cufunction_lock :
-    isdefined(CUDA, :CUDACore) && isdefined(CUDA.CUDACore, :cufunction_lock) ?
-    CUDA.CUDACore.cufunction_lock : ReentrantLock()
 function graphed!(f::F, p::TPoisson, key) where F
     k = (key, objectid(p.levels[1].r))
-    ex = get(p.graphs, k, nothing)
-    if ex !== nothing
-        CUDA.launch(ex); swap_levels!(p)
-    elseif k in p.seen
-        state = [(lv.r, lv.ϵ) for lv in p.levels]
-        # Capture on a private non-blocking stream in relaxed mode, so that CUDA calls of
-        # other tasks (possibly scheduled on this thread, possibly on the legacy stream)
-        # cannot touch or depend on the capturing stream. Nothing runs during a capture;
-        # the graph is launched on the task's stream. No GC during the capture: a
-        # finalizer freeing GPU memory would be captured too.
-        # CUDA.jl's kernel compile/load lock is held too: loading a module while a stream
-        # is capturing fails, and CUDA.jl's retry synchronizes the device.
-        cs = CuStream(; flags=CUDA.STREAM_NON_BLOCKING)
-        gc = GC.enable(false)
-        g = try
-            lock(CUFUNCTION_LOCK) do
-                CUDA.stream!(cs) do
-                    CUDA.capture(f; flags=CUDA.STREAM_CAPTURE_MODE_RELAXED, throw_error=false)
-                end
-            end
-        catch
-            nothing
-        finally
-            GC.enable(gc)
-        end
-        if g === nothing   # capture failed: restore the buffers and run normally
-            for (lv, (r, ϵ)) in zip(p.levels, state); lv.r, lv.ϵ = r, ϵ; end
+    if haskey(p.graphs, k)
+        ex = p.graphs[k]
+        if ex === nothing           # the capture failed earlier
             f()
         else
-            ex = CUDA.instantiate(g)
-            p.graphs[k] = ex
-            CUDA.launch(ex)
+            CUDA.launch(ex); swap_levels!(p)
         end
+    elseif k in p.seen
+        ex = capture_graph(f, p)    # `f` ran on the host here, so the level buffers are swapped
+        p.graphs[k] = ex
+        ex === nothing ? f() : CUDA.launch(ex)
     else
         push!(p.seen, k); f()
     end
     return nothing
 end
+"""
+    capture_graph(f, p)
+
+Capture the launches of `f()` into a CUDA graph and return its executable, or `nothing`
+(with the level buffers of `p` as before the call) if the capture is not possible.
+"""
+function capture_graph(f::F, p::TPoisson) where F
+    if CUFUNCTION_LOCK === nothing
+        @warn "TurboLily: CUDA.jl's kernel compile lock was not found; the multigrid cycles run without CUDA graphs" maxlog=1
+        return nothing
+    end
+    state = [(lv.r, lv.ϵ) for lv in p.levels]
+    # Capture on a private non-blocking stream in relaxed mode, so that CUDA calls of
+    # other tasks (possibly scheduled on this thread, possibly on the legacy stream)
+    # cannot touch or depend on the capturing stream. Nothing runs during a capture;
+    # the graph is launched on the task's stream. No GC during the capture: a
+    # finalizer freeing GPU memory would be captured too.
+    # CUDA.jl's kernel compile/load lock is held too: loading a module while a stream
+    # is capturing fails, and CUDA.jl's retry synchronizes the device.
+    cs = CuStream(; flags=CUDA.STREAM_NON_BLOCKING)
+    gc = GC.enable(false)
+    g = try
+        lock(CUFUNCTION_LOCK) do
+            CUDA.stream!(cs) do
+                CUDA.capture(f; flags=CUDA.STREAM_CAPTURE_MODE_RELAXED, throw_error=false)
+            end
+        end
+    catch err
+        err isa InterruptException && rethrow()
+        @debug "TurboLily: CUDA graph capture failed" exception=err
+        nothing
+    finally
+        GC.enable(gc)
+    end
+    if g === nothing
+        for (lv, (r, ϵ)) in zip(p.levels, state); lv.r, lv.ϵ = r, ϵ; end
+        return nothing
+    end
+    return CUDA.instantiate(g)
+end
 # one multigrid iteration: V-cycle, fine smoothing with norms (Σ|r|, max|r|) into slot 3, ω update
-function iteration!(p::TPoisson; fix=false, assign=false, exclb=false, adapt=true)
-    graphed!(p, (fix, assign, exclb, adapt)) do
-        vcycle!(p, 1, fix ? true : nothing; assign)
+function iteration!(p::TPoisson; fix=false, exclb=false, adapt=true)
+    graphed!(p, (fix, exclb, adapt)) do
+        vcycle!(p, 1, fix)
         smooth!(p.levels[1], p.ωd, p.red, true; exclb)
         adapt && @cuda k_omega!(p.ωd, p.red.s, fix)
     end
@@ -808,7 +870,7 @@ end
     solve!(p::TPoisson, scale; tol=2e-3, itmx=32)
 
 Multigrid iterations on `A x = z` where the level-1 residual `r` (uncorrected, with its
-sum in `p.red.s[1]`) was set by the caller. Convergence is tested on `scale·r`, so a
+sum in slot `SLOT_RSUM` of `p.red`) was set by the caller. Convergence is tested on `scale·r`, so a
 caller solving for `p = x/Δt` passes `scale = Δt` and WaterLily's tolerances keep their meaning.
 """
 function solve!(p::TPoisson{T}, scale; tol=2e-3, itmx=32) where T
@@ -820,8 +882,8 @@ function solve!(p::TPoisson{T}, scale; tol=2e-3, itmx=32) where T
     while nᵖ < itmx
         iteration!(p; fix = nᵖ == 0)
         fetch!(p.red)
-        nᵖ == 0 && @log ", 0, $(getmax(p.red,2)*scale), $(getsum(p.red,2)*scale)\n"
-        rnew, r∞ = getsum(p.red,3), getmax(p.red,3); nᵖ += 1
+        nᵖ == 0 && @log ", 0, $(getmax(p.red,SLOT_R0)*scale), $(getsum(p.red,SLOT_R0)*scale)\n"
+        rnew, r∞ = getsum(p.red,SLOT_R), getmax(p.red,SLOT_R); nᵖ += 1
         @log ", $nᵖ, $(r∞*scale), $(rnew*scale)\n"
         (rnew < r₁tol && r∞ < r∞tol) && break
     end
@@ -842,7 +904,7 @@ function k_residual!(lo, hi, ps, pm, r, z, x, op::Op)
 end
 function WaterLily.solver!(p::TPoisson; tol=2e-3, itmx=32)
     lv = p.levels[1]; g = lv.op.g
-    red_launch(k_residual!, inside_lo(g), inside_hi(g), p.red, 1, lv.r, lv.z, lv.x, lv.op)
+    red_launch(k_residual!, inside_lo(g), inside_hi(g), p.red, SLOT_RSUM, lv.r, lv.z, lv.x, lv.op)
     solve!(p, 1; tol, itmx)
 end
 
@@ -986,7 +1048,7 @@ function k_proj_cfl!(lo, hi, ps, pm, unew, uold, x, op::Op{D}, dt::T, bc::B, t::
 end
 # (WaterLily ≥ 1.9.1: domain BCs at t and the convective exit (predictor) are applied here,
 # and the step is Δt/w with w=1 in the predictor and w=2 in the corrector)
-# `cfl=true`: the CFL flux maximum of the final velocity goes to b.red slot 5 (see `cfl!`),
+# `cfl=true`: the CFL flux maximum of the final velocity goes to SLOT_PROJ_CFL of b.red (see `cfl!`),
 # from the projection kernel, which then writes to `a.f` (swapped into `a.u`)
 # `kwargs` (`tol`, `itmx`) go to `solve!` at scale `Δt/w`, as WaterLily forwards them to `solver!`.
 function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t; cfl=false, kwargs...) where {D,T}
@@ -995,11 +1057,11 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t; cfl=false
     xf === nothing && BC!(a, a.u, t)
     w == 1 && a.exitBC && exitBC!(a, a.u, a.u⁰, a.Δt[end], t)
     dt = a.Δt[end]/T(w); g = a.grid; lv = b.levels[1]
-    red_launch(k_resid_src!, inside_lo(g), inside_hi(g), b.red, 1, lv.r, lv.x, a.u, a.V, lv.op, inv(dt), !a.Vzero, xf)
+    red_launch(k_resid_src!, inside_lo(g), inside_hi(g), b.red, SLOT_RSUM, lv.r, lv.x, a.u, a.V, lv.op, inv(dt), !a.Vzero, xf)
     xf === nothing || BC!(a, a.u, t; jfirst=2)
     solve!(b, dt; kwargs...)
     if cfl
-        red_launch(k_proj_cfl!, inside_lo(g), inside_hi(g), b.red, 5, a.f, a.u, b.x, lv.op, dt, a.bc, T(t), a.exitBC, xf)
+        red_launch(k_proj_cfl!, inside_lo(g), inside_hi(g), b.red, SLOT_PROJ_CFL, a.f, a.u, b.x, lv.op, dt, a.bc, T(t), a.exitBC, xf)
         copy_exit!(a, a.f, a.u)
         a.u, a.f = a.f, a.u
     else
@@ -1008,7 +1070,7 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t; cfl=false
     BC!(a, a.u, t; jfirst = xf === nothing ? 1 : 2)
 end
 "WaterLily.CFL of the velocity projected by `mom_project!(...; cfl=true)`."
-cfl!(a::TFlow, b::TPoisson; Δt_max=10) = (fetch!(b.red); min(Δt_max, inv(getmax(b.red, 5) + 5a.ν)))
+cfl!(a::TFlow, b::TPoisson; Δt_max=10) = (fetch!(b.red); min(Δt_max, inv(getmax(b.red, SLOT_PROJ_CFL) + 5a.ν)))
 
 # Streaming kernels (no shared-memory sums): 32×8×1 blocks are 3–7 % faster than 32×4×2.
 # The Jacobi kernels keep 32×4×2, whose blocks hold whole 2ᵈ coarsening blocks (`FusedR`).

@@ -69,6 +69,7 @@ update like any other face. Faces in periodic directions always do.
 """
 function TFlow(N::NTuple{D}, uBC; T=Float32, mem=CuArray, bdimfaces=(), kw...) where D
     T === Float32 || throw(ArgumentError("TurboLily supports T=Float32 only (got T=$T)"))
+    check_mem(mem)
     f = WaterLily.Flow(N, uBC; T, mem=CuArray, kw...)
     # `f` is swapped into `u` by the corrector: start it with the ghost values of `u`, as
     # cells that no BC writes (domain corners and edges) keep their initial values
@@ -91,10 +92,15 @@ end
 `WaterLily.setproperties(flow; uBC)` as for `WaterLily.Flow`: a new flow sharing all arrays,
 with the kernel-side boundary function and acceleration rebuilt from the new values.
 A tuple `uBC` is converted to the flow's eltype.
+
+`perdir` and `exitBC` cannot be patched: the periodic flags, the BDIM face lists and the
+pressure solver are built from them at construction.
 """
 function WaterLily.setproperties(a::TFlow{D,T}, patch::NamedTuple) where {D,T}
     names = fieldnames(typeof(a))
     all(n -> n in names, keys(patch)) || throw(ArgumentError("TFlow has no field(s) $(setdiff(keys(patch), names))"))
+    fixed = intersect(keys(patch), (:perdir, :exitBC, :per, :bdimlow, :grid))
+    isempty(fixed) || throw(ArgumentError("TFlow field(s) $fixed are set at construction; build a new simulation"))
     nt = merge(NamedTuple{names}(map(n -> getfield(a, n), names)), patch)
     uBC = nt.uBC isa Tuple ? T.(nt.uBC) : nt.uBC
     bc = uBC isa Function ? uBC : ConstBC{D,T}(uBC)
@@ -406,9 +412,15 @@ function copy_exit!(a::TFlow{D}, dst, src) where D
     launch_face(k_copyexit!, lo, hi, 1, dst, src, g)
 end
 
+# Slots of the flow's reduction buffer `a.red` (see `RedBuf`). The CFL maximum shares slot 1
+# with the inlet sum: it uses the max half, the inlet sum the sum half.
+const SLOT_INLET = 1    # Σ u₁ over the inlet plane
+const SLOT_EXIT = 2     # Σ u₁ over the exit plane after the convective update
+const SLOT_CFL = 1      # max of the CFL flux
+
 # Convective exit (WaterLily.exitBC!), in three launches over the plane (block partial sums,
 # reduced on the device), so that all SMs share the strided plane accesses; sums in a.red
-# slots 1 (inlet) and 2 (exit).
+# slots SLOT_INLET and SLOT_EXIT.
 # (the inlet u₁ is the value BC! sets there, so it is evaluated rather than read)
 function k_exitsum!(lo, hi, j, ps, pm, bc::B, t::T) where {B,T}
     I, ok = faceidx(lo, hi, j)
@@ -418,7 +430,7 @@ function k_exitsum!(lo, hi, j, ps, pm, bc::B, t::T) where {B,T}
 end
 function k_exitupd!(lo, hi, j, ps, pm, u, u0, g::Grid, dt::T, sums, np) where T
     I, ok = faceidx(lo, hi, j)
-    U = Float32(@inbounds(sums[1]))/np
+    U = Float32(@inbounds(sums[SLOT_INLET]))/np     # mean inlet velocity
     v = 0f0
     if ok
         l = lin(g, I)
@@ -430,8 +442,8 @@ function k_exitupd!(lo, hi, j, ps, pm, u, u0, g::Grid, dt::T, sums, np) where T
 end
 function k_exitfix!(lo, hi, j, u, g::Grid, sums, np)
     I, ok = faceidx(lo, hi, j); ok || return
-    U = Float32(@inbounds(sums[1]))/np
-    fix = Float32(@inbounds(sums[2]))/np - U
+    U = Float32(@inbounds(sums[SLOT_INLET]))/np
+    fix = Float32(@inbounds(sums[SLOT_EXIT]))/np - U  # mean exit velocity minus mean inlet velocity
     @inbounds u[lin(g, I)] -= fix
     return nothing
 end
@@ -440,10 +452,10 @@ function exitBC!(a::TFlow{D,T}, u, u0, dt, t) where {D,T}
     plane(x) = (ntuple(d-> d == 1 ? x : 2, D), ntuple(d-> d == 1 ? x : Int(g.n[d])-1, D))
     np = Float32(prod(Int.(g.n[2:D]) .- 2))
     nb = launch_face(k_exitsum!, plane(2)..., 1, b.ps, b.pm, a.bc, T(t))
-    finish!(b, nb, b.s, b.m, 1)
+    finish!(b, nb, b.s, b.m, SLOT_INLET)
     lo, hi = plane(Int(g.n[1]))
     nb = launch_face(k_exitupd!, lo, hi, 1, b.ps, b.pm, u, u0, g, T(dt), b.s, np)
-    finish!(b, nb, b.s, b.m, 2)
+    finish!(b, nb, b.s, b.m, SLOT_EXIT)
     launch_face(k_exitfix!, lo, hi, 1, u, g, b.s, np)
     return nothing
 end
@@ -464,9 +476,9 @@ function k_cfl!(lo, hi, ps, pm, u, g::Grid{D}) where D
 end
 function WaterLily.CFL(a::TFlow; Δt_max=10)
     g = a.grid; b = a.red
-    red_launch(k_cfl!, inside_lo(g), inside_hi(g), b, 1, a.u, g)
+    red_launch(k_cfl!, inside_lo(g), inside_hi(g), b, SLOT_CFL, a.u, g)
     fetch!(b)
-    min(Δt_max, inv(getmax(b,1) + 5a.ν))
+    min(Δt_max, inv(getmax(b, SLOT_CFL) + 5a.ν))
 end
 
 # ---------------------------------------------------------------- time step
@@ -568,7 +580,9 @@ function k_zero_u!(lo, hi, u, g::Grid{D}) where D
     return nothing
 end
 function mom_step_udf!(a::TFlow{D,T}, b::AbstractPoisson; udf, poisson_kwargs=(;), kwargs...) where {D,T}
-    a.aux === nothing && (a.aux = similar(a.u))
+    # `aux` is swapped into `u` by the corrector, so it starts as a copy of `u` (as `f` does in
+    # `TFlow`): ghost cells that no kernel writes then hold defined values
+    a.aux === nothing && (a.aux = copy(a.u))
     a.u, a.u⁰ = a.u⁰, a.u
     copy_exit!(a, a.u, a.u⁰)
     t₁ = sum(a.Δt); t₀ = t₁ - a.Δt[end]

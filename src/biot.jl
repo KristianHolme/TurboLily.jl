@@ -23,16 +23,14 @@ struct TBiotPoisson{T,S,V,D,P<:TPoisson,W,G,K} <: AbstractPoisson{T,S,V}
     g :: G                          # NTuple of level grids (level 1 first)
     tar :: Vector{CuVector{Int32}}  # target (face) linear indices per level
     tadj :: CuVector{Int32}         # level-1 targets: the adjacent cell, negated for a lower face
-    p :: S                          # pressure accumulator
     n :: Vector{Int16}
     perdir :: NTuple
-    fmm :: Bool
     red :: RedBuf
     B :: CuVector{Int32}              # cells next to the domain boundary
     own :: Vector{CuVector{Float32}}  # per level, each target's own sum from the last FMM
     near :: Vector{CuVector{Int32}}   # per level, positions in `tar` of the targets that see the body box
     nnear :: Vector{Int}
-    boxes :: Vector{Any}              # per level (lo,hi) body box (empty box: lo > hi)
+    boxes :: Vector{Tuple{NTuple{D,Int},NTuple{D,Int}}}   # per level (lo,hi) body box (empty box: lo > hi)
     bst :: CuVector{Int32}            # [box lo, box hi, near count per level]
     images :: NTuple{K,Int32}         # symmetry planes (faces ±j) with image vortices
 end
@@ -54,15 +52,14 @@ function TBiotPoisson(flow::TFlow{D,T}; nonbiotfaces=(), fmm=true, symmetry=()) 
         i, l, lower = face_of(li, g[1])
         lower ? -(l + g[1].s[i]) : l - g[1].s[i]
     end)
-    p = copy(flow.p)
     # cells next to the domain boundary (the only cells whose residual a Biot update changes)
     n = size(flow.p)
     B = Int32[LinearIndices(n)[I] for I in CartesianIndices(map(m->2:m-1, n)) if any(d->I[d]==2 || I[d]==n[d]-1, 1:D)]
     nl = length(tar)
     b = TBiotPoisson{T,typeof(flow.p),typeof(flow.μ₀),D,typeof(pois),typeof(ω),typeof(g),length(symmetry)}(
-        pois, pois.x, pois.L, pois.z, ω, g, tar, tadj, p, pois.n, flow.perdir, fmm, pois.red,
+        pois, pois.x, pois.L, pois.z, ω, g, tar, tadj, pois.n, flow.perdir, pois.red,
         CuVector{Int32}(B), [CuVector{Float32}(undef, length(t)) for t in tar],
-        [CuVector{Int32}(undef, length(t)) for t in tar], zeros(Int, nl), Any[],
+        [CuVector{Int32}(undef, length(t)) for t in tar], zeros(Int, nl), Tuple{NTuple{D,Int},NTuple{D,Int}}[],
         CuVector{Int32}(undef, 6 + nl), Int32.(Tuple(symmetry)))
     body_box!(b)
     return b
@@ -151,6 +148,13 @@ function body_box!(b::TBiotPoisson{T, S, V, D}) where {T, S, V, D}
     b.nnear .= st[7:6+nl]
     return b
 end
+
+# Slots of the pressure solver's reduction buffer used by the Biot-Savart projection
+# (slots 1 to 4: poisson.jl)
+const SLOT_BIOT_R0 = 5      # Σ|r|, max|r| of the whole residual before the first iteration
+const SLOT_B_BEFORE = 6     # Σ|r| over the boundary cells before a Biot-Savart update
+const SLOT_FLUX = 7         # net change of the boundary flux in a Biot-Savart update
+const SLOT_B_AFTER = 8      # Σ|r|, max|r| over the boundary cells after the update
 
 # velocity accessors: plain u, or the projected u - Δt·L∇p (without writing it)
 struct UA{A}; u::A; nc::Int32; end
@@ -320,8 +324,6 @@ end
     end
     return s
 end
-# Interaction sum at one target of one level (BiotSavartBCs.interaction).
-# P consecutive lanes share a target, splitting the outermost source loop; P ∈ {1,2,4,…,32}.
 # Unscaled interaction sum at target cell T (component i), possibly an image outside the domain.
 @inline function target_sum(T::NTuple{D,Int32}, i, ω, g::Grid{D}, top, bottom, p, P) where D
     c = closeR(Val(D))
@@ -482,9 +484,9 @@ end
 "Σ|r| and max|r| over the whole level-1 residual."
 function norms!(b::TBiotPoisson, r)
     g = b.g[1]
-    red_launch(k_norms!, ntuple(_->1, length(g.n)), Int.(g.n), b.red, 4, r, g)
+    red_launch(k_norms!, ntuple(_->1, length(g.n)), Int.(g.n), b.red, SLOT_BIOT_R0, r, g)
     fetch!(b.red)
-    return getsum(b.red, 4), getmax(b.red, 4)
+    return getsum(b.red, SLOT_BIOT_R0), getmax(b.red, SLOT_BIOT_R0)
 end
 
 # Incompressible & irrotational ghosts (BiotSavartBCs.pflowBC!), one pass per normal direction i
@@ -617,8 +619,8 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w::Int, t; tol=2
     fmm!(b, a.f)
     launch1(k_biotbc!, nt, tar1, b.tadj, a.u, a.f, top.r, U, g, false)
     # residual r = (div(u) - δv·div(V))/Δt - A p (Σr in slot 1), global flux fix, norms
-    red_launch(k_resid_src!, inside_lo(g), inside_hi(g), red, 1, top.r, a.p, a.u, a.V, op, idt, !a.Vzero, nothing)
-    launch1(k_fixresid2!, nt, tar1, b.tadj, a.u, top.r, red.s, Int32(1), dt, idt, g)
+    red_launch(k_resid_src!, inside_lo(g), inside_hi(g), red, SLOT_RSUM, top.r, a.p, a.u, a.V, op, idt, !a.Vzero, nothing)
+    launch1(k_fixresid2!, nt, tar1, b.tadj, a.u, top.r, red.s, Int32(SLOT_RSUM), dt, idt, g)
     r₁, r∞ = norms!(b, top.r)
     nᵖ, nᵇ = 0, 0
     @log ", $nᵖ, $(r∞*dt), $(r₁*dt), $nᵇ\n"
@@ -627,21 +629,23 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w::Int, t; tol=2
         rtol = max(r₁tol, 0.1r₁)
         while nᵖ < itmx
             iteration!(b.pois; exclb=true, adapt=false)
-            fetch!(red); r₁ = getsum(red, 3); nᵖ += 1
+            fetch!(red); r₁ = getsum(red, SLOT_R); nᵖ += 1
             r₁ < rtol && break
         end
-        r₁mg, r∞in = getsum(red, 3), getmax(red, 3)   # max over cells away from the boundary
+        r₁mg, r∞in = getsum(red, SLOT_R), getmax(red, SLOT_R)   # max over cells away from the boundary
         # Biot-Savart update of the boundary velocity with the current p
         body_ω!(b, a.f, a.u, a.p, dt)
         fmm!(b, a.f; update=true)
-        list_norms!(b, b.B, top.r, 5)
+        list_norms!(b, b.B, top.r, SLOT_B_BEFORE)
         nb = cld(nt, 256); checkcap(red, nb)
         @cuda threads=256 blocks=nb k_biotbc2!(Int32(nt), red.ps, red.pm, tar1, b.tadj, a.u, a.f, top.r, U, g, idt)
-        finish!(red, nb, red.s, red.m, 6)
-        launch1(k_fixresid2!, nt, tar1, b.tadj, a.u, top.r, red.s, Int32(6), 1f0, idt, g)
-        list_norms!(b, b.B, top.r, 7)
+        finish!(red, nb, red.s, red.m, SLOT_FLUX)
+        launch1(k_fixresid2!, nt, tar1, b.tadj, a.u, top.r, red.s, Int32(SLOT_FLUX), 1f0, idt, g)
+        list_norms!(b, b.B, top.r, SLOT_B_AFTER)
         fetch!(red)
-        r₁ = r₁mg - getsum(red, 5) + getsum(red, 7); r∞ = max(r∞in, getmax(red, 7)); nᵇ += 1
+        # the multigrid norms, with the boundary cells' part replaced by its value after the update
+        r₁ = r₁mg - getsum(red, SLOT_B_BEFORE) + getsum(red, SLOT_B_AFTER)
+        r∞ = max(r∞in, getmax(red, SLOT_B_AFTER)); nᵇ += 1
         @log ", $nᵖ, $(r∞*dt), $(r₁*dt), $nᵇ\n"
         (r₁ < r₁tol && r∞ < r∞tol) && break
     end
@@ -664,7 +668,8 @@ Not supported (`ArgumentError`): `fmm=false`, periodic directions (`perdir`), an
 too small for a second Biot-Savart level.
 """
 function BiotSimulation(args...; nonbiotfaces=(), fmm=true, symmetry=(), mem=CuArray, kwargs...)
-    WaterLily.Simulation(args...; mem=CuArray,
+    check_mem(mem)
+    return WaterLily.Simulation(args...; mem=CuArray,
         flow_ctor=(dims,uBC;kw...)->TFlow(dims,uBC; bdimfaces=(nonbiotfaces..., symmetry...), kw...),
         pois_ctor=flow->TBiotPoisson(flow; nonbiotfaces, fmm, symmetry), kwargs...)
 end

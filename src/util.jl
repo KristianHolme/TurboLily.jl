@@ -41,10 +41,8 @@ end
 const AGrid{D} = Union{Grid{D},SGrid{D}}
 
 # (`sum` would widen Int32 to Int64)
-@inline lin(g::SGrid{3}, I::NTuple{3,Int32}) = i32 + (I[1]-i32) + (I[2]-i32)*g.s[2] + (I[3]-i32)*g.s[3]
-@inline lin(g::SGrid{2}, I::NTuple{2,Int32}) = i32 + (I[1]-i32) + (I[2]-i32)*g.s[2]
-@inline lin(g::Grid{3}, I::NTuple{3,Int32}) = i32 + (I[1]-i32) + (I[2]-i32)*g.s[2] + (I[3]-i32)*g.s[3]
-@inline lin(g::Grid{2}, I::NTuple{2,Int32}) = i32 + (I[1]-i32) + (I[2]-i32)*g.s[2]
+@inline lin(g::AGrid{3}, I::NTuple{3,Int32}) = i32 + (I[1]-i32) + (I[2]-i32)*g.s[2] + (I[3]-i32)*g.s[3]
+@inline lin(g::AGrid{2}, I::NTuple{2,Int32}) = i32 + (I[1]-i32) + (I[2]-i32)*g.s[2]
 @inline function coords(g::Grid{3}, l::Int32)
     l0 = l - i32
     k = l0 ÷ g.s[3]; r = l0 - k*g.s[3]
@@ -93,6 +91,10 @@ end
     I, all(ntuple(d->I[d]<=hi[d], Val(D)))
 end
 @inline tid1() = (blockIdx().x-i32)*blockDim().x + threadIdx().x
+
+# TurboLily's arrays are always CuArrays: reject a request for anything else
+check_mem(mem) = mem === CuArray ||
+    throw(ArgumentError("TurboLily supports mem=CuArray only (got mem=$mem); use WaterLily for other array types"))
 
 threads_for(::Val{1}) = (256,1,1)
 threads_for(::Val{2}) = (32,8,1)
@@ -202,16 +204,8 @@ inside_lo(::Grid{D}) where D = ntuple(_->2, D)
 inside_hi(g::Grid{D}) where D = ntuple(d->Int(g.n[d])-1, D)
 
 # ---------------------------------------------------------------- reductions
-@inline function warp_red(s::Float32, m::Float32)
-    off = Int32(16)
-    while off > 0
-        s += shfl_down_sync(0xffffffff, s, off)
-        m = max(m, shfl_down_sync(0xffffffff, m, off))
-        off >>= 1
-    end
-    return s, m
-end
-@inline function warp_red(s::Float64, m::Float32)
+# (sum,max) over the warp, returned on lane 1; `s` is a Float32 or Float64 sum
+@inline function warp_red(s::Union{Float32,Float64}, m::Float32)
     off = Int32(16)
     while off > 0
         s += shfl_down_sync(0xffffffff, s, off)
@@ -283,6 +277,10 @@ end
 Reduction scratch: per-block partials `ps/pm`, results on the device in `s` (`n` sums,
 then `n` maxima, so that one copy fetches both; `m` is the maxima half), and the host
 mirror `hs`.
+
+A result lives in a slot `1:n`. Each file names the slots it uses on its buffer as `SLOT_*`
+constants (a flow and a pressure solver have separate buffers); kernels that read a sum on
+the device index `s` with the same constants.
 """
 struct RedBuf
     s::CuVector{Float64}
@@ -326,6 +324,7 @@ stream cooperatively (a worker thread wakes the task), which leaves the GPU idle
 50–200 µs before the next launch; this blocks the calling thread in the driver instead.
 """
 function hostcopy!(dst::Array{T}, src::CuArray{T}) where T
+    length(dst) >= length(src) || throw(BoundsError(dst, length(src)))
     s = CUDA.stream()
     CUDA.synchronize(s; blocking=true)
     # the stream is idle: a copy to pageable memory completes before the call returns

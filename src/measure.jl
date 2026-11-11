@@ -165,7 +165,9 @@ function k_restrictL!(lo, hi, a, ga::Grid{D}, b, gb::Grid{D}, c) where D
     I, ok = cellidx(lo, hi); ok || return
     la = lin(ga, I)
     @unroll for i in i32:Int32(D)
-        J0 = ntuple(d-> d == i ? (c[d] ? Int32(2)*I[d]-Int32(2) : I[d]) : (c[d] ? Int32(2)*I[d]-Int32(2) : I[d]), Val(D))
+        # the fine faces under coarse face i: the first fine cell in every coarsened direction,
+        # and both fine cells (e=1) in the coarsened directions tangential to the face
+        J0 = ntuple(d-> c[d] ? Int32(2)*I[d]-Int32(2) : I[d], Val(D))
         e = ntuple(d-> (d != i && c[d]) ? i32 : Int32(0), Val(D))
         lb = lin(gb, J0) + (i-i32)*gb.nc
         s = zero(eltype(a))
@@ -196,6 +198,7 @@ function WaterLily.update!(p::TPoisson{T}) where T
         checkcap(p.red, nblocks(inside_lo(g), inside_hi(g)))
         nb = launch(k_diag!, inside_lo(g), inside_hi(g), p.red.ps, p.red.pm, op.L, op.Dg, op.iD, op.reg, g, op.Lreg)
         set_deep!(op)
+        # the number of solved rows of level 1, to p.nsd[1] (its max half is not used)
         l == 1 && finish!(p.red, nb, p.nsd, p.red.m, 1)
     end
     return p

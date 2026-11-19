@@ -70,6 +70,9 @@ update like any other face. Faces in periodic directions always do.
 function TFlow(N::NTuple{D}, uBC; T=Float32, mem=CuArray, bdimfaces=(), kw...) where D
     T === Float32 || throw(ArgumentError("TurboLily supports T=Float32 only (got T=$T)"))
     check_mem(mem)
+    # kernels index a vector field with Int32 offsets up to D·(cells including ghosts)
+    D*prod(big.(N) .+ 2) <= typemax(Int32) || throw(ArgumentError(
+        "grid $N is too large for TurboLily's 32-bit kernel indices ($D·cells must not exceed $(typemax(Int32)))"))
     f = WaterLily.Flow(N, uBC; T, mem=CuArray, kw...)
     # `f` is swapped into `u` by the corrector: start it with the ghost values of `u`, as
     # cells that no BC writes (domain corners and edges) keep their initial values

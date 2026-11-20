@@ -89,15 +89,25 @@ pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
         end
     end
     @testset "update uBC with setproperties" begin   # WaterLily#340
-        swap!(sim, uBC) = (sim.flow = WaterLily.setproperties(sim.flow; uBC); nothing)
+        # A tuple keeps TFlow's type, so the field write is valid on 1.11.0–1.11.2.
+        # A function changes `bc` and `acc`. WaterLily 1.11.2 stores `flow` as a type
+        # parameter and that write throws; 1.11.0 and 1.11.1 still accept it.
+        function swap!(sim, uBC)
+            flow = WaterLily.setproperties(sim.flow; uBC)
+            if typeof(flow) === typeof(sim.flow) || pkgversion(WaterLily) < v"1.11.2"
+                sim.flow = flow
+                return sim
+            end
+            return WaterLily.setproperties(sim; flow)
+        end
         sim = TurboLily.Simulation((64,64), (1,0), 16; T)
-        swap!(sim, (1f0,0f0))   # compile
+        sim = swap!(sim, (1f0,0f0))   # compile
         @test @allocated(swap!(sim, (2f0,0f0))) < sizeof(sim.flow.p)   # arrays are shared, not copied
         sim_step!(sim)
         @test all(Array(sim.flow.u)[2,2:end-1,1] .== 2)   # the kernels use the new uBC
-        swap!(sim, (3,0))   # an Int tuple is converted to the flow's eltype
+        sim = swap!(sim, (3,0))   # an Int tuple is converted to the flow's eltype
         @test sim.flow.uBC === (3f0,0f0)
-        swap!(sim, (i,x,t)->i==1 ? 1.5f0 : 0f0)   # a function uBC rebuilds the acceleration term too
+        sim = swap!(sim, (i,x,t)->i==1 ? 1.5f0 : 0f0)   # a function uBC rebuilds the acceleration term too
         sim_step!(sim)
         @test all(Array(sim.flow.u)[2,2:end-1,1] .== 1.5f0)
     end

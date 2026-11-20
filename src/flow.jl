@@ -94,7 +94,14 @@ end
 
 `WaterLily.setproperties(flow; uBC)` as for `WaterLily.Flow`: a new flow sharing all arrays,
 with the kernel-side boundary function and acceleration rebuilt from the new values.
-A tuple `uBC` is converted to the flow's eltype.
+A tuple `uBC` is converted to the flow's eltype. Replacing a tuple with a tuple keeps
+this flow's type, so `sim.flow = flow` is valid. Replacing a tuple with a function (or
+the reverse) changes `bc` and `acc`, and therefore the flow's type. WaterLily 1.11.2
+stores `sim.flow` as a type parameter and rejects that write; put it back with
+`sim = WaterLily.setproperties(sim; flow)`. On 1.11.0 and 1.11.1 the field is
+`AbstractFlow`, so the write accepts either type. `WaterLily.Flow`'s field names and
+constructor keywords are unchanged, including the default `λ=quick`, and this constructor
+still copies those fields by name.
 
 `perdir` and `exitBC` cannot be patched: the periodic flags, the BDIM face lists and the
 pressure solver are built from them at construction.

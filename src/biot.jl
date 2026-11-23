@@ -70,21 +70,6 @@ Base.getproperty(b::TBiotPoisson, s::Symbol) = s === :levels ? getfield(b, :pois
 # Body box (BiotSavartBCs.transition_box): the cells with 0 < L < 1 on some face, grown by one
 # cell. Outside it L is 0 or 1 on every face a curl stencil reads, so curl(L∇p) ≡ 0 there and
 # ω of u - Δt·L∇p does not change when p changes.
-@inline function warp_box!(bst, off, pred::Bool, I::NTuple{D,Int32}) where D
-    @unroll for d in i32:Int32(D)
-        lo = pred ? I[d] : typemax(Int32); hi = pred ? I[d] : typemin(Int32)
-        o = Int32(16)
-        while o > 0
-            lo = min(lo, shfl_down_sync(0xffffffff, lo, o)); hi = max(hi, shfl_down_sync(0xffffffff, hi, o))
-            o >>= 1
-        end
-        if flat_tid() % Int32(32) == 0 && lo != typemax(Int32)
-            CUDA.atomic_min!(pointer(bst, off + d), lo)
-            CUDA.atomic_max!(pointer(bst, off + 3 + d), hi)
-        end
-    end
-    return nothing
-end
 function k_tbox!(lo, hi, L, g::Grid{D}, bst) where D
     I, ok = cellidx(lo, hi)
     tr = false
@@ -131,10 +116,20 @@ function k_near!(n, tar, g::Grid{D}, top::Bool, bottom::Bool, blo, bhi, imgs::NT
 end
 function body_box!(b::TBiotPoisson{T, S, V, D}) where {T, S, V, D}
     g = b.g; nl = length(g)
-    copyto!(b.bst, vcat(fill(typemax(Int32), 3), fill(typemin(Int32), 3), zeros(Int32, nl)))
-    launch(k_tbox!, ntuple(_->1, D), Int.(g[1].n), b.L, g[1], b.bst)
-    st = hostcopy!(Vector{Int32}(undef, length(b.bst)), b.bst)
-    box = st[1] > st[4] ? (ntuple(_->2, D), ntuple(_->1, D)) : (ntuple(d->Int(st[d])-1, D), ntuple(d->Int(st[3+d])+1, D))
+    db = b.pois.dirty
+    if db !== nothing && db.tvalid
+        db.tvalid = false
+        box = db.tlo[1] > db.thi[1] ? (ntuple(_->2, D), ntuple(_->1, D)) : (db.tlo .- 1, db.thi .+ 1)
+        !isempty(b.boxes) && b.boxes[1] == box && return b
+        fill!(b.bst, 0)
+        st = Vector{Int32}(undef, length(b.bst))
+    else
+        copyto!(b.bst, vcat(fill(typemax(Int32), 3), fill(typemin(Int32), 3), zeros(Int32, nl)))
+        launch(k_tbox!, ntuple(_->1, D), Int.(g[1].n), b.L, g[1], b.bst)
+        st = hostcopy!(Vector{Int32}(undef, length(b.bst)), b.bst)
+        box = st[1] > st[4] ? (ntuple(_->2, D), ntuple(_->1, D)) : (ntuple(d->Int(st[d])-1, D), ntuple(d->Int(st[3+d])+1, D))
+        !isempty(b.boxes) && b.boxes[1] == box && return b
+    end
     empty!(b.boxes); push!(b.boxes, box)
     for l in 2:nl
         lo, hi = b.boxes[end]
@@ -194,11 +189,35 @@ function k_curl_layer!(lo, hi, ω, u, g::Grid{D}, w) where D
     end
     return nothing
 end
+# Sum of `dcross(a, b, J)` and `dcross(a, c, J)` over the 2×2×2 fine block starting at `l0`.
+# Shares the 4 centre sums along axis `a` (`U(0)+2U(1)+U(2)`) between both cross-derivatives.
+@inline function dsum2(l0, sa, sb, sc, a, U::F) where F
+    @inline S(db, dc) = (lp = l0 + db*sb + dc*sc; U(lp, a) + 2f0*U(lp+sa, a) + U(lp+Int32(2)*sa, a))
+    c00 = S(Int32(0), Int32(0)); c10 = S(i32, Int32(0))
+    c01 = S(Int32(0), i32);      c11 = S(i32, i32)
+    dab = 0.25f0*((c10 + c11 - c00 - c01) + (S(Int32(2), Int32(0)) + S(Int32(2), i32) - S(-i32, Int32(0)) - S(-i32, i32)))
+    dac = 0.25f0*((c01 + c11 - c00 - c10) + (S(Int32(0), Int32(2)) + S(i32, Int32(2)) - S(Int32(0), -i32) - S(i32, -i32)))
+    return dab, dac
+end
 # level-2 vorticity = Σ over the 2ᵈ fine cells of the level-1 curl (zero outside buff=2)
 function k_curl_restrict!(lo, hi, ω2, g2::Grid{D}, u, g::Grid{D}) where D
     I, ok = cellidx(lo, hi); ok || return
     l2 = lin(g2, I)
     J0 = ntuple(d-> Int32(2)*I[d] - Int32(2), Val(D))
+    if D == 3 && (J0[1] >= Int32(3)) & (J0[1] <= g.n[1] - Int32(3)) &
+                 (J0[2] >= Int32(3)) & (J0[2] <= g.n[2] - Int32(3)) &
+                 (J0[3] >= Int32(3)) & (J0[3] <= g.n[3] - Int32(3))
+        U = u isa AbstractArray ? UA(u, g.nc) : u
+        l0 = lin(g, J0)
+        s1, s2, s3 = i32, g.s[2], g.s[3]
+        d12, d13 = dsum2(l0, s1, s2, s3, i32, U)
+        d21, d23 = dsum2(l0, s2, s1, s3, Int32(2), U)
+        d31, d32 = dsum2(l0, s3, s1, s2, Int32(3), U)
+        @inbounds ω2[l2] = d32 - d23
+        @inbounds ω2[l2 + g2.nc] = d13 - d31
+        @inbounds ω2[l2 + Int32(2)*g2.nc] = d21 - d12
+        return nothing
+    end
     @unroll for i in i32:Int32(D)
         s = 0f0
         if D == 3
@@ -221,6 +240,8 @@ function k_curl_restrict!(lo, hi, ω2, g2::Grid{D}, u, g::Grid{D}) where D
     end
     return nothing
 end
+kernel_threads(::typeof(k_curl_restrict!), ::Val{3}, ext) = ext[1]*ext[2] >= BIG_PLANE ? (32, 8, 1) : threads_for(Val(3))
+shrinkable(::typeof(k_curl_restrict!)) = true
 # vector restriction a[I,i] = Σ b[up(I),i] (BiotSavartBCs.restrict!)
 function k_vrestrict!(lo, hi, a, ga::Grid{D}, b, gb::Grid{D}) where D
     I, ok = cellidx(lo, hi); ok || return
@@ -286,20 +307,22 @@ end
 @inline function xline(::Val{i}, x::NTuple{3}, ω, g::Grid{3}, ls, a, b, r2, r3) where i
     j = i % 3 + 1; k = (i + 1) % 3 + 1
     cj = Int32(j-1)*g.nc; ck = Int32(k-1)*g.nc
+    r23 = r2*r2 + r3*r3
     s = 0f0
     for s1 in a:b
         r1 = x[1] - s1
         r = (r1, r2, r3)
-        ir = CUDA.rsqrt(r1*r1 + r2*r2 + r3*r3)
+        ir = CUDA.rsqrt(r1*r1 + r23)
         @inbounds s += (ω[ls+s1+cj]*r[k] - ω[ls+s1+ck]*r[j])*(ir*ir*ir)
     end
     return s
 end
 @inline function xline(::Val{i}, x::NTuple{2}, ω, g::Grid{2}, ls, a, b, r2, r3) where i
+    r22 = r2*r2
     s = 0f0
     for s1 in a:b
         r1 = x[1] - s1
-        @inbounds s += ω[ls+s1]*(i == 1 ? r2 : r1)*@fastmath(inv(r1*r1 + r2*r2))
+        @inbounds s += ω[ls+s1]*(i == 1 ? r2 : r1)*@fastmath(inv(r1*r1 + r22))
     end
     return i == 1 ? -s : s
 end
@@ -475,19 +498,6 @@ function k_biotbc!(n, tar, tadj, u, uv, r, U, g::Grid, resid::Bool)
     @inbounds u[lu] = un
     return nothing
 end
-function k_norms!(lo, hi, ps, pm, r, g::Grid)
-    I, ok = cellidx(lo, hi)
-    v = ok ? abs(@inbounds(r[lin(g, I)])) : 0f0
-    block_partial!(ps, pm, v, v)
-    return nothing
-end
-"Σ|r| and max|r| over the whole level-1 residual."
-function norms!(b::TBiotPoisson, r)
-    g = b.g[1]
-    red_launch(k_norms!, ntuple(_->1, length(g.n)), Int.(g.n), b.red, SLOT_BIOT_R0, r, g)
-    fetch!(b.red)
-    return getsum(b.red, SLOT_BIOT_R0), getmax(b.red, SLOT_BIOT_R0)
-end
 
 # Incompressible & irrotational ghosts (BiotSavartBCs.pflowBC!), one pass per normal direction i
 @inline edgev(I, j, g::Grid, v) = (Int32(2) < I[j]) & (I[j] < g.n[j]) ? v : 0f0
@@ -514,12 +524,14 @@ end
 function k_pflow_n!(lo, hi, i, u, g::Grid{D}) where D
     I, ok = faceidx(lo, hi, i); ok || return   # I[i] == 1, others 2:n-1
     l = lin(g, I)
-    dv = 0f0
+    ci = (i-i32)*g.nc
+    v = @inbounds u[l+g.s[i]+ci]
     @unroll for k in i32:Int32(D)
+        k == i && continue
         ck = (k-i32)*g.nc
-        @inbounds dv += u[l+g.s[k]+ck] - u[l+ck]
+        @inbounds v += u[l+g.s[k]+ck] - u[l+ck]
     end
-    @inbounds u[l+(i-i32)*g.nc] += dv
+    @inbounds u[l+ci] = v
     return nothing
 end
 function pflowBC!(u, g::Grid{D}) where D
@@ -603,7 +615,7 @@ global flux fix and the residual norms are updated from the boundary cells.
 Stopping criterion as BiotSavartBCs#13 / `WaterLily.solver!`: `max|r| < tol`, `Σ|r|/N < tol/10`.
 The step is `Δt/w` (`w=1` predictor, `w=2` corrector), as `WaterLily.mom_project!`.
 """
-function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w::Int, t; tol=2e-3, itmx=32) where {D,T}
+function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w::Int, t; cfl=false, tol=2e-3, itmx=32) where {D,T}
     # (no BC! here, as BiotSavartBCs: the Biot-Savart BCs and pflowBC! set the boundary)
     dt = a.Δt[end]/T(w); idt = inv(dt)
     U = T.(bctuple(a.uBC, T(t), D))
@@ -618,15 +630,23 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w::Int, t; tol=2
     body_ω!(b, a.f, a.u, a.p, dt; full=true)
     fmm!(b, a.f)
     launch1(k_biotbc!, nt, tar1, b.tadj, a.u, a.f, top.r, U, g, false)
-    # residual r = (div(u) - δv·div(V))/Δt - A p (Σr in slot 1), global flux fix, norms
-    red_launch(k_resid_src!, inside_lo(g), inside_hi(g), red, SLOT_RSUM, top.r, a.p, a.u, a.V, op, idt, !a.Vzero, nothing)
+    # residual r = (div(u) - δv·div(V))/Δt - A p (Σr in SLOT_RSUM, non-boundary norms in SLOT_BIOT_R0)
+    lo, hi = inside_lo(g), inside_hi(g)
+    checkcap(red, nblocks(lo, hi))
+    nb = launch(k_resid_biot!, lo, hi, red.ps, red.ps2, red.pm, top.r, a.p, a.u, a.V, op, idt, !a.Vzero; cap=length(red.ps))
+    finish!(red, nb, red.s, red.m, SLOT_RSUM)
+    finish!(red, nb, red.s, red.m, SLOT_BIOT_R0; ps=red.ps2)
     launch1(k_fixresid2!, nt, tar1, b.tadj, a.u, top.r, red.s, Int32(SLOT_RSUM), dt, idt, g)
-    r₁, r∞ = norms!(b, top.r)
+    list_norms!(b, b.B, top.r, SLOT_B_AFTER)
+    fetch!(red)
+    r₁ = getsum(red, SLOT_BIOT_R0) + getsum(red, SLOT_B_AFTER)
+    r∞ = max(getmax(red, SLOT_BIOT_R0), getmax(red, SLOT_B_AFTER))
     nᵖ, nᵇ = 0, 0
     @log ", $nᵖ, $(r∞*dt), $(r₁*dt), $nᵇ\n"
     while nᵖ < itmx
         # V-cycles with fixed BCs until Σ|r| drops >10x
         rtol = max(r₁tol, 0.1r₁)
+        b.pois.usevrb && @cuda k_set_scale_val!(b.pois.scd, Float32(r∞))
         while nᵖ < itmx
             iteration!(b.pois; exclb=true, adapt=false)
             fetch!(red); r₁ = getsum(red, SLOT_R); nᵖ += 1
@@ -650,7 +670,12 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w::Int, t; tol=2
         (r₁ < r₁tol && r∞ < r∞tol) && break
     end
     push!(b.n, nᵖ)
-    launch(k_proj!, inside_lo(g), inside_hi(g), a.u, a.p, op, dt, nothing)
+    if cfl
+        red_launch(k_proj_cfl!, inside_lo(g), inside_hi(g), red, SLOT_PROJ_CFL, a.f, a.u, a.p, op, dt, nothing, T(t), false, nothing)
+        a.u, a.f = a.f, a.u
+    else
+        launch(k_proj!, inside_lo(g), inside_hi(g), a.u, a.p, op, dt, nothing)
+    end
     pflowBC!(a.u, g)
 end
 """

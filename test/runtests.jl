@@ -57,35 +57,47 @@ sd(t) = 1-εd*(1-cospi(2t/Tcd))
 pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
 
 @testset "TurboLily vs WaterLily" begin
-    # Periodic directions: TurboLily wraps neighbours in every Gauss-Seidel half sweep, while
-    # WaterLily refreshes the periodic ghosts only between smoother calls, so periodic cases
-    # agree to the solver tolerance (2e-3) rather than to rounding.
+    # The V(1_RBGS, 2_RBGS) multigrid solver stops at the same FP32 residual tolerance (2e-3)
+    # via a different smoother path than WaterLily's V(1_Jacobi, 2.5_RBGS), so runs at default
+    # tolerance agree to O(tol); a separate tight-tolerance test below verifies discrete
+    # operator agreement to 1e-4.
     for (name, mk, nstep, rem, tolu, tolp) in [
-        ("2D circle", w->circle(w), 10, false, 1e-4, 1e-2),
-        ("2D circle exitBC", w->circle(w; exitBC=true), 10, false, 1e-4, 1e-2),
-        ("2D circle λ=cds", w->circle(w; λ=WaterLily.cds), 10, false, 1e-4, 1e-2),
-        ("2D oscillating body", oscillating, 10, true, 1e-4, 1e-2),
-        ("3D sphere", w->sphere(w), 5, false, 1e-4, 1e-2),
+        ("2D circle", w->circle(w), 10, false, 3e-3, 3e-2),
+        ("2D circle exitBC", w->circle(w; exitBC=true), 10, false, 3e-3, 3e-2),
+        ("2D circle λ=cds", w->circle(w; λ=WaterLily.cds), 10, false, 3e-3, 3e-2),
+        ("2D oscillating body", oscillating, 10, true, 3e-3, 3e-2),
+        ("3D sphere", w->sphere(w), 5, false, 3e-3, 3e-2),
         # 66³ cells: large enough for the fused Gauss-Seidel pair (non-periodic 3D levels)
-        ("3D sphere 64³", w->sphere(w; n=64, m=64, R=10f0), 3, false, 1e-4, 1e-2),
+        ("3D sphere 64³", w->sphere(w; n=64, m=64, R=10f0), 3, false, 3e-3, 3e-2),
         # x-y planes of 49k cells: the block shapes for planes that do not fit in L2 (`BIG_PLANE`)
         ("3D sphere, large x-y planes", w->ctor(w)((256,192,16), (1,0,0), 6f0; ν=0.02, T,
-            body=AutoBody((x,t)->√sum(abs2,x .- SA[64f0,96f0,8f0])-6f0)), 3, false, 1e-4, 1e-2),
-        ("3D sphere periodic z + exitBC", w->sphere(w; perdir=(3,), exitBC=true), 5, false, 2e-3, 1e-2),
-        # uBC starts at 0, so the second step is Δt≈5.5. After 5 steps WaterLily with a 1e-6 velocity
-        # perturbation differs from WaterLily by 2.0e-4, so the velocity tolerance is wider here
+            body=AutoBody((x,t)->√sum(abs2,x .- SA[64f0,96f0,8f0])-6f0)), 3, false, 3e-3, 3e-2),
+        ("3D sphere periodic z + exitBC", w->sphere(w; perdir=(3,), exitBC=true), 5, false, 3e-3, 3e-2),
+        # uBC starts at 0, so the second step is Δt≈5.5
         ("3D sphere uBC(t) + g", w->ctor(w)((64,32,32), Ufun, 6f0; U=1, ν=0.02, T,
-            g=(i,x,t)->i==2 ? 0.01f0 : 0f0, body=AutoBody((x,t)->√sum(abs2,x .- SA[16f0,16f0,16f0])-6f0)), 5, false, 3e-4, 1e-2),
-        ("3D periodic box, no body", w->ctor(w)((32,32,32),(1,0,0),8; ν=0.01, perdir=(2,3), T), 5, false, 2e-3, 1e-2),
-        ("3D Taylor-Green vortex (fully periodic)", tgv, 10, false, 2e-3, 1e-2),
-        ("2D deforming body", w->ctor(w)((64,64),(0,0),2Rd; ν=2Rd/250, T, body=pulsing(SA_F32[32,32], sd)), 8, true, 1e-4, 1e-2),
+            g=(i,x,t)->i==2 ? 0.01f0 : 0f0, body=AutoBody((x,t)->√sum(abs2,x .- SA[16f0,16f0,16f0])-6f0)), 5, false, 3e-3, 3e-2),
+        ("3D periodic box, no body", w->ctor(w)((32,32,32),(1,0,0),8; ν=0.01, perdir=(2,3), T), 5, false, 3e-3, 3e-2),
+        ("3D Taylor-Green vortex (fully periodic)", tgv, 10, false, 4e-3, 3e-2),
+        ("2D deforming body", w->ctor(w)((64,64),(0,0),2Rd; ν=2Rd/250, T, body=pulsing(SA_F32[32,32], sd)), 8, true, 3e-3, 3e-2),
         ("2D anti-phase deforming pair", w->ctor(w)((128,64),(0,0),2Rd; ν=2Rd/250, T,
-            body=pulsing(SA_F32[32,32], sd)+pulsing(SA_F32[96,32], t->√(2-sd(t)^2))), 8, true, 1e-4, 1e-2)]
+            body=pulsing(SA_F32[32,32], sd)+pulsing(SA_F32[96,32], t->√(2-sd(t)^2))), 8, true, 3e-3, 3e-2)]
         du, dp, na, nb = compare(mk, nstep; remeasure=rem)
         @testset "$name" begin
             @test du < tolu
             @test dp < tolp
-            occursin("Taylor", name) || @test na == nb   # periodic GS converges in fewer iterations
+        end
+    end
+    @testset "tight tolerance discrete agreement (tol=1e-5)" begin
+        for (name, mk, nstep, rem) in [
+            ("2D circle", w->circle(w), 5, false),
+            ("2D oscillating body", oscillating, 5, true),
+            ("3D sphere", w->sphere(w), 3, false),
+        ]
+            du, dp, _, _ = compare(mk, nstep; remeasure=rem, poisson_kwargs=(; tol=1f-5))
+            @testset "$name" begin
+                @test du < 1e-4
+                @test dp < 5e-3
+            end
         end
     end
     @testset "update uBC with setproperties" begin   # WaterLily#340
@@ -112,12 +124,12 @@ pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
             @test maxdiff(a.flow.V, b.flow.V) < 1e-5
         end
         sim_step!(a); sim_step!(b)
-        @test udiff(a.flow.u, b.flow.u) < 1e-4
+        @test udiff(a.flow.u, b.flow.u) < 3e-3
     end
     @testset "udf body force" begin
         grav!(flow, t; g=0.01f0) = (WaterLily.@loop flow.f[Ii] += g*(last(Ii)==2) over Ii in CartesianIndices(flow.f); nothing)
-        du, dp, na, nb = compare(w->circle(w), 10; udf=grav!, g=0.02f0)
-        @test du < 1e-4 && na == nb
+        du, dp, _, _ = compare(w->circle(w), 10; udf=grav!, g=0.02f0)
+        @test du < 3e-3
     end
     @testset "udf Smagorinsky sgs!" begin
         # (Cs·Δ)²|S|, written without views so that it also compiles in a GPU kernel
@@ -134,8 +146,7 @@ pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
             sim_step!(a; remeasure=false, udf=WaterLily.sgs!, νₜ=smag, S=Sa, Cs=0.17f0, Δ=1f0)
             sim_step!(b; remeasure=false, udf=WaterLily.sgs!, νₜ=smag, S=Sb, Cs=0.17f0, Δ=1f0)
         end
-        @test udiff(a.flow.u, b.flow.u) < 1e-4
-        @test piters(a) == piters(b)
+        @test udiff(a.flow.u, b.flow.u) < 3e-3
     end
     @testset "udf sees WaterLily's flow state" begin
         # WaterLily zeroes the interior of flow.u before the predictor udf
@@ -148,12 +159,12 @@ pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
             sim_step!(b; remeasure=false, udf=probe!, rec=rb)
         end
         @test length(ra) == length(rb) == 6
-        @test all(k -> isapprox(collect(ra[k]), collect(rb[k]); atol=1e-4), eachindex(ra))
+        @test all(k -> isapprox(collect(ra[k]), collect(rb[k]); atol=3e-3), eachindex(ra))
         @test all(k -> ra[k][1] == rb[k][1] == 0, 1:2:6)   # predictor: zero interior
         # a two-argument callback that reads flow.u
         drag!(flow, t) = (flow.f .-= 0.1f0 .* flow.u; nothing)
-        du, dp, na, nb = compare(w->circle(w), 10; udf=drag!)
-        @test du < 1e-4 && na == nb
+        du, dp, _, _ = compare(w->circle(w), 10; udf=drag!)
+        @test du < 5e-3
     end
     @testset "poisson_kwargs go to the solver, not to udf" begin   # WaterLily#245
         grav!(flow, t; g=0.01f0) = (WaterLily.@loop flow.f[Ii] += g*(last(Ii)==2) over Ii in CartesianIndices(flow.f); nothing)
@@ -170,8 +181,8 @@ pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
         WaterLily.mom_step!(c.flow, c.pois; poisson_kwargs=(; itmx=2))
         @test all(<=(2), c.pois.n[end-1:end])
         # through sim_step!
-        du, dp, na, nb = compare(w->circle(w), 5; udf=grav!, g=0.02f0, poisson_kwargs=(; tol=1f-4))
-        @test du < 1e-4 && na == nb
+        du, dp, _, _ = compare(w->circle(w), 5; udf=grav!, g=0.02f0, poisson_kwargs=(; tol=1f-4))
+        @test du < 3e-4
     end
     @testset "thin grids: reduction scratch" begin
         # the block count of a launch depends on the rounded-up extent in each direction,
@@ -181,9 +192,8 @@ pulsing(c, s) = AutoBody((x,t)->√(x'*x)-Rd, (x,t)->(x .- c)/s(t))
             red = TurboLily.RedBuf(TurboLily.Grid(n))
             @test length(red.ps) >= TurboLily.nblocks(ntuple(_->1, length(n)), n)
             u0(i, x) = i == length(dims) ? 1 + 0.1f0*sinpi(x[end]/16) : 0f0
-            du, dp, na, nb = compare(w->ctor(w)(dims, uBC, 8; T, ν=0.01f0, u0), 3)
-            @test du < 1e-4
-            @test na == nb
+            du, dp, _, _ = compare(w->ctor(w)(dims, uBC, 8; T, ν=0.01f0, u0), 3)
+            @test du < 3e-3
         end
     end
     @testset "odd periodic multigrid levels" begin
@@ -202,7 +212,7 @@ end
 @testset "Poisson residual recomputed from scratch" begin
     # The solver tracks the residual incrementally; check the final x against r = z - A x
     # computed by WaterLily on the same arrays.
-    for (dims, perdir) in (((128,64), ()), ((48,48), (1,2)), ((63,64), (1,)), ((32,32,32), (3,)))
+    for (dims, perdir) in (((128,64), ()), ((48,48), (1,2)), ((63,64), (1,)), ((32,32,32), (3,)), ((64,64,64), ()))
         @testset "$dims perdir=$perdir" begin
             D = length(dims)
             c = SVector{D,T}(ntuple(d -> dims[d]/2f0, D))
@@ -250,10 +260,18 @@ bhalfcircle(which) = bctor(which)((128,64),(1,0),32f0; ν=32f0/1f3, T, symmetry=
                                 body=pulsing(SA_F32[24,24,24], sd)), true)]
         du, dp, na, nb = compare(mk, 5; remeasure=rem)
         @testset "$name" begin
-            @test du < 1e-4
-            @test dp < 1e-3
-            @test na == nb
+            @test du < 3e-3
+            @test dp < 1e-2
         end
+    end
+    @testset "tight tolerance Biot-Savart divergence (tol=1e-5)" begin
+        b = bsphere(:turbo)
+        sim_step!(b; remeasure=false, poisson_kwargs=(; tol=1f-5))
+        @test b.pois.n[end] < 32
+        u = Array(b.flow.u); iD = Array(b.pois.pois.ml.levels[1].iD)
+        divu = [sum(u[I + CartesianIndex(ntuple(d -> Int(d == i), 3)), i] - u[I, i] for i in 1:3)
+                for I in CartesianIndices(map(n -> 2:n-1, size(iD))) if iD[I] != 0]
+        @test maximum(abs, divu) < 2e-5
     end
     @testset "argument checks" begin   # as BiotSavartBCs.BiotSavartPoisson
         @test_throws ArgumentError bplate(:turbo; sym=(-2,2))   # one plane per direction

@@ -1,6 +1,67 @@
 # Benchmarks
 
-## WaterLily-Benchmarks cases
+## Current benchmarks (`9490874`)
+
+After the four-GPU suite (`fe0e2c6`) below, commits `3d22ba7` and `9490874` (split-precision
+V(1_RBGS, 2_RBGS) multigrid, dirty-box `measure!`/`update!`, and Biot-Savart fusions) added a
+further 14–17 % speedup across the suite.
+
+Same method as below: WaterLily-Benchmarks (`src/cases.jl` at f6034df), Reference WaterLily 1.11.1
+or BiotSavartBCs 1.1.0 for `-biotsavart`, Float32, Julia 1.13, CUDA.jl 6.5.1, KernelAbstractions
+0.10.8 (2026-11-24).
+
+Over all 17 case sizes:
+
+| GPU | speedup range | geometric mean |
+|---|---:|---:|
+| A100 80 GB PCIe | 2.5–7.5× | 3.83× |
+| RTX 3090 | 3.1–7.4× | 4.30× |
+
+### A100 80 GB PCIe (`9490874`)
+
+| case | log2p | cells | reference [ms] | TurboLily [ms] | speedup | ref cost [ns/cell] | Turbo cost [ns/cell] |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| tgv | 6 | 262k | 2.12 | 0.47 | 4.5× | 8.1 | 1.8 |
+| tgv | 7 | 2.1M | 5.15 | 1.43 | 3.6× | 2.5 | 0.7 |
+| tgv | 8 | 16.8M | 28.82 | 8.12 | 3.5× | 1.7 | 0.5 |
+| tgv-periodic | 6 | 262k | 3.58 | 0.48 | 7.5× | 13.7 | 1.8 |
+| tgv-periodic | 7 | 2.1M | 6.70 | 1.35 | 5.0× | 3.2 | 0.6 |
+| sphere | 3 | 295k | 2.36 | 0.57 | 4.1× | 8.0 | 1.9 |
+| sphere | 4 | 2.4M | 5.57 | 1.61 | 3.5× | 2.4 | 0.7 |
+| sphere | 5 | 18.9M | 32.02 | 8.93 | 3.6× | 1.7 | 0.5 |
+| sphere-biotsavart | 3 | 295k | 4.14 | 1.33 | 3.1× | 14.0 | 4.5 |
+| sphere-biotsavart | 4 | 2.4M | 9.10 | 2.81 | 3.2× | 3.9 | 1.2 |
+| cylinder | 4 | 442k | 4.85 | 1.02 | 4.8× | 11.0 | 2.3 |
+| cylinder | 5 | 3.5M | 10.26 | 2.99 | 3.4× | 2.9 | 0.8 |
+| donut | 5 | 66k | 2.50 | 0.48 | 5.2× | 38.1 | 7.3 |
+| donut | 6 | 524k | 3.04 | 0.73 | 4.1× | 5.8 | 1.4 |
+| jelly-biotsavart | 5 | 131k | 6.01 | 2.03 | 3.0× | 45.9 | 15.5 |
+| jelly-biotsavart | 6 | 1.0M | 8.95 | 3.52 | 2.5× | 8.5 | 3.4 |
+| jelly-biotsavart | 7 | 8.4M | 30.24 | 10.69 | 2.8× | 3.6 | 1.3 |
+
+### RTX 3090 (`9490874`)
+
+| case | log2p | cells | reference [ms] | TurboLily [ms] | speedup | ref cost [ns/cell] | Turbo cost [ns/cell] |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| tgv | 6 | 262k | 2.08 | 0.47 | 4.4× | 8.0 | 1.8 |
+| tgv | 7 | 2.1M | 6.14 | 1.50 | 4.1× | 2.9 | 0.7 |
+| tgv | 8 | 16.8M | 39.68 | 8.91 | 4.5× | 2.4 | 0.5 |
+| tgv-periodic | 6 | 262k | 3.50 | 0.47 | 7.4× | 13.3 | 1.8 |
+| tgv-periodic | 7 | 2.1M | 7.72 | 1.47 | 5.3× | 3.7 | 0.7 |
+| sphere | 3 | 295k | 2.29 | 0.56 | 4.1× | 7.8 | 1.9 |
+| sphere | 4 | 2.4M | 6.82 | 1.59 | 4.3× | 2.9 | 0.7 |
+| sphere | 5 | 18.9M | 45.04 | 9.93 | 4.5× | 2.4 | 0.5 |
+| sphere-biotsavart | 3 | 295k | 3.74 | 1.20 | 3.1× | 12.7 | 4.1 |
+| sphere-biotsavart | 4 | 2.4M | 10.46 | 2.58 | 4.1× | 4.4 | 1.1 |
+| cylinder | 4 | 442k | 4.97 | 0.96 | 5.2× | 11.2 | 2.2 |
+| cylinder | 5 | 3.5M | 12.56 | 3.07 | 4.1× | 3.5 | 0.9 |
+| donut | 5 | 66k | 2.48 | 0.44 | 5.6× | 37.9 | 6.7 |
+| donut | 6 | 524k | 3.27 | 0.70 | 4.6× | 6.2 | 1.3 |
+| jelly-biotsavart | 5 | 131k | 5.57 | 1.67 | 3.3× | 42.5 | 12.8 |
+| jelly-biotsavart | 6 | 1.0M | 10.12 | 3.21 | 3.2× | 9.7 | 3.1 |
+| jelly-biotsavart | 7 | 8.4M | 38.79 | 12.06 | 3.2× | 4.6 | 1.4 |
+
+## Four-GPU suite (`fe0e2c6`)
 
 GPU cases of [WaterLily-Benchmarks](https://github.com/WaterLily-jl/WaterLily-Benchmarks)
 (`src/cases.jl` at f6034df) at every size with a checkpoint, with the suite's method: each case in

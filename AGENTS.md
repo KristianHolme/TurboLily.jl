@@ -5,7 +5,8 @@ CUDA-only, Float32 rewrite of the WaterLily time step and the BiotSavartBCs proj
 ## Layout
 
 - `src/`: `flow.jl` (momentum step), `poisson.jl` (multigrid), `biot.jl` (Biot-Savart FMM), `measure.jl`, `util.jl` (reductions, index helpers).
-- `test/runtests.jl`: steps every case side by side with WaterLily / BiotSavartBCs on CPU and requires agreement to rounding level. Needs a GPU.
+- `test/runtests.jl`: steps every case side by side with WaterLily / BiotSavartBCs on CPU and requires agreement to the solver tolerance. Needs a GPU. Helpers and case constructors are in `test/setup.jl`.
+- `test/long_tests.jl` (optional, `Pkg.test(test_args=["long"])` or `julia --project test/long_tests.jl`): every comparison case at `tol=1e-5` over more steps; velocity within max(1e-4, 4× a 1e-6-perturbed WaterLily run). Run it after solver changes.
 - `test/waterlily_tests.jl`: WaterLily's simulation-level tests (analytic checks) on `TurboLily.Simulation`.
 - `.github/workflows/CI.yml`: dependency resolution only; hosted runners have no GPU.
 - `examples/`: usage examples.
@@ -34,3 +35,10 @@ CUDA-only, Float32 rewrite of the WaterLily time step and the BiotSavartBCs proj
 - A block shape has to fit every architecture. `k_bottom!` needs 196 registers per thread on sm_90, so 512 threads failed on a GH200. `launch` checks blocks above `SAFE_THREADS` (256 threads always fit) against `CUDA.maxthreads` and halves `shrinkable` kernels' shape until it fits, otherwise it raises an error; `k_bottom!` uses `fit_threads` the same way. Querying the limit on every launch costs 1–3 % of a small step, so keep it off the 256-thread path.
 
 After every kernel change, run `test/runtests.jl` against the reference codes.
+
+## Workflow and benchmarking
+
+- In `dev/` worktrees where the `fork` remote is HTTPS, push using the SSH URL (`git push git@github.com:KristianHolme/<repo>.git <branch>`).
+- Never let two processes append to the same result file on the NFS home (lines get lost); write one file per GPU.
+- Run final A/B timings back to back without CPU-heavy reference tests running.
+- `papers/speedup-attribution.typ` (git-ignored) compares TurboLily against the latest registered WaterLily and BiotSavartBCs releases (no KernelAbstractions-port work).

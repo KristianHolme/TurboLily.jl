@@ -598,37 +598,39 @@ function k_fix_r!(lo, hi, ps, pm, r, op::Op{D}, fixd) where D
     block_partial!(ps, pm, a, a)
     return nothing
 end
-# Pass 1a (level 1): full RBGS pre-sweep from ϵ=0 into scaled Float16 `ϵ1`.
+# Pass 1a (level 1): black cells of the RBGS pre-sweep from ϵ=0 into scaled Float16 `ϵ1`
+# (x-paired so every lane in a warp is on the same (y,z) row; red cells are never read
+# before `k_prol_dz!` overwrites them).
 function k_pre_rb16!(lo, hi, ϵ1, r, op::Op{D}, scd) where D
+    Iv, ok = cellidx(lo, hi); ok || return
+    g = op.g
+    fs = D == 3 ? (Iv[2] + Iv[3]) : Iv[2]
+    p = (fs + i32) % Int32(2)
+    i = Int32(2)*Iv[1] - i32 - p
+    i <= g.n[1] - i32 || return
+    I = setj(Iv, 1, i); l = lin(g, I)
     sc = @inbounds scd[1]
-    I, ok = cellidx(lo, hi); ok || return
-    g = op.g; l = lin(g, I)
-    sidx = D == 3 ? (I[1] + I[2] + I[3]) : (I[1] + I[2])
-    if isodd(sidx)
-        @inbounds ϵ1[l] = pack16(@inbounds(r[l]) * getiD(op, l), sc)
-    else
-        pr = Pre(AV(r), op, I, l)
-        e = isdeep(op, l) ?
-            (pr.c - offdiag_f(op, I, l, Scaled(pr, op.iDreg))) * op.iDreg :
-            (pr.c - offdiag_f(op, I, l, RiD(r, op))) * getiD(op, l)
-        @inbounds ϵ1[l] = pack16(e, sc)
-    end
+    pr = Pre(AV(r), op, I, l)
+    e = isdeep(op, l) ?
+        (pr.c - offdiag_f(op, I, l, Scaled(pr, op.iDreg))) * op.iDreg :
+        (pr.c - offdiag_f(op, I, l, RiD(r, op))) * getiD(op, l)
+    @inbounds ϵ1[l] = pack16(e, sc)
     return nothing
 end
-# Pass 1a (coarse levels, Float32): full RBGS pre-sweep from ϵ=0.
+# Pass 1a (coarse levels, Float32): black cells of the RBGS pre-sweep from ϵ=0 (x-paired).
 function k_pre_rb32!(lo, hi, ϵ, r, op::Op{D}) where D
-    I, ok = cellidx(lo, hi); ok || return
-    g = op.g; l = lin(g, I)
-    sidx = D == 3 ? (I[1] + I[2] + I[3]) : (I[1] + I[2])
-    if isodd(sidx)
-        @inbounds ϵ[l] = r[l] * getiD(op, l)
-    else
-        pr = Pre(AV(r), op, I, l)
-        e = isdeep(op, l) ?
-            (pr.c - offdiag_f(op, I, l, Scaled(pr, op.iDreg))) * op.iDreg :
-            (pr.c - offdiag_f(op, I, l, RiD(r, op))) * getiD(op, l)
-        @inbounds ϵ[l] = e
-    end
+    Iv, ok = cellidx(lo, hi); ok || return
+    g = op.g
+    fs = D == 3 ? (Iv[2] + Iv[3]) : Iv[2]
+    p = (fs + i32) % Int32(2)
+    i = Int32(2)*Iv[1] - i32 - p
+    i <= g.n[1] - i32 || return
+    I = setj(Iv, 1, i); l = lin(g, I)
+    pr = Pre(AV(r), op, I, l)
+    e = isdeep(op, l) ?
+        (pr.c - offdiag_f(op, I, l, Scaled(pr, op.iDreg))) * op.iDreg :
+        (pr.c - offdiag_f(op, I, l, RiD(r, op))) * getiD(op, l)
+    @inbounds ϵ[l] = e
     return nothing
 end
 # Pass 1b: restrict r₁ = r - A·ϵ after the full RBGS pre-sweep. On black cells r₁ ≡ 0;
@@ -765,19 +767,17 @@ function k_vprol_red!(lo, hi, zb, ϵb, cx, gc::Grid{D}, c::Per, rb, op::Op{D}) w
     end
     return nothing
 end
-# Single RBGS half sweep on Float16 (`ϵ1`/`r1`, level 1) or Float32 (coarse levels).
+# Single RBGS half sweep on Float16 (`ϵ1`/`r1`, level 1) or Float32 (coarse levels),
+# paired along x so all 32 lanes of a warp stay on the same (y,z) row.
 function k_vgs_s!(lo, hi, zb, rb, op::Op{D}, k0::Int32) where D
     Iv, ok = cellidx(lo, hi); ok || return
     E = eltype(zb)
     g = op.g
-    fs = Int32(0)
-    @unroll for d in i32:Int32(D-1)
-        fs += Iv[d]
-    end
+    fs = D == 3 ? (Iv[2] + Iv[3]) : Iv[2]
     p = (fs + k0) % Int32(2)
-    k = Int32(2)*Iv[D] - i32 - p
-    k <= g.n[D] - i32 || return
-    I = setj(Iv, D, k); l = lin(g, I)
+    i = Int32(2)*Iv[1] - i32 - p
+    i <= g.n[1] - i32 || return
+    I = setj(Iv, 1, i); l = lin(g, I)
     pe = PreOff(CastF32(zb), op, I, l)
     v = (Float32(@inbounds rb[l]) - offdiag_f(op, I, l, pe)) * getiD(op, l)
     @inbounds zb[l] = E === Float16 ? Float16(clamp(v, -65000f0, 65000f0)) : v
@@ -903,6 +903,7 @@ function jacobi!(lv::Level, fr=nothing)
     lv.r, lv.ϵ = lv.ϵ, lv.r
 end
 gs_range(g::Grid{D}) where D = (inside_lo(g), ntuple(d-> d==D ? cld(Int(g.n[d]),2) : Int(g.n[d])-1, D))
+gs_range_x(g::Grid{D}) where D = (inside_lo(g), ntuple(d-> d==1 ? cld(Int(g.n[1]),2) : Int(g.n[d])-1, D))
 function k_rid!(lo, hi, ϵ, r, op::Op)
     I, ok = cellidx(lo, hi); ok || return
     l = lin(op.g, I)
@@ -1078,7 +1079,8 @@ function vrb_coarse!(p::TPoisson, l::Int, lb::Int)
     fine, coarse = p.levels[l], p.levels[l+1]
     gf, gc = fine.op.g, coarse.op.g
     cp = Per(fine.c)
-    launch(k_pre_rb32!, inside_lo(gf), inside_hi(gf), fine.ϵ, fine.r, fine.op)
+    lo, hi = gs_range_x(gf)
+    launch(k_pre_rb32!, lo, hi, fine.ϵ, fine.r, fine.op)
     launch(k_restrict_rb!, inside_lo(gc), inside_hi(gc), coarse.r, coarse.x, gc, fine.ϵ, fine.op, cp, p.scd)
     if l + 1 == lb
         bottom!(p, lb; swap=false)
@@ -1086,14 +1088,13 @@ function vrb_coarse!(p::TPoisson, l::Int, lb::Int)
         vrb_coarse!(p, l + 1, lb)
     else
         # coarsest level when no level fits in `k_bottom!`: 3 full RBGS sweeps into `coarse.x`
-        launch(k_pre_rb32!, inside_lo(gc), inside_hi(gc), coarse.x, coarse.r, coarse.op)
-        clo, chi = gs_range(gc)
+        clo, chi = gs_range_x(gc)
+        launch(k_pre_rb32!, clo, chi, coarse.x, coarse.r, coarse.op)
         for k0 in (Int32(2), Int32(1), Int32(2), Int32(1))
             launch(k_vgs_s!, clo, chi, coarse.x, coarse.r, coarse.op, k0)
         end
     end
     launch(k_vprol_red!, inside_lo(gf), inside_hi(gf), fine.z, fine.ϵ, coarse.x, gc, cp, fine.r, fine.op)
-    lo, hi = gs_range(gf)
     launch(k_vgs_s!, lo, hi, fine.z, fine.r, fine.op, Int32(1))
     launch(k_vgs_s!, lo, hi, fine.z, fine.r, fine.op, Int32(2))
     launch(k_vblk_coarse!, inside_lo(gf), inside_hi(gf), fine.x, fine.z, fine.r, fine.op)
@@ -1114,21 +1115,21 @@ function vrb_iter!(p::TPoisson; fix::Bool=false, exclb::Bool=false, adapt::Bool=
         finish!(p.red, nb, p.red.s, p.red.m, SLOT_R0; fixd=p.fixd)
         @cuda k_set_scale!(p.scd, p.red.m, Int32(SLOT_R0))
     end
-    launch(k_pre_rb16!, inside_lo(g1), inside_hi(g1), p.ϵ1, top.r, top.op, p.scd)
+    lo, hi = gs_range_x(g1)
+    launch(k_pre_rb16!, lo, hi, p.ϵ1, top.r, top.op, p.scd)
     launch(k_restrict_rb!, inside_lo(g2), inside_hi(g2), c2.r, c2.x, g2, p.ϵ1, top.op, cp, p.scd)
     if 2 == lb
         bottom!(p, lb; swap=false)
     elseif 2 < length(p.levels)
         vrb_coarse!(p, 2, lb)
     else
-        launch(k_pre_rb32!, inside_lo(g2), inside_hi(g2), c2.x, c2.r, c2.op)
-        clo, chi = gs_range(g2)
+        clo, chi = gs_range_x(g2)
+        launch(k_pre_rb32!, clo, chi, c2.x, c2.r, c2.op)
         for k0 in (Int32(2), Int32(1), Int32(2), Int32(1))
             launch(k_vgs_s!, clo, chi, c2.x, c2.r, c2.op, k0)
         end
     end
     launch(k_prol_dz!, inside_lo(g1), inside_hi(g1), p.ϵ1, p.r1, c2.x, g2, cp, top.r, top.op, p.scd)
-    lo, hi = gs_range(g1)
     launch(k_vgs_s!, lo, hi, p.ϵ1, p.r1, top.op, Int32(1))
     launch(k_vgs_s!, lo, hi, p.ϵ1, p.r1, top.op, Int32(2))
     launch(k_vgs_s!, lo, hi, p.ϵ1, p.r1, top.op, Int32(1))

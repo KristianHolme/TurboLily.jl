@@ -23,14 +23,24 @@ still grows, so the caller can detect the overflow and retry with a larger list)
     return nothing
 end
 
+# Initialize `mstat`: counts 1:4 = 0, dirty box 5:10 and transition box 11:16 = [max..max, min..min].
+function k_mstat_init!(stat)
+    @inbounds for k in 1:4; stat[k] = Int32(0); end
+    @inbounds for k in 5:7; stat[k] = typemax(Int32); end
+    @inbounds for k in 8:10; stat[k] = typemin(Int32); end
+    @inbounds for k in 11:13; stat[k] = typemax(Int32); end
+    @inbounds for k in 14:16; stat[k] = typemin(Int32); end
+    return nothing
+end
+
 # WaterLily.measure! in two passes. The first evaluates the distance in every cell and updates
 # only cells away from the body that were near it, or that changed side since the last measure
 # (a body that moved further than the band in between); it lists the cells near the body. The
 # second measures the listed cells (normal and body velocity), so the costly `measure` code
 # does not set the register use of the pass over all cells.
 # `near` holds 0x01 for a cell near the body, 0x00 / 0x02 for a cell away from it outside / inside.
-# Both append the BDIM band faces (class 1: μ₀≠1, μ₁=0; class 2: μ₁≠0); `stat` counts
-# [band, shell, V≠0, near cells].
+# Both append the BDIM band faces (class 1: μ₀≠1, μ₁=0; class 2: μ₁≠0); `stat` holds
+# [band, shell, V≠0, near, dirty lo(3), dirty hi(3), transition lo(3), transition hi(3)].
 function k_measure!(lo, hi, μ₀, μ₁, V, σ, near_prev, body::B, t::T, d²::T, g::Grid{D},
                     stat, band, nearl, bdimlow::NTuple{D,Bool}) where {B,T,D}
     I, ok = cellidx(lo, hi)
@@ -44,6 +54,8 @@ function k_measure!(lo, hi, μ₀, μ₁, V, σ, near_prev, body::B, t::T, d²::
     end
     wappend!(nearl, stat, 4, near, l)
     prev = ok ? @inbounds(near_prev[l]) : 0x00
+    changed = ok & (near | (prev != (d < 0 ? 0x02 : 0x00)))
+    warp_box!(stat, 4, changed, I)
     @unroll for i in i32:Int32(D)
         li = l + (i-i32)*g.nc
         cls = 0
@@ -72,6 +84,7 @@ function k_measure_near!(cap, nearl, μ₀, μ₁, V, σ, body::B, t::T, ϵ::T, 
     I = coords(g, l)
     d = ok ? @inbounds(σ[l]) : zero(T)
     vnz = false
+    tr = false
     @unroll for i in i32:Int32(D)
         li = l + (i-i32)*g.nc
         cls = 0
@@ -82,6 +95,7 @@ function k_measure_near!(cap, nearl, μ₀, μ₁, V, σ, body::B, t::T, ϵ::T, 
             vnz |= Vᵢ[i] != 0
             m0 = WaterLily.μ₀(dᵢ, ϵ)
             @inbounds μ₀[li] = m0
+            tr |= (m0 > 0) & (m0 < 1) & (I[i] > 2i32)
             m1 = WaterLily.μ₁(dᵢ, ϵ)
             sh = false
             @unroll for j in i32:Int32(D)
@@ -98,6 +112,7 @@ function k_measure_near!(cap, nearl, μ₀, μ₁, V, σ, body::B, t::T, ϵ::T, 
         wappend!(band, stat, 1, cls == 1, li)
         wappend!(shell, stat, 2, cls == 2, li)
     end
+    warp_box!(stat, 10, ok & tr, I)
     vnz && (@inbounds stat[3] = Int32(1))
     return nothing
 end
@@ -114,7 +129,7 @@ end
 function WaterLily.measure!(a::TFlow{D,T}, body::AbstractBody; t=zero(T), ϵ=1) where {D,T}
     g = a.grid
     while true
-        fill!(a.mstat, 0)
+        @cuda k_mstat_init!(a.mstat)
         d² = T((2+ϵ)^2)
         launch(k_measure!, inside_lo(g), inside_hi(g), a.μ₀, a.μ₁, a.V, a.σ, a.near, body, T(t),
                d², g, a.mstat, a.band, a.nearl, a.bdimlow)
@@ -123,10 +138,28 @@ function WaterLily.measure!(a::TFlow{D,T}, body::AbstractBody; t=zero(T), ϵ=1) 
                 d², g, a.mstat, a.band, a.shell, a.bdimlow)
         vecBC0!(a.μ₀, g, a.per, false)
         vecBC0!(a.V, g, a.per, a.exitBC)
-        st = hostcopy!(Vector{Int32}(undef, length(a.mstat)), a.mstat)
+        st = hostcopy!(a.mstat_h, a.mstat)
         a.nband, a.nshell = st[1], st[2]
         a.Vzero = st[3] == 0
-        (a.nband <= length(a.band) && a.nshell <= length(a.shell) && st[4] <= length(a.nearl)) && break
+        if a.nband <= length(a.band) && a.nshell <= length(a.shell) && st[4] <= length(a.nearl)
+            dlo = ntuple(d -> Int(st[4 + d]), D)
+            dhi = ntuple(d -> Int(st[7 + d]), D)
+            if dlo[1] <= dhi[1]
+                if a.dirty.valid && a.dirty.lo[1] <= a.dirty.hi[1]
+                    a.dirty.lo = min.(a.dirty.lo, dlo)
+                    a.dirty.hi = max.(a.dirty.hi, dhi)
+                else
+                    a.dirty.lo = dlo; a.dirty.hi = dhi
+                end
+            elseif !a.dirty.valid
+                a.dirty.lo = ntuple(_ -> 2, D); a.dirty.hi = ntuple(_ -> 1, D)
+            end
+            a.dirty.valid = true
+            a.dirty.tlo = st[11] > st[14] ? ntuple(_ -> 2, D) : ntuple(d -> Int(st[10 + d]), D)
+            a.dirty.thi = st[11] > st[14] ? ntuple(_ -> 1, D) : ntuple(d -> Int(st[13 + d]), D)
+            a.dirty.tvalid = true
+            break
+        end
         # lists too small: grow and measure again (every cell near the body is rewritten,
         # so a repeated measure gives the same result)
         a.band = CuVector{Int32}(undef, 2a.nband + 1024)
@@ -160,6 +193,48 @@ function k_diag!(lo, hi, ps, pm, L, Dg, iD, reg, g::Grid{D}, Lreg) where D
     block_partial!(ps, pm, c, 0f0)
     return nothing
 end
+# Same as `k_diag!`, but accumulates the change in solved-row count `Δ(iD≠0)` over a dirty box.
+function k_diag_delta!(lo, hi, ps, pm, L, Dg, iD, reg, g::Grid{D}, Lreg) where D
+    I, ok = cellidx(lo, hi)
+    dc = 0f0
+    if ok
+        l = lin(g, I)
+        old_nz = iszero(@inbounds(iD[l])) ? 0f0 : 1f0
+        s = zero(eltype(Dg)); rg = true
+        @unroll for j in i32:Int32(D)
+            cj = (j-i32)*g.nc
+            @inbounds a = L[l+cj]; @inbounds b = L[l+g.s[j]+cj]
+            s -= a + b
+            rg &= (a == Lreg) & (b == Lreg)
+        end
+        @inbounds Dg[l] = s
+        @inbounds iD[l] = iszero(s) ? s : inv(s)
+        @inbounds reg[l] = rg ? 0x01 : 0x00
+        dc = (iszero(s) ? 0f0 : 1f0) - old_nz
+    end
+    block_partial!(ps, pm, dc, 0f0)
+    return nothing
+end
+# Coarse-level diagonal update (no solved-row count needed).
+function k_diag_coarse!(lo, hi, L, Dg, iD, reg, g::Grid{D}, Lreg) where D
+    I, ok = cellidx(lo, hi); ok || return
+    l = lin(g, I)
+    s = zero(eltype(Dg)); rg = true
+    @unroll for j in i32:Int32(D)
+        cj = (j-i32)*g.nc
+        @inbounds a = L[l+cj]; @inbounds b = L[l+g.s[j]+cj]
+        s -= a + b
+        rg &= (a == Lreg) & (b == Lreg)
+    end
+    @inbounds Dg[l] = s
+    @inbounds iD[l] = iszero(s) ? s : inv(s)
+    @inbounds reg[l] = rg ? 0x01 : 0x00
+    return nothing
+end
+function k_add_nsd!(nsd, sums, slot::Int32)
+    @inbounds nsd[1] += sums[slot]
+    return nothing
+end
 # coarse L from fine L (WaterLily.restrictL with the semi-coarsening mask c)
 function k_restrictL!(lo, hi, a, ga::Grid{D}, b, gb::Grid{D}, c) where D
     I, ok = cellidx(lo, hi); ok || return
@@ -184,7 +259,45 @@ function k_restrictL!(lo, hi, a, ga::Grid{D}, b, gb::Grid{D}, c) where D
     end
     return nothing
 end
+clip_box(lo, hi, a, b) = (map(max, lo, a), map(min, hi, b))
+function update_box(lo, hi, g::Grid{D}, per, padlo::Int, padhi::Int) where D
+    ilo, ihi = inside_lo(g), inside_hi(g)
+    blo = ntuple(d -> (per[d] && (lo[d] - padlo < ilo[d] || hi[d] + padhi > ihi[d])) ? ilo[d] : max(ilo[d], lo[d] - padlo), D)
+    bhi = ntuple(d -> (per[d] && (lo[d] - padlo < ilo[d] || hi[d] + padhi > ihi[d])) ? ihi[d] : min(ihi[d], hi[d] + padhi), D)
+    return blo, bhi
+end
 function WaterLily.update!(p::TPoisson{T}) where T
+    db = p.dirty
+    if db !== nothing && db.valid
+        dlo, dhi = db.lo, db.hi
+        db.valid = false
+        dlo[1] > dhi[1] && return p
+        for l in eachindex(p.levels)
+            lv = p.levels[l]; op = lv.op; g = op.g
+            if l > 1
+                f = p.levels[l-1]
+                dlo = ntuple(d -> f.c[d] ? (dlo[d] + 2) ÷ 2 : dlo[d], length(dlo))
+                dhi = ntuple(d -> f.c[d] ? (dhi[d] + 2) ÷ 2 : dhi[d], length(dhi))
+                dlo, dhi = clip_box(dlo, dhi, inside_lo(g), inside_hi(g))
+                launch(k_restrictL!, dlo, dhi, op.L, g, f.op.L, f.op.g, f.c)
+                any(j -> p.per[j], 1:length(g.n)) && vecBC0!(op.L, g, p.per, false)
+            end
+            diag_lo, diag_hi = update_box(dlo, dhi, g, p.per, 1, 0)
+            if l == 1
+                checkcap(p.red, nblocks(diag_lo, diag_hi))
+                nb = launch(k_diag_delta!, diag_lo, diag_hi, p.red.ps, p.red.pm, op.L, op.Dg, op.iD, op.reg, g, op.Lreg)
+                if nb > 0
+                    finish!(p.red, nb, p.red.s, p.red.m, SLOT_RSUM)
+                    @cuda k_add_nsd!(p.nsd, p.red.s, Int32(SLOT_RSUM))
+                end
+            else
+                launch(k_diag_coarse!, diag_lo, diag_hi, op.L, op.Dg, op.iD, op.reg, g, op.Lreg)
+            end
+            deep_lo, deep_hi = update_box(dlo, dhi, g, p.per, 2, 1)
+            set_deep!(op, deep_lo, deep_hi)
+        end
+        return p
+    end
     for l in eachindex(p.levels)
         lv = p.levels[l]; op = lv.op; g = op.g
         if l > 1
@@ -195,11 +308,14 @@ function WaterLily.update!(p::TPoisson{T}) where T
             # written, and no stencil reads the tangential ghosts of L.
             any(j-> p.per[j], 1:length(g.n)) && vecBC0!(op.L, g, p.per, false)
         end
-        checkcap(p.red, nblocks(inside_lo(g), inside_hi(g)))
-        nb = launch(k_diag!, inside_lo(g), inside_hi(g), p.red.ps, p.red.pm, op.L, op.Dg, op.iD, op.reg, g, op.Lreg)
+        if l == 1
+            checkcap(p.red, nblocks(inside_lo(g), inside_hi(g)))
+            nb = launch(k_diag!, inside_lo(g), inside_hi(g), p.red.ps, p.red.pm, op.L, op.Dg, op.iD, op.reg, g, op.Lreg)
+            finish!(p.red, nb, p.nsd, p.red.m, 1)
+        else
+            launch(k_diag_coarse!, inside_lo(g), inside_hi(g), op.L, op.Dg, op.iD, op.reg, g, op.Lreg)
+        end
         set_deep!(op)
-        # the number of solved rows of level 1, to p.nsd[1] (its max half is not used)
-        l == 1 && finish!(p.red, nb, p.nsd, p.red.m, 1)
     end
     return p
 end

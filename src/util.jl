@@ -203,6 +203,42 @@ end
 inside_lo(::Grid{D}) where D = ntuple(_->2, D)
 inside_hi(g::Grid{D}) where D = ntuple(d->Int(g.n[d])-1, D)
 
+"""
+    DirtyBox{D}
+
+Bounding box of cells modified by `measure!` (and the `0 < μ₀ < 1` transition box for
+Biot-Savart), shared between `TFlow` and `TPoisson` so `update!` and `body_box!` touch only
+the changed region after body motion.
+"""
+mutable struct DirtyBox{D}
+    valid :: Bool
+    lo :: NTuple{D,Int}
+    hi :: NTuple{D,Int}
+    tvalid :: Bool
+    tlo :: NTuple{D,Int}
+    thi :: NTuple{D,Int}
+end
+DirtyBox(::Val{D}) where D = DirtyBox{D}(false, ntuple(_->2, D), ntuple(_->1, D), false, ntuple(_->2, D), ntuple(_->1, D))
+
+# Warp-reduced axis-aligned bounding box of cells with `pred`, atomically merged into
+# `bst[off+1:off+3]` (lo) and `bst[off+4:off+6]` (hi). All 32 lanes of the warp must call it.
+@inline function warp_box!(bst, off, pred::Bool, I::NTuple{D,Int32}) where D
+    vote_ballot_sync(0xffffffff, pred) == 0 && return nothing
+    @unroll for d in i32:Int32(D)
+        lo = pred ? I[d] : typemax(Int32); hi = pred ? I[d] : typemin(Int32)
+        o = Int32(16)
+        while o > 0
+            lo = min(lo, shfl_down_sync(0xffffffff, lo, o)); hi = max(hi, shfl_down_sync(0xffffffff, hi, o))
+            o >>= 1
+        end
+        if flat_tid() % Int32(32) == 0 && lo != typemax(Int32)
+            CUDA.atomic_min!(pointer(bst, off + d), lo)
+            CUDA.atomic_max!(pointer(bst, off + 3 + d), hi)
+        end
+    end
+    return nothing
+end
+
 # ---------------------------------------------------------------- reductions
 # (sum,max) over the warp, returned on lane 1; `s` is a Float32 or Float64 sum
 @inline function warp_red(s::Union{Float32,Float64}, m::Float32)
@@ -246,8 +282,50 @@ end
     end
     return nothing
 end
+"Write this block's (sum1, sum2, max) partials to `ps/ps2/pm[block]`."
+@inline function block_partial2!(ps, ps2, pm, s1::Float32, s2::Float32, m::Float32)
+    shs1 = CuStaticSharedArray(Float32, 32)
+    shs2 = CuStaticSharedArray(Float32, 32)
+    shm = CuStaticSharedArray(Float32, 32)
+    t = flat_tid()
+    nt = blockDim().x*blockDim().y*blockDim().z
+    off = Int32(16)
+    while off > 0
+        s1 += shfl_down_sync(0xffffffff, s1, off)
+        s2 += shfl_down_sync(0xffffffff, s2, off)
+        m = max(m, shfl_down_sync(0xffffffff, m, off))
+        off >>= 1
+    end
+    lane = t % Int32(32) + i32
+    wid = t ÷ Int32(32) + i32
+    nw = (nt + Int32(31)) ÷ Int32(32)
+    if lane == i32
+        @inbounds shs1[wid] = s1; @inbounds shs2[wid] = s2; @inbounds shm[wid] = m
+    end
+    sync_threads()
+    if wid == i32
+        s1 = lane <= nw ? @inbounds(shs1[lane]) : 0f0
+        s2 = lane <= nw ? @inbounds(shs2[lane]) : 0f0
+        m = lane <= nw ? @inbounds(shm[lane]) : 0f0
+        off = Int32(16)
+        while off > 0
+            s1 += shfl_down_sync(0xffffffff, s1, off)
+            s2 += shfl_down_sync(0xffffffff, s2, off)
+            m = max(m, shfl_down_sync(0xffffffff, m, off))
+            off >>= 1
+        end
+        if lane == i32
+            b = flat_bid()
+            @inbounds ps[b] = s1; @inbounds ps2[b] = s2; @inbounds pm[b] = m
+        end
+    end
+    return nothing
+end
+@inline skip_fix(::Nothing) = false
+@inline skip_fix(fixd) = abs(@inbounds(fixd[1])) <= @inbounds(fixd[2])
 # (sum,max) of the block partials 1:nb, grid-strided; block b writes its result to outs/outm[k+b-1]
-function k_finish!(ps, pm, nb::Int32, outs, outm, k::Int32)
+function k_finish!(ps, pm, nb::Int32, outs, outm, k::Int32, fixd=nothing)
+    skip_fix(fixd) && return nothing
     s = 0.0; m = 0f0
     i = (blockIdx().x - i32)*blockDim().x + threadIdx().x
     while i <= nb
@@ -261,7 +339,8 @@ function k_finish!(ps, pm, nb::Int32, outs, outm, k::Int32)
     return nothing
 end
 # (sum,max) of Float64/Float32 values 1:nq in one block
-function k_finish2!(qs, qm, nq::Int32, outs, outm, k::Int32)
+function k_finish2!(qs, qm, nq::Int32, outs, outm, k::Int32, fixd=nothing)
+    skip_fix(fixd) && return nothing
     i = threadIdx().x
     s = i <= nq ? @inbounds(qs[i]) : 0.0; m = i <= nq ? @inbounds(qm[i]) : 0f0
     s, m = block_red(s, m)
@@ -286,6 +365,7 @@ struct RedBuf
     s::CuVector{Float64}
     m::CuVector{Float64}
     ps::CuVector{Float32}
+    ps2::CuVector{Float32}   # second per-block sum partial (e.g. Biot-Savart residual L1)
     pm::CuVector{Float32}
     hs::Vector{Float64}
     qs::CuVector{Float64}    # per-block results of the first level of `finish!`
@@ -294,22 +374,22 @@ end
 const FINISH_BLOCKS = 64
 function RedBuf(nb::Integer, n=8)
     s = CUDA.zeros(Float64, 2n)
-    RedBuf(s, view(s, n+1:2n), CUDA.zeros(Float32,nb), CUDA.zeros(Float32,nb), zeros(Float64,2n),
-        CUDA.zeros(Float64, FINISH_BLOCKS), CUDA.zeros(Float32, FINISH_BLOCKS))
+    RedBuf(s, view(s, n+1:2n), CUDA.zeros(Float32,nb), CUDA.zeros(Float32,nb), CUDA.zeros(Float32,nb),
+        zeros(Float64,2n), CUDA.zeros(Float64, FINISH_BLOCKS), CUDA.zeros(Float32, FINISH_BLOCKS))
 end
 """
-    finish!(b::RedBuf, nb, outs, outm, k)
+    finish!(b::RedBuf, nb, outs, outm, k; ps=b.ps)
 
-Reduce the block partials `b.ps/pm[1:nb]` into `outs[k]` (Float64 sum) and `outm[k]` (max).
+Reduce the block partials `ps/b.pm[1:nb]` into `outs[k]` (Float64 sum) and `outm[k]` (max).
 FP64 runs at 1/32 rate on GeForce cards, so many partials are first reduced by
 `FINISH_BLOCKS` blocks, then by one.
 """
-function finish!(b::RedBuf, nb, outs, outm, k)
+function finish!(b::RedBuf, nb, outs, outm, k; ps=b.ps, fixd=nothing)
     if nb <= 16384
-        @cuda threads=1024 k_finish!(b.ps, b.pm, Int32(nb), outs, outm, Int32(k))
+        @cuda threads=1024 k_finish!(ps, b.pm, Int32(nb), outs, outm, Int32(k), fixd)
     else
-        @cuda threads=256 blocks=FINISH_BLOCKS k_finish!(b.ps, b.pm, Int32(nb), b.qs, b.qm, i32)
-        @cuda threads=FINISH_BLOCKS k_finish2!(b.qs, b.qm, Int32(FINISH_BLOCKS), outs, outm, Int32(k))
+        @cuda threads=256 blocks=FINISH_BLOCKS k_finish!(ps, b.pm, Int32(nb), b.qs, b.qm, i32, fixd)
+        @cuda threads=FINISH_BLOCKS k_finish2!(b.qs, b.qm, Int32(FINISH_BLOCKS), outs, outm, Int32(k), fixd)
     end
     return nothing
 end

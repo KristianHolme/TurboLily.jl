@@ -63,6 +63,19 @@ end
     p = (f(shift(I,1,1), nbp(g,I,l,1,per)), f(shift(I,2,1), nbp(g,I,l,2,per)))
     return Pre(I, f(I, l), m, p)
 end
+# Like `Pre`, without loading the centre cell (for `offdiag_f`, which reads neighbours only).
+@inline function PreOff(f::F, op::Op{3}, I, l) where F
+    g, per = op.g, op.per
+    m = (f(shift(I,1,-1), nbm(g,I,l,1,per)), f(shift(I,2,-1), nbm(g,I,l,2,per)), f(shift(I,3,-1), nbm(g,I,l,3,per)))
+    p = (f(shift(I,1,1), nbp(g,I,l,1,per)), f(shift(I,2,1), nbp(g,I,l,2,per)), f(shift(I,3,1), nbp(g,I,l,3,per)))
+    return Pre(I, zero(m[1]), m, p)
+end
+@inline function PreOff(f::F, op::Op{2}, I, l) where F
+    g, per = op.g, op.per
+    m = (f(shift(I,1,-1), nbm(g,I,l,1,per)), f(shift(I,2,-1), nbm(g,I,l,2,per)))
+    p = (f(shift(I,1,1), nbp(g,I,l,1,per)), f(shift(I,2,1), nbp(g,I,l,2,per)))
+    return Pre(I, zero(m[1]), m, p)
+end
 "Preloaded values times a constant (r·iDreg around a cell flagged `isdeep`)."
 struct Scaled{P,T}; p::P; s::T; end
 @inline (f::Scaled)(Ip, lp) = f.p(Ip, lp)*f.s
@@ -143,18 +156,19 @@ function k_regflag!(lo, hi, reg, L, g::Grid{D}, Lreg) where D
     return nothing
 end
 # bit 0x02: the cell and its 2d neighbours (wrapped in periodic directions) are regular.
-# Only bit 0x02 is written, so concurrent reads of bit 0x01 are unaffected.
+# Only bit 0x02 is modified, so concurrent reads of bit 0x01 are unaffected.
 function k_deepflag!(lo, hi, reg, g::Grid{D}, per) where D
     I, ok = cellidx(lo, hi); ok || return
     l = lin(g, I)
-    b = @inbounds(reg[l]) & 0x01
+    r0 = @inbounds(reg[l]) & 0x01
+    b = r0
     @unroll for j in i32:Int32(D)
         b &= @inbounds(reg[nbm(g,I,l,j,per)]) & @inbounds(reg[nbp(g,I,l,j,per)])
     end
-    b != 0x00 && (@inbounds reg[l] = 0x03)
+    @inbounds reg[l] = b != 0x00 ? 0x03 : r0
     return nothing
 end
-set_deep!(op::Op) = launch(k_deepflag!, inside_lo(op.g), inside_hi(op.g), op.reg, op.g, op.per)
+set_deep!(op::Op, lo=inside_lo(op.g), hi=inside_hi(op.g)) = launch(k_deepflag!, lo, hi, op.reg, op.g, op.per)
 "Recompute the regular-cell flags from `L` (after `L` changed)."
 function set_reg!(lv::Level{D,T}) where {D,T}
     op = lv.op; g = op.g
@@ -204,19 +218,38 @@ struct TPoisson{T,S,V,D,R,P,M<:MultiLevelPoisson{T,S,V}} <: AbstractPoisson{T,S,
     nsd :: CuVector{Float64}         # number of solved rows, count(iD≠0), on the device
     graphs :: Dict{GraphKey,Union{Nothing,CuGraphExec}}   # see `graphed!`
     seen :: Set{GraphKey}
+    dirty :: Union{Nothing,DirtyBox{D}}
+    ϵ1 :: CuVector{Float16}          # level-1 scaled Float16 δz buffer (aliases first half of levels[1].ϵ)
+    r1 :: CuVector{Float16}          # level-1 scaled Float16 r̃ buffer (aliases second half of levels[1].ϵ)
+    scd :: CuVector{Float32}         # [sc, 1/sc] dynamic Float16 scale on the device
+    usevrb :: Bool                   # V(1_RBGS, 2_RBGS): Float16 δz + Float32 cx on level 1, Float32 coarse
 end
-function TPoisson(x::AbstractArray{T,D}, L, z; perdir=()) where {T,D}
+function TPoisson(x::AbstractArray{T,D}, L, z; perdir=(), dirty=nothing) where {T,D}
     ml = MultiLevelPoisson(x, L, z; perdir)
     nl = length(ml.levels)
     per = Per(ntuple(j->j ∈ perdir, D))
     levels = [Level(ml.levels[l], l < nl ? coarsen_mask(ml.levels[l].x, ml.levels[l+1].x) : ntuple(_->false,D), per) for l in 1:nl]
+    usevrb = nl >= 2 && !any(lv -> oddper(lv.op), levels)
+    if usevrb
+        e0 = levels[1].ϵ
+        fill!(e0, zero(T))
+        n = length(e0)
+        ptr = reinterpret(CuPtr{Float16}, pointer(e0))
+        ϵ1 = unsafe_wrap(CuArray, ptr, n; own=false)
+        r1 = unsafe_wrap(CuArray, ptr + sizeof(Float16) * n, n; own=false)
+    else
+        ϵ1 = CUDA.zeros(Float16, 1)
+        r1 = CUDA.zeros(Float16, 1)
+    end
     p = TPoisson{T,typeof(x),typeof(L),D,typeof(levels[1].op.reg),typeof(per),typeof(ml)}(x, L, z, ml, levels, per, Int16[], perdir, RedBuf(Grid(x)),
         CUDA.ones(Float32, 2), CUDA.zeros(Float32, 2), CUDA.zeros(Float64, 1),
-        Dict{GraphKey,Union{Nothing,CuGraphExec}}(), Set{GraphKey}())
+        Dict{GraphKey,Union{Nothing,CuGraphExec}}(), Set{GraphKey}(), dirty,
+        ϵ1, r1, CuVector{Float32}(Float32[1f0, 1f0]), usevrb)
     finish_update!(p)
 end
-TPoisson(flow::AbstractFlow) = TPoisson(flow.p, flow.μ₀, flow.σ; perdir=flow.perdir)
+TPoisson(flow::AbstractFlow) = TPoisson(flow.p, flow.μ₀, flow.σ; perdir=flow.perdir, dirty = flow isa TFlow ? flow.dirty : nothing)
 function finish_update!(p::TPoisson)
+    p.dirty !== nothing && (p.dirty.valid = false)
     foreach(set_reg!, p.levels)       # sets Lreg per level (the fluid value of L)
     return WaterLily.update!(p)
 end
@@ -544,7 +577,272 @@ usegs2(op::Op) = false
 function gs2!(ϵi, ϵo, r, op::Op{3}, k0)
     g = op.g
     bl = (cld(Int(g.n[1]) - 2, GS2_TX - 2), cld(Int(g.n[2]) - 2, GS2_TY - 2), cld(Int(g.n[3]) - 2, GS2_CH))
-    @cuda maxregs=64 threads=(GS2_TX, GS2_TY) blocks=bl k_gs2!(ϵi, ϵo, r, op, Int32(k0))
+    @cuda threads=(GS2_TX, GS2_TY) blocks=bl k_gs2!(ϵi, ϵo, r, op, Int32(k0))
+end
+
+# ---------------------------------------------------------------- V(1_RBGS, 2_RBGS) cycle
+# Level 1 splits the correction as `prol(cx) + δz`: the smooth coarse solution `cx` stays in
+# Float32 (zero quantization noise on large grids) while the local high-frequency `δz` and
+# shifted residual `r̃ = r - A·prol(cx)` run in dynamically scaled Float16 (`sc = 1 / max|r|`),
+# aliasing `levels[1].ϵ` (zero extra GPU memory). Coarse levels (l ≥ 2) run in Float32.
+@inline pack16(x::Float32, sc::Float32) = Float16(clamp(x * sc, -65000f0, 65000f0))
+struct CastF32{S}; a::S; end
+@inline (f::CastF32)(I, l) = Float32(@inbounds f.a[l])
+# Apply the mean-residual fix (WaterLily.residual!) to `r` in place when |s| > tiny,
+# and reduce Σ|r| into `ps` (SLOT_R0 for `k_omega!`). Returns immediately when |s| ≤ tiny
+# since `k_resid_src!`/`k_residual!` already populated SLOT_R0.
+function k_fix_r!(lo, hi, ps, pm, r, op::Op{D}, fixd) where D
+    skip_fix(fixd) && return nothing
+    I, ok = cellidx(lo, hi)
+    a = 0f0
+    if ok
+        l = lin(op.g, I)
+        v = getiD(op, l) == 0 ? 0f0 : @inbounds(r[l]) - @inbounds(fixd[1])
+        @inbounds r[l] = v
+        a = abs(v)
+    end
+    block_partial!(ps, pm, a, a)
+    return nothing
+end
+# Pass 1a (level 1): full RBGS pre-sweep from ϵ=0 into scaled Float16 `ϵ1`.
+function k_pre_rb16!(lo, hi, ϵ1, r, op::Op{D}, scd) where D
+    sc = @inbounds scd[1]
+    I, ok = cellidx(lo, hi); ok || return
+    g = op.g; l = lin(g, I)
+    sidx = D == 3 ? (I[1] + I[2] + I[3]) : (I[1] + I[2])
+    if isodd(sidx)
+        @inbounds ϵ1[l] = pack16(@inbounds(r[l]) * getiD(op, l), sc)
+    else
+        pr = Pre(AV(r), op, I, l)
+        e = isdeep(op, l) ?
+            (pr.c - offdiag_f(op, I, l, Scaled(pr, op.iDreg))) * op.iDreg :
+            (pr.c - offdiag_f(op, I, l, RiD(r, op))) * getiD(op, l)
+        @inbounds ϵ1[l] = pack16(e, sc)
+    end
+    return nothing
+end
+# Pass 1a (coarse levels, Float32): full RBGS pre-sweep from ϵ=0.
+function k_pre_rb32!(lo, hi, ϵ, r, op::Op{D}) where D
+    I, ok = cellidx(lo, hi); ok || return
+    g = op.g; l = lin(g, I)
+    sidx = D == 3 ? (I[1] + I[2] + I[3]) : (I[1] + I[2])
+    if isodd(sidx)
+        @inbounds ϵ[l] = r[l] * getiD(op, l)
+    else
+        pr = Pre(AV(r), op, I, l)
+        e = isdeep(op, l) ?
+            (pr.c - offdiag_f(op, I, l, Scaled(pr, op.iDreg))) * op.iDreg :
+            (pr.c - offdiag_f(op, I, l, RiD(r, op))) * getiD(op, l)
+        @inbounds ϵ[l] = e
+    end
+    return nothing
+end
+# Pass 1b: restrict r₁ = r - A·ϵ after the full RBGS pre-sweep. On black cells r₁ ≡ 0;
+# on red cells (odd sum(J)) r₁ = -offdiag(ϵ_blk). Writes Float32 `rc` and zeroes `cx`.
+function k_restrict_rb!(lo, hi, rc, cx, gc::Grid{D}, ϵb, op::Op{D}, c::Per, scd) where D
+    I, ok = cellidx(lo, hi); ok || return
+    isc = eltype(ϵb) === Float16 ? @inbounds(scd[2]) : 1f0
+    gf = op.g
+    J0 = ntuple(d -> c[d] ? Int32(2)*I[d] - Int32(2) : I[d], Val(D))
+    fe = CastF32(ϵb)
+    s = 0f0
+    if D == 3
+        for dz in 0:Int(c[3]), dy in 0:Int(c[2]), dx in 0:Int(c[1])
+            J = (J0[1] + Int32(dx), J0[2] + Int32(dy), J0[3] + Int32(dz))
+            if isodd(J[1] + J[2] + J[3])
+                s -= offdiag_f(op, J, lin(gf, J), fe)
+            end
+        end
+    else
+        for dy in 0:Int(c[2]), dx in 0:Int(c[1])
+            J = (J0[1] + Int32(dx), J0[2] + Int32(dy))
+            if isodd(J[1] + J[2])
+                s -= offdiag_f(op, J, lin(gf, J), fe)
+            end
+        end
+    end
+    lc = lin(gc, I)
+    @inbounds rc[lc] = s * isc
+    @inbounds cx[lc] = 0f0
+    return nothing
+end
+# Coarse-face deltas `cx[Ic ± δ_j] - cc` for `A·prol(cx)` (at most 1 non-zero per coarsened axis).
+@inline function coarse_d1(cx, gc::Grid, Ic, lc, Ij, j, cj::Bool, per, cc::Float32)
+    if cj
+        lc2 = iseven(Ij) ? nbm(gc, Ic, lc, j, per) : nbp(gc, Ic, lc, j, per)
+        return (@inbounds(cx[lc2]) - cc), 0f0
+    else
+        return (@inbounds(cx[nbm(gc, Ic, lc, j, per)]) - cc),
+               (@inbounds(cx[nbp(gc, Ic, lc, j, per)]) - cc)
+    end
+end
+@inline function aprol_terms(cx, gc::Grid{3}, c::Per, per, I, Ic, lc, cc::Float32)
+    d1m, d1p = coarse_d1(cx, gc, Ic, lc, I[1], 1, c[1], per, cc)
+    d2m, d2p = coarse_d1(cx, gc, Ic, lc, I[2], 2, c[2], per, cc)
+    d3m, d3p = coarse_d1(cx, gc, Ic, lc, I[3], 3, c[3], per, cc)
+    return (d1m, d2m, d3m), (d1p, d2p, d3p)
+end
+@inline function aprol_terms(cx, gc::Grid{2}, c::Per, per, I, Ic, lc, cc::Float32)
+    d1m, d1p = coarse_d1(cx, gc, Ic, lc, I[1], 1, c[1], per, cc)
+    d2m, d2p = coarse_d1(cx, gc, Ic, lc, I[2], 2, c[2], per, cc)
+    return (d1m, d2m), (d1p, d2p)
+end
+@inline function aprol_irreg(op::Op{3}, I, l, c::Per, dm, dp)
+    g = op.g; nc = g.nc
+    s = c[1] ? @inbounds(op.L[l + (iseven(I[1]) ? Int32(0) : i32)]) * dm[1] :
+               (@inbounds(op.L[l]) * dm[1] + @inbounds(op.L[l + i32]) * dp[1])
+    s += c[2] ? @inbounds(op.L[l + nc + (iseven(I[2]) ? Int32(0) : g.s[2])]) * dm[2] :
+                (@inbounds(op.L[l + nc]) * dm[2] + @inbounds(op.L[l + nc + g.s[2]]) * dp[2])
+    s += c[3] ? @inbounds(op.L[l + Int32(2)*nc + (iseven(I[3]) ? Int32(0) : g.s[3])]) * dm[3] :
+                (@inbounds(op.L[l + Int32(2)*nc]) * dm[3] + @inbounds(op.L[l + Int32(2)*nc + g.s[3]]) * dp[3])
+    return s
+end
+@inline function aprol_irreg(op::Op{2}, I, l, c::Per, dm, dp)
+    g = op.g; nc = g.nc
+    s = c[1] ? @inbounds(op.L[l + (iseven(I[1]) ? Int32(0) : i32)]) * dm[1] :
+               (@inbounds(op.L[l]) * dm[1] + @inbounds(op.L[l + i32]) * dp[1])
+    s += c[2] ? @inbounds(op.L[l + nc + (iseven(I[2]) ? Int32(0) : g.s[2])]) * dm[2] :
+                (@inbounds(op.L[l + nc]) * dm[2] + @inbounds(op.L[l + nc + g.s[2]]) * dp[2])
+    return s
+end
+@inline aprol_regsum(dm::NTuple{3,Float32}, dp::NTuple{3,Float32}) = dm[1] + dp[1] + dm[2] + dp[2] + dm[3] + dp[3]
+@inline aprol_regsum(dm::NTuple{2,Float32}, dp::NTuple{2,Float32}) = dm[1] + dp[1] + dm[2] + dp[2]
+@inline pre_odsum(pe::Pre{3,Float32}) = pe.m[1] + pe.p[1] + pe.m[2] + pe.p[2] + pe.m[3] + pe.p[3]
+@inline pre_odsum(pe::Pre{2,Float32}) = pe.m[1] + pe.p[1] + pe.m[2] + pe.p[2]
+
+# Pass 2 (level 1, in-place on `ϵ1`): computes Float32 `r̃ = r - A·prol(cx)` into Float16 `r1`,
+# leaves black cells of `ϵ1` untouched (`δz_blk = ϵ_blk`), and runs the first red GS sweep on `ϵ1`.
+function k_prol_dz!(lo, hi, ϵ1, r1, cx, gc::Grid{D}, c::Per, r, op::Op{D}, scd) where D
+    I, ok = cellidx(lo, hi); ok || return
+    sc = @inbounds scd[1]; isc = @inbounds scd[2]
+    g = op.g; l = lin(g, I)
+    Ic = down(I, c); lc = lin(gc, Ic)
+    cc = @inbounds cx[lc]
+    dm, dp = aprol_terms(cx, gc, c, op.per, I, Ic, lc, cc)
+    reg = isreg(op, l)
+    ap = reg ? op.Lreg * aprol_regsum(dm, dp) : aprol_irreg(op, I, l, c, dm, dp)
+    rt = @inbounds(r[l]) - ap
+    @inbounds r1[l] = pack16(rt, sc)
+    sidx = D == 3 ? (I[1] + I[2] + I[3]) : (I[1] + I[2])
+    if isodd(sidx)
+        pe = PreOff(CastF32(ϵ1), op, I, l)
+        od = reg ? op.Lreg * pre_odsum(pe) : offdiag_f(op, I, l, pe)
+        iD = reg ? op.iDreg : @inbounds(op.iD[l])
+        @inbounds ϵ1[l] = pack16((rt - isc * od) * iD, sc)
+    end
+    return nothing
+end
+# Pass 2 (coarse levels, Float32): fused prolongation (`ϵb + prol(cx)`) and first red GS sweep.
+@inline function cnb_pair(cx, gc::Grid, Ic, lc, Ij, j, cj::Bool, per, cc::Float32)
+    if cj
+        if iseven(Ij)
+            return @inbounds(cx[nbm(gc, Ic, lc, j, per)]), cc
+        else
+            return cc, @inbounds(cx[nbp(gc, Ic, lc, j, per)])
+        end
+    else
+        return @inbounds(cx[nbm(gc, Ic, lc, j, per)]), @inbounds(cx[nbp(gc, Ic, lc, j, per)])
+    end
+end
+function k_vprol_red!(lo, hi, zb, ϵb, cx, gc::Grid{D}, c::Per, rb, op::Op{D}) where D
+    I, ok = cellidx(lo, hi); ok || return
+    g, per = op.g, op.per
+    l = lin(g, I)
+    Ic = down(I, c); lc = lin(gc, Ic)
+    cc = @inbounds cx[lc]
+    sidx = D == 3 ? (I[1] + I[2] + I[3]) : (I[1] + I[2])
+    if iseven(sidx)
+        @inbounds zb[l] = ϵb[l] + cc
+    else
+        em = PreOff(AV(ϵb), op, I, l)
+        if D == 3
+            cm1, cp1 = cnb_pair(cx, gc, Ic, lc, I[1], 1, c[1], per, cc)
+            cm2, cp2 = cnb_pair(cx, gc, Ic, lc, I[2], 2, c[2], per, cc)
+            cm3, cp3 = cnb_pair(cx, gc, Ic, lc, I[3], 3, c[3], per, cc)
+            pe = Pre(I, 0f0, (em.m[1] + cm1, em.m[2] + cm2, em.m[3] + cm3),
+                             (em.p[1] + cp1, em.p[2] + cp2, em.p[3] + cp3))
+        else
+            cm1, cp1 = cnb_pair(cx, gc, Ic, lc, I[1], 1, c[1], per, cc)
+            cm2, cp2 = cnb_pair(cx, gc, Ic, lc, I[2], 2, c[2], per, cc)
+            pe = Pre(I, 0f0, (em.m[1] + cm1, em.m[2] + cm2),
+                             (em.p[1] + cp1, em.p[2] + cp2))
+        end
+        @inbounds zb[l] = (@inbounds(rb[l]) - offdiag_f(op, I, l, pe)) * getiD(op, l)
+    end
+    return nothing
+end
+# Single RBGS half sweep on Float16 (`ϵ1`/`r1`, level 1) or Float32 (coarse levels).
+function k_vgs_s!(lo, hi, zb, rb, op::Op{D}, k0::Int32) where D
+    Iv, ok = cellidx(lo, hi); ok || return
+    E = eltype(zb)
+    g = op.g
+    fs = Int32(0)
+    @unroll for d in i32:Int32(D-1)
+        fs += Iv[d]
+    end
+    p = (fs + k0) % Int32(2)
+    k = Int32(2)*Iv[D] - i32 - p
+    k <= g.n[D] - i32 || return
+    I = setj(Iv, D, k); l = lin(g, I)
+    pe = PreOff(CastF32(zb), op, I, l)
+    v = (Float32(@inbounds rb[l]) - offdiag_f(op, I, l, pe)) * getiD(op, l)
+    @inbounds zb[l] = E === Float16 ? Float16(clamp(v, -65000f0, 65000f0)) : v
+    return nothing
+end
+# Coarse-level final black GS sweep: copies red cells and updates black cells directly into `xb`.
+function k_vblk_coarse!(lo, hi, xb, zb, rb, op::Op{D}) where D
+    I, ok = cellidx(lo, hi); ok || return
+    g = op.g; l = lin(g, I)
+    sidx = D == 3 ? (I[1] + I[2] + I[3]) : (I[1] + I[2])
+    if isodd(sidx)
+        @inbounds xb[l] = zb[l]
+    else
+        pe = PreOff(AV(zb), op, I, l)
+        @inbounds xb[l] = (@inbounds(rb[l]) - offdiag_f(op, I, l, pe)) * getiD(op, l)
+    end
+    return nothing
+end
+# Level-1 FP32 outer update: `r -= ω·(A·prol(cx) + A·(δz/sc))`, `x += ω·(prol(cx) + δz/sc)`, plus norms.
+function k_incr_dz!(lo, hi, ps, pm, r, x, ϵ1, cx, gc::Grid{D}, c::Per, op::Op{D}, ωd, scd, ::Val{exclb}) where {D, exclb}
+    I, ok = cellidx(lo, hi)
+    ω = @inbounds ωd[1]; isc = @inbounds scd[2]
+    a = 0f0; m = 0f0
+    if ok
+        g = op.g; l = lin(g, I)
+        pe = Pre(CastF32(ϵ1), op, I, l)
+        Ic = down(I, c); lc = lin(gc, Ic)
+        cc = @inbounds cx[lc]
+        dm, dp = aprol_terms(cx, gc, c, op.per, I, Ic, lc, cc)
+        if isreg(op, l)
+            az = op.Lreg * (aprol_regsum(dm, dp) + isc * (pre_odsum(pe) - Float32(2D) * pe.c))
+        else
+            az = aprol_irreg(op, I, l, c, dm, dp) + isc * mult_f(op, I, l, pe)
+        end
+        v = @inbounds(r[l]) - ω * az
+        @inbounds r[l] = v
+        @inbounds x[l] += ω * (cc + isc * pe.c)
+        a = abs(v)
+        edge = false
+        if exclb
+            @unroll for d in i32:Int32(D)
+                edge |= (I[d] == Int32(2)) | (I[d] == g.n[d] - i32)
+            end
+        end
+        m = edge ? 0f0 : a
+    end
+    block_partial!(ps, pm, a, m)
+    return nothing
+end
+function k_set_scale!(scd, maxs, slot::Int32)
+    rm = Float32(@inbounds maxs[slot])
+    sc = rm > 1f-30 ? inv(rm) : 1f0
+    @inbounds scd[1] = sc; @inbounds scd[2] = inv(sc)
+    return nothing
+end
+function k_set_scale_val!(scd, rm::Float32)
+    sc = rm > 1f-30 ? inv(rm) : 1f0
+    @inbounds scd[1] = sc; @inbounds scd[2] = inv(sc)
+    return nothing
 end
 
 # perBC! for a scalar field
@@ -768,15 +1066,83 @@ function bottom_index(p::TPoisson)
     end
     return lb <= nl ? lb : 0
 end
-function bottom!(p::TPoisson, lb)
+function bottom!(p::TPoisson, lb; swap::Bool=true)
     lv = Tuple(DLevel(v.op, v.x, v.ϵ, v.r, v.c) for v in p.levels[lb:end])
     kern = @cuda launch=false k_bottom!(lv, p.ωd)
     # 512 threads, fewer where the kernel's registers do not allow a block of that size (196 per
     # thread on sm_90); the passes stride by blockDim, so the thread count does not change the result
     kern(lv, p.ωd; threads=fit_threads((512,), CUDA.maxthreads(kern)))
-    for l in lb:length(p.levels)-1
-        v = p.levels[l]; v.r, v.ϵ = v.ϵ, v.r
+    if swap
+        for l in lb:length(p.levels)-1
+            v = p.levels[l]; v.r, v.ϵ = v.ϵ, v.r
+        end
     end
+end
+
+# Coarse-level recursion for the V(1_RBGS, 2_RBGS) cycle (all Float32).
+function vrb_coarse!(p::TPoisson, l::Int, lb::Int)
+    fine, coarse = p.levels[l], p.levels[l+1]
+    gf, gc = fine.op.g, coarse.op.g
+    cp = Per(fine.c)
+    launch(k_pre_rb32!, inside_lo(gf), inside_hi(gf), fine.ϵ, fine.r, fine.op)
+    launch(k_restrict_rb!, inside_lo(gc), inside_hi(gc), coarse.r, coarse.x, gc, fine.ϵ, fine.op, cp, p.scd)
+    if l + 1 == lb
+        bottom!(p, lb; swap=false)
+    elseif l + 1 < length(p.levels)
+        vrb_coarse!(p, l + 1, lb)
+    else
+        # coarsest level when no level fits in `k_bottom!`: 3 full RBGS sweeps into `coarse.x`
+        launch(k_pre_rb32!, inside_lo(gc), inside_hi(gc), coarse.x, coarse.r, coarse.op)
+        clo, chi = gs_range(gc)
+        for k0 in (Int32(2), Int32(1), Int32(2), Int32(1))
+            launch(k_vgs_s!, clo, chi, coarse.x, coarse.r, coarse.op, k0)
+        end
+    end
+    launch(k_vprol_red!, inside_lo(gf), inside_hi(gf), fine.z, fine.ϵ, coarse.x, gc, cp, fine.r, fine.op)
+    lo, hi = gs_range(gf)
+    launch(k_vgs_s!, lo, hi, fine.z, fine.r, fine.op, Int32(1))
+    launch(k_vgs_s!, lo, hi, fine.z, fine.r, fine.op, Int32(2))
+    launch(k_vblk_coarse!, inside_lo(gf), inside_hi(gf), fine.x, fine.z, fine.r, fine.op)
+    return nothing
+end
+# One V-cycle iteration: scaled Float16 `δz` + exact Float32 `prol(cx)` on level 1 (5 post
+# half-sweeps for `TPoisson` to keep cut-cell `r∞` single-cycle; 4 for Biot-Savart `exclb`),
+# Float32 on coarse levels. Leaves all level buffers unswapped and `top.z` untouched.
+function vrb_iter!(p::TPoisson; fix::Bool=false, exclb::Bool=false, adapt::Bool=true)
+    lb = bottom_index(p)
+    top, c2 = p.levels[1], p.levels[2]
+    g1, g2 = top.op.g, c2.op.g
+    cp = Per(top.c)
+    if fix
+        @cuda k_mkfix!(p.fixd, p.red.s, p.nsd)
+        checkcap(p.red, nblocks(inside_lo(g1), inside_hi(g1)))
+        nb = launch(k_fix_r!, inside_lo(g1), inside_hi(g1), p.red.ps, p.red.pm, top.r, top.op, p.fixd; cap=length(p.red.ps))
+        finish!(p.red, nb, p.red.s, p.red.m, SLOT_R0; fixd=p.fixd)
+        @cuda k_set_scale!(p.scd, p.red.m, Int32(SLOT_R0))
+    end
+    launch(k_pre_rb16!, inside_lo(g1), inside_hi(g1), p.ϵ1, top.r, top.op, p.scd)
+    launch(k_restrict_rb!, inside_lo(g2), inside_hi(g2), c2.r, c2.x, g2, p.ϵ1, top.op, cp, p.scd)
+    if 2 == lb
+        bottom!(p, lb; swap=false)
+    elseif 2 < length(p.levels)
+        vrb_coarse!(p, 2, lb)
+    else
+        launch(k_pre_rb32!, inside_lo(g2), inside_hi(g2), c2.x, c2.r, c2.op)
+        clo, chi = gs_range(g2)
+        for k0 in (Int32(2), Int32(1), Int32(2), Int32(1))
+            launch(k_vgs_s!, clo, chi, c2.x, c2.r, c2.op, k0)
+        end
+    end
+    launch(k_prol_dz!, inside_lo(g1), inside_hi(g1), p.ϵ1, p.r1, c2.x, g2, cp, top.r, top.op, p.scd)
+    lo, hi = gs_range(g1)
+    launch(k_vgs_s!, lo, hi, p.ϵ1, p.r1, top.op, Int32(1))
+    launch(k_vgs_s!, lo, hi, p.ϵ1, p.r1, top.op, Int32(2))
+    launch(k_vgs_s!, lo, hi, p.ϵ1, p.r1, top.op, Int32(1))
+    !exclb && launch(k_vgs_s!, lo, hi, p.ϵ1, p.r1, top.op, Int32(2))
+    red_launch(k_incr_dz!, inside_lo(g1), inside_hi(g1), p.red, SLOT_R, top.r, top.x, p.ϵ1, c2.x, g2, cp, top.op, p.ωd, p.scd, Val(exclb))
+    @cuda k_set_scale!(p.scd, p.red.m, Int32(SLOT_R))
+    adapt && @cuda k_omega!(p.ωd, p.red.s, fix)
+    return nothing
 end
 
 # ω update on the device (WaterLily.solver! rule); the previous Σ|r| is the initial one
@@ -789,8 +1155,12 @@ function k_omega!(ωd, sums, first::Bool)
     @inbounds ωd[2] = rnew
     return nothing
 end
-swap_levels!(p::TPoisson) = for l in 1:length(p.levels)-1
-    lv = p.levels[l]; lv.r, lv.ϵ = lv.ϵ, lv.r
+function swap_levels!(p::TPoisson)
+    p.usevrb && return nothing
+    for l in 1:length(p.levels)-1
+        lv = p.levels[l]; lv.r, lv.ϵ = lv.ϵ, lv.r
+    end
+    return nothing
 end
 # CUDA.jl's kernel compile/load lock (internal to CUDA.jl, so looked up defensively);
 # `nothing` if this CUDA.jl version has none under a known name
@@ -866,9 +1236,13 @@ end
 # one multigrid iteration: V-cycle, fine smoothing with norms (Σ|r|, max|r|) into slot 3, ω update
 function iteration!(p::TPoisson; fix=false, exclb=false, adapt=true)
     graphed!(p, (fix, exclb, adapt)) do
-        vcycle!(p, 1, fix)
-        smooth!(p.levels[1], p.ωd, p.red, true; exclb)
-        adapt && @cuda k_omega!(p.ωd, p.red.s, fix)
+        if p.usevrb
+            vrb_iter!(p; fix, exclb, adapt)
+        else
+            vcycle!(p, 1, fix)
+            smooth!(p.levels[1], p.ωd, p.red, true; exclb)
+            adapt && @cuda k_omega!(p.ωd, p.red.s, fix)
+        end
     end
 end
 
@@ -879,10 +1253,14 @@ Multigrid iterations on `A x = z` where the level-1 residual `r` (uncorrected, w
 sum in slot `SLOT_RSUM` of `p.red`) was set by the caller. Convergence is tested on `scale·r`, so a
 caller solving for `p = x/Δt` passes `scale = Δt` and WaterLily's tolerances keep their meaning.
 """
+function k_setfix!(fixd, tiny::Float32)
+    @inbounds fixd[1] = 0f0; @inbounds fixd[2] = tiny
+    return nothing
+end
 function solve!(p::TPoisson{T}, scale; tol=2e-3, itmx=32) where T
     top = p.levels[1]
     r₁tol = WaterLily.l1n_tol(p.ml.levels[1], tol)/scale; r∞tol = tol/scale
-    copyto!(p.fixd, Float32[0, 2eps(T)/scale])
+    @cuda k_setfix!(p.fixd, Float32(2eps(T)/scale))
     fill!(p.ωd, 1)
     nᵖ = 0
     while nᵖ < itmx
@@ -896,7 +1274,7 @@ function solve!(p::TPoisson{T}, scale; tol=2e-3, itmx=32) where T
     perBC!(top.x, top.op.g, p.per)
     push!(p.n, nᵖ)
 end
-function k_residual!(lo, hi, ps, pm, r, z, x, op::Op)
+function k_residual!(lo, hi, ps, ps2, pm, r, z, x, op::Op)
     I, ok = cellidx(lo, hi)
     s = 0f0
     if ok
@@ -905,12 +1283,16 @@ function k_residual!(lo, hi, ps, pm, r, z, x, op::Op)
         @inbounds r[l] = v
         s = v
     end
-    block_partial!(ps, pm, s, 0f0)
+    a = abs(s)
+    block_partial2!(ps, ps2, pm, s, a, a)
     return nothing
 end
 function WaterLily.solver!(p::TPoisson; tol=2e-3, itmx=32)
-    lv = p.levels[1]; g = lv.op.g
-    red_launch(k_residual!, inside_lo(g), inside_hi(g), p.red, SLOT_RSUM, lv.r, lv.z, lv.x, lv.op)
+    lv = p.levels[1]; g = lv.op.g; lo, hi = inside_lo(g), inside_hi(g)
+    checkcap(p.red, nblocks(lo, hi))
+    nb = launch(k_residual!, lo, hi, p.red.ps, p.red.ps2, p.red.pm, lv.r, lv.z, lv.x, lv.op; cap=length(p.red.ps))
+    finish!(p.red, nb, p.red.s, p.red.m, SLOT_RSUM)
+    finish!(p.red, nb, p.red.s, p.red.m, SLOT_R0; ps=p.red.ps2)
     solve!(p, 1; tol, itmx)
 end
 
@@ -973,7 +1355,7 @@ end
 @inline uall(u, l, g::Grid{2}) = (@inbounds(u[l]), @inbounds(u[l+g.nc]))
 # `xf`: an XBC to apply the x faces of BC! here (and read the face values BC! will leave),
 # or nothing when BC! was applied before
-function k_resid_src!(lo, hi, ps, pm, r, x, u, V, op::Op{D}, idt, useV::Bool, xf) where D
+function k_resid_src!(lo, hi, ps, ps2, pm, r, x, u, V, op::Op{D}, idt, useV::Bool, xf) where D
     I, ok = cellidx(lo, hi)
     s = 0f0
     if ok
@@ -995,7 +1377,41 @@ function k_resid_src!(lo, hi, ps, pm, r, x, u, V, op::Op{D}, idt, useV::Bool, xf
         s = v
         xf === nothing || xfaces!(xf, u, I, l, g, uall(u, l, g))
     end
-    block_partial!(ps, pm, s, 0f0)
+    a = abs(s)
+    block_partial2!(ps, ps2, pm, s, a, a)
+    return nothing
+end
+# Residual kernel for Biot-Savart: computes r, reduces Σr into `ps`, and non-boundary
+# Σ|r| and max|r| into `ps2` and `pm` so `mom_project!` avoids a full-grid norm scan.
+function k_resid_biot!(lo, hi, ps, ps2, pm, r, x, u, V, op::Op{D}, idt, useV::Bool) where D
+    I, ok = cellidx(lo, hi)
+    s = 0f0; a_in = 0f0; m_in = 0f0
+    if ok
+        g = op.g
+        l = lin(g, I)
+        px = Pre(AV(x), op, I, l)
+        v = 0f0
+        if getiD(op, l) != 0
+            du = 0f0; dv = 0f0
+            @unroll for i in i32:Int32(D)
+                ci = (i-i32)*g.nc
+                @inbounds du += u[l+g.s[i]+ci] - u[l+ci]
+                useV && (@inbounds dv += V[l+g.s[i]+ci] - V[l+ci])
+            end
+            z = useV ? du - (1 + (isreg(op,l) ? op.Dreg : @inbounds(op.Dg[l]))/(2D))*dv : du
+            v = z*idt - mult_f(op, I, l, px)
+        end
+        @inbounds r[l] = v
+        s = v
+        edge = false
+        @unroll for d in i32:Int32(D)
+            edge |= (I[d] == Int32(2)) | (I[d] == g.n[d] - i32)
+        end
+        if !edge
+            a_in = abs(v); m_in = a_in
+        end
+    end
+    block_partial2!(ps, ps2, pm, s, a_in, m_in)
     return nothing
 end
 # projected u at face (l,i): u - Δt·L·(x[l] - x[l-δᵢ]); `r` is isreg(op, l)
@@ -1035,9 +1451,13 @@ function k_proj_cfl!(lo, hi, ps, pm, unew, uold, x, op::Op{D}, dt::T, bc::B, t::
         @unroll for i in i32:Int32(D)
             ci = (i-i32)*g.nc; s = g.s[i]; Ii = I[i]; ni = g.n[i]
             v = vs[i]
-            lw = ((Ii == Int32(2)) & !per[i]) ? bc(i, loc(i, I, T), t) : v
+            lw = (bc !== nothing && (Ii == Int32(2)) & !per[i]) ? bc(i, loc(i, I, T), t) : v
             up = if Ii < ni - i32
                 projv(uold, x, op, l+s, i, ru[i], dt)
+            elseif bc === nothing
+                vup = @inbounds uold[l+s+ci]
+                @inbounds unew[l+s+ci] = vup
+                vup
             elseif per[i]
                 l2 = l - (ni-Int32(3))*s
                 projv(uold, x, op, l2, i, isreg(op, l2), dt)
@@ -1063,7 +1483,11 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t; cfl=false
     xf === nothing && BC!(a, a.u, t)
     w == 1 && a.exitBC && exitBC!(a, a.u, a.u⁰, a.Δt[end], t)
     dt = a.Δt[end]/T(w); g = a.grid; lv = b.levels[1]
-    red_launch(k_resid_src!, inside_lo(g), inside_hi(g), b.red, SLOT_RSUM, lv.r, lv.x, a.u, a.V, lv.op, inv(dt), !a.Vzero, xf)
+    lo, hi = inside_lo(g), inside_hi(g)
+    checkcap(b.red, nblocks(lo, hi))
+    nb = launch(k_resid_src!, lo, hi, b.red.ps, b.red.ps2, b.red.pm, lv.r, lv.x, a.u, a.V, lv.op, inv(dt), !a.Vzero, xf; cap=length(b.red.ps))
+    finish!(b.red, nb, b.red.s, b.red.m, SLOT_RSUM)
+    finish!(b.red, nb, b.red.s, b.red.m, SLOT_R0; ps=b.red.ps2)
     xf === nothing || BC!(a, a.u, t; jfirst=2)
     solve!(b, dt; kwargs...)
     if cfl
@@ -1076,11 +1500,13 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t; cfl=false
     BC!(a, a.u, t; jfirst = xf === nothing ? 1 : 2)
 end
 "WaterLily.CFL of the velocity projected by `mom_project!(...; cfl=true)`."
-cfl!(a::TFlow, b::TPoisson; Δt_max=10) = (fetch!(b.red); min(Δt_max, inv(getmax(b.red, SLOT_PROJ_CFL) + 5a.ν)))
+cfl!(a::TFlow, b::AbstractPoisson; Δt_max=10) = (fetch!(b.red); min(Δt_max, inv(getmax(b.red, SLOT_PROJ_CFL) + 5a.ν)))
 
 # Streaming kernels (no shared-memory sums): 32×8×1 blocks are 3–7 % faster than 32×4×2.
 # The Jacobi kernels keep 32×4×2, whose blocks hold whole 2ᵈ coarsening blocks (`FusedR`).
-for k in (:k_gs!, :k_incr!, :k_prol_incr!, :k_resid_src!, :k_proj!, :k_proj_cfl!)
+for k in (:k_gs!, :k_incr!, :k_prol_incr!, :k_resid_src!, :k_resid_biot!, :k_proj!, :k_proj_cfl!,
+          :k_fix_r!, :k_pre_rb16!, :k_pre_rb32!, :k_restrict_rb!, :k_prol_dz!, :k_vprol_red!,
+          :k_vgs_s!, :k_vblk_coarse!, :k_incr_dz!)
     @eval kernel_threads(::typeof($k), ::Val{3}, ext) = ext[1]*ext[2] >= BIG_PLANE ? (32, 8, 1) : threads_for(Val(3))
     @eval shrinkable(::typeof($k)) = true
 end

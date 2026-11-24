@@ -26,7 +26,7 @@ is a fused CUDA implementation of `WaterLily.mom_step!`.
 `u` and `u⁰` (and `f` as the corrector output) are swapped instead of copied;
 always read `flow.u` afresh rather than holding on to the array.
 """
-mutable struct TFlow{D,T,Sf<:AbstractArray{T},Vf<:AbstractArray{T},Tf<:AbstractArray{T},Lf,Bf,Af,Pf<:Per} <: AbstractFlow{D,T}
+mutable struct TFlow{D,T,Sf<:AbstractArray{T},Vf<:AbstractArray{T},Tf<:AbstractArray{T},Lf,Bf,Af,Pf<:Per,Sg<:SGrid{D},KS} <: AbstractFlow{D,T}
     u :: Vf
     u⁰:: Vf
     f :: Vf
@@ -46,6 +46,7 @@ mutable struct TFlow{D,T,Sf<:AbstractArray{T},Vf<:AbstractArray{T},Tf<:AbstractA
     bc :: Bf                    # isbits boundary function
     acc :: Af                   # isbits acceleration or nothing
     grid :: Grid{D}
+    sgrid :: Sg                 # static-size grid for `k_momc!` (avoids per-step dispatch)
     per :: Pf                   # periodic directions
     bdimlow :: NTuple{D,Bool}   # lower boundary faces normal to j get the BDIM update (no BC! overwrites them)
     band :: CuVector{Int32}     # linear (I,i) indices of faces with μ₀≠1, μ₁=0 (u = V+μ₀f̃)
@@ -56,8 +57,16 @@ mutable struct TFlow{D,T,Sf<:AbstractArray{T},Vf<:AbstractArray{T},Tf<:AbstractA
     red :: RedBuf
     aux :: Union{Nothing,Vf}    # extra vector buffer for the udf path (allocated on first use)
     near :: CuArray{UInt8,D}    # per cell at the last measure!: 0x01 near the body, else 0x00 outside / 0x02 inside
-    mstat :: CuVector{Int32}    # [nband, nshell, V≠0, near cells] from the last measure!
+    mstat :: CuVector{Int32}    # [nband, nshell, V≠0, near, dlo(3), dhi(3), tlo(3), thi(3)]
+    mstat_h :: Vector{Int32}    # host scratch for `mstat`
     nearl :: CuVector{Int32}    # linear indices of the cells near the body (measure! scratch)
+    dirty :: DirtyBox{D}        # changed-cell and transition boxes from the last `measure!`
+    mom_clo :: NTuple{D,Int}
+    mom_chi :: NTuple{D,Int}
+    slab_lo :: NTuple{KS,NTuple{D,Int32}}
+    slab_ext :: NTuple{KS,NTuple{D,Int32}}
+    slab_start :: NTuple{KS,Int32}
+    slab_nt :: Int
 end
 
 """
@@ -81,11 +90,19 @@ function TFlow(N::NTuple{D}, uBC; T=Float32, mem=CuArray, bdimfaces=(), kw...) w
     acc = make_acc(f.g, f.uBC)
     per = Per(ntuple(j->j ∈ f.perdir, D))
     bdimlow = ntuple(j->per[j] || -j ∈ bdimfaces, D)
-    a = TFlow{D,T,typeof(f.p),typeof(f.u),typeof(f.μ₁),typeof(f.λ),typeof(bc),typeof(acc),typeof(per)}(
+    g = Grid(f.p); sg = SGrid(g)
+    (clo, chi), slabs = core_and_shell(g, true)
+    slo = Tuple(Int32.(l) for (l, h) in slabs)
+    sext = Tuple(Int32.(h .- l .+ 1) for (l, h) in slabs)
+    slen = map(e -> Int(prod(e)), sext)
+    sstart = Tuple(Int32.(cumsum((0, slen...))[1:end-1]))
+    ks = length(slabs)
+    a = TFlow{D,T,typeof(f.p),typeof(f.u),typeof(f.μ₁),typeof(f.λ),typeof(bc),typeof(acc),typeof(per),typeof(sg),ks}(
         f.u, f.u⁰, f.f, f.p, f.σ, f.V, f.μ₀, f.μ₁, f.uBC, f.Δt, f.ν, f.g, f.exitBC, f.perdir, f.λ,
-        bc, acc, Grid(f.p), per, bdimlow, CuVector{Int32}(undef,1024), CuVector{Int32}(undef,1024), 0, 0, true,
-        RedBuf(Grid(f.p)), nothing, (n = similar(f.p, UInt8); fill!(n, 0x01); n), CUDA.zeros(Int32, 4),
-        CuVector{Int32}(undef, 1024))
+        bc, acc, g, sg, per, bdimlow, CuVector{Int32}(undef,1024), CuVector{Int32}(undef,1024), 0, 0, true,
+        RedBuf(g), nothing, (n = similar(f.p, UInt8); fill!(n, 0x01); n), CUDA.zeros(Int32, 16),
+        zeros(Int32, 16), CuVector{Int32}(undef, 1024), DirtyBox(Val(D)),
+        clo, chi, slo, sext, sstart, sum(slen))
     return a
 end
 
@@ -106,17 +123,17 @@ still copies those fields by name.
 `perdir` and `exitBC` cannot be patched: the periodic flags, the BDIM face lists and the
 pressure solver are built from them at construction.
 """
-function WaterLily.setproperties(a::TFlow{D,T}, patch::NamedTuple) where {D,T}
+function WaterLily.setproperties(a::TFlow{D,T,Sf,Vf,Tf,Lf,Bf,Af,Pf,Sg,KS}, patch::NamedTuple) where {D,T,Sf,Vf,Tf,Lf,Bf,Af,Pf,Sg,KS}
     names = fieldnames(typeof(a))
     all(n -> n in names, keys(patch)) || throw(ArgumentError("TFlow has no field(s) $(setdiff(keys(patch), names))"))
-    fixed = intersect(keys(patch), (:perdir, :exitBC, :per, :bdimlow, :grid))
+    fixed = intersect(keys(patch), (:perdir, :exitBC, :per, :bdimlow, :grid, :sgrid))
     isempty(fixed) || throw(ArgumentError("TFlow field(s) $fixed are set at construction; build a new simulation"))
     nt = merge(NamedTuple{names}(map(n -> getfield(a, n), names)), patch)
     uBC = nt.uBC isa Tuple ? T.(nt.uBC) : nt.uBC
     bc = uBC isa Function ? uBC : ConstBC{D,T}(uBC)
     acc = make_acc(nt.g, uBC)
     nt = merge(nt, (; uBC, bc, acc))
-    return TFlow{D,T,typeof(nt.p),typeof(nt.u),typeof(nt.μ₁),typeof(nt.λ),typeof(bc),typeof(acc),typeof(nt.per)}(values(nt)...)
+    return TFlow{D,T,typeof(nt.p),typeof(nt.u),typeof(nt.μ₁),typeof(nt.λ),typeof(bc),typeof(acc),typeof(nt.per),Sg,KS}(values(nt)...)
 end
 
 # ---------------------------------------------------------------- convection-diffusion
@@ -262,7 +279,7 @@ end
 kernel_threads(::typeof(k_momc!), ::Val{3}, ext) = ext[1]*ext[2] >= BIG_PLANE ? (32, 1, 8) : threads_for(Val(3))
 shrinkable(::typeof(k_momc!)) = true
 launch_core!(a::TFlow{D,T}, lo, hi, out, uin, t, corr) where {D,T} =
-    launch(k_momc!, lo, hi, out, uin, a.u⁰, SGrid(a.grid), a.Δt[end], a.ν, a.λ, a.per, a.acc, T(t), corr)
+    launch(k_momc!, lo, hi, out, uin, a.u⁰, a.sgrid, a.Δt[end], a.ν, a.λ, a.per, a.acc, T(t), corr)
 # all boundary slabs in one launch: thread t takes cell t-start[b] of slab b (x fastest)
 function k_momslabs!(nt, lo::NTuple{K}, ext::NTuple{K}, start::NTuple{K,Int32}, out, uin, u0, g::Grid{D},
                      dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool) where {K,D,T,F,A}
@@ -275,13 +292,8 @@ function k_momslabs!(nt, lo::NTuple{K}, ext::NTuple{K}, start::NTuple{K,Int32}, 
     return nothing
 end
 function launch_mom!(a::TFlow{D,T}, out, uin, t, corr) where {D,T}
-    fullx = true
-    (clo, chi), slabs = core_and_shell(a.grid, fullx)
-    launch_core!(a, clo, chi, out, uin, t, corr)
-    lo = Tuple(Int32.(l) for (l, h) in slabs); ext = Tuple(Int32.(h .- l .+ 1) for (l, h) in slabs)
-    len = map(e-> Int(prod(e)), ext)
-    start = Tuple(Int32.(cumsum((0, len...))[1:end-1]))
-    launch1(k_momslabs!, sum(len), lo, ext, start, out, uin, a.u⁰, a.grid, a.Δt[end], a.ν, a.λ, a.per, a.acc, T(t), corr)
+    launch_core!(a, a.mom_clo, a.mom_chi, out, uin, t, corr)
+    launch1(k_momslabs!, a.slab_nt, a.slab_lo, a.slab_ext, a.slab_start, out, uin, a.u⁰, a.grid, a.Δt[end], a.ν, a.λ, a.per, a.acc, T(t), corr)
 end
 
 # BDIM update on the listed faces: k_band! for the band list (μ₀≠1, μ₁=0), k_shell! for the
@@ -509,7 +521,7 @@ function WaterLily.mom_step!(a::TFlow{D,T}, b::AbstractPoisson; udf=nothing, poi
     mom_update!(a, a.f, a.u, t₁, true)
     copy_exit!(a, a.f, a.u)
     a.u, a.f = a.f, a.u
-    if b isa TPoisson
+    if b isa TPoisson || b isa TBiotPoisson
         WaterLily.mom_project!(a, b, 2, t₁; cfl=true, poisson_kwargs...)
         push!(a.Δt, cfl!(a, b))
     else

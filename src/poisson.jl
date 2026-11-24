@@ -1099,7 +1099,8 @@ function vrb_coarse!(p::TPoisson, l::Int, lb::Int)
     launch(k_vblk_coarse!, inside_lo(gf), inside_hi(gf), fine.x, fine.z, fine.r, fine.op)
     return nothing
 end
-# One V(1_RBGS, 2_RBGS) iteration: scaled Float16 `δz` + exact Float32 `prol(cx)` on level 1,
+# One V-cycle iteration: scaled Float16 `δz` + exact Float32 `prol(cx)` on level 1 (5 post
+# half-sweeps for `TPoisson` to keep cut-cell `r∞` single-cycle; 4 for Biot-Savart `exclb`),
 # Float32 on coarse levels. Leaves all level buffers unswapped and `top.z` untouched.
 function vrb_iter!(p::TPoisson; fix::Bool=false, exclb::Bool=false, adapt::Bool=true)
     lb = bottom_index(p)
@@ -1131,6 +1132,7 @@ function vrb_iter!(p::TPoisson; fix::Bool=false, exclb::Bool=false, adapt::Bool=
     launch(k_vgs_s!, lo, hi, p.ϵ1, p.r1, top.op, Int32(1))
     launch(k_vgs_s!, lo, hi, p.ϵ1, p.r1, top.op, Int32(2))
     launch(k_vgs_s!, lo, hi, p.ϵ1, p.r1, top.op, Int32(1))
+    !exclb && launch(k_vgs_s!, lo, hi, p.ϵ1, p.r1, top.op, Int32(2))
     red_launch(k_incr_dz!, inside_lo(g1), inside_hi(g1), p.red, SLOT_R, top.r, top.x, p.ϵ1, c2.x, g2, cp, top.op, p.ωd, p.scd, Val(exclb))
     @cuda k_set_scale!(p.scd, p.red.m, Int32(SLOT_R))
     adapt && @cuda k_omega!(p.ωd, p.red.s, fix)

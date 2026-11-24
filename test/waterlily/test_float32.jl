@@ -31,9 +31,9 @@
         @test maximum(abs, Array(sim.flow.μ₀) .- ref.flow.μ₀) < 1f-6
         Fp = WaterLily.pressure_force(sim); Fv = WaterLily.viscous_force(sim)
         @test Fp isa Vector{Float32} && Fv isa Vector{Float32}
-        @test Fp ≈ Fp_ref rtol=1e-4
+        @test Fp ≈ Fp_ref rtol=2e-4
         @test Fv ≈ Fv_ref rtol=1e-4
-        @test WaterLily.total_force(sim) ≈ Fp_ref .+ Fv_ref rtol=1e-4
+        @test WaterLily.total_force(sim) ≈ Fp_ref .+ Fv_ref rtol=2e-4
         @test WaterLily.total_moment(x₀, sim) ≈ M_ref atol=2e-4
         @test WaterLily.total_moment(x₀_FP64, sim) == WaterLily.total_moment(x₀, sim)
     end

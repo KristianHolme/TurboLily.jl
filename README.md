@@ -341,4 +341,5 @@ and 4 tests are marked broken (3 ForwardDiff, 1 on `pois.levels[1].r`).
 
 MIT, see [`LICENSE`](LICENSE). Parts of TurboLily are derived from WaterLily.jl and
 BiotSavartBCs.jl by Gabriel Weymouth, both MIT-licensed. TurboLily was written with
-[Claude Code](https://claude.com/claude-code).
+LLM-based agentic coding tools, including [Claude Code](https://claude.com/claude-code) and
+Antigravity (Claude Opus 5.5 and Gemini 4 Neon).

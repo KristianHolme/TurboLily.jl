@@ -196,12 +196,18 @@ Multigrid pressure solver with the same algorithm as `WaterLily.MultiLevelPoisso
 (Jacobi pre-smoothing, red-black Gauss-Seidel post-smoothing, adaptive ω), with
 fused CUDA kernels, compressed regular-cell stencils and one host synchronisation
 per V-cycle.
+
+`ml` is its own type parameter. WaterLily 1.11.2 is `MultiLevelPoisson{T,S,V,P}`
+(`P` is `perdir`); 1.11.0 and 1.11.1 are `MultiLevelPoisson{T,S,V}`.
+`M<:MultiLevelPoisson{T,S,V}` is the concrete type on both, so a read of `p.ml`
+stays inferred. Writing the field as `MultiLevelPoisson{T,S,V}` is not concrete
+on 1.11.2.
 """
-struct TPoisson{T,S,V,D,R,P} <: AbstractPoisson{T,S,V}
+struct TPoisson{T,S,V,D,R,P,M<:MultiLevelPoisson{T,S,V}} <: AbstractPoisson{T,S,V}
     x :: S
     L :: V
     z :: S
-    ml :: MultiLevelPoisson{T,S,V}
+    ml :: M
     levels :: Vector{Level{D,T,S,V,R,P}}
     per :: P
     n :: Vector{Int16}
@@ -235,7 +241,7 @@ function TPoisson(x::AbstractArray{T,D}, L, z; perdir=(), dirty=nothing) where {
         ϵ1 = CUDA.zeros(Float16, 1)
         r1 = CUDA.zeros(Float16, 1)
     end
-    p = TPoisson{T,typeof(x),typeof(L),D,typeof(levels[1].op.reg),typeof(per)}(x, L, z, ml, levels, per, Int16[], perdir, RedBuf(Grid(x)),
+    p = TPoisson{T,typeof(x),typeof(L),D,typeof(levels[1].op.reg),typeof(per),typeof(ml)}(x, L, z, ml, levels, per, Int16[], perdir, RedBuf(Grid(x)),
         CUDA.ones(Float32, 2), CUDA.zeros(Float32, 2), CUDA.zeros(Float64, 1),
         Dict{GraphKey,Union{Nothing,CuGraphExec}}(), Set{GraphKey}(), dirty,
         ϵ1, r1, CuVector{Float32}(Float32[1f0, 1f0]), usevrb)

@@ -18,7 +18,7 @@ sim_step!(bsim, 10; remeasure=false)
 using Pkg; Pkg.add(url="https://github.com/KristianHolme/TurboLily.jl")
 ```
 
-Requires WaterLily 1.11 and BiotSavartBCs 1.1. Tested with Julia 1.13, CUDA.jl 6.5 and
+Requires WaterLily 1.12 and BiotSavartBCs 1.1. Tested with Julia 1.13, CUDA.jl 6.5 and
 KernelAbstractions 0.10 on RTX 2080 Ti and A10. Benchmarked on A100, GH200, RTX 3090 and P100.
 
 ## Limitations

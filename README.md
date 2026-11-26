@@ -193,15 +193,19 @@ it breaks.
 - Saves: 0.68 ms (4.1 ms).
 
 **1.5 `measure!` rewrites only the body band and dirty boxes (any BCs).**
-- WL: resets V, μ₀, μ₁ everywhere, evaluates the sdf everywhere, measures the band; `update!`
-  recomputes the multigrid coefficients with several kernels per level.
-- TurboLily: one kernel evaluates the sdf and measures the band. A byte per cell records whether
-  the cell was in the band and on which side of the body, and only cells that left the band or
-  changed side are reset. This holds for any motion between two measures. The same kernel builds
-  the BDIM face lists (3.1) and tracks changed-cell and transition bounding boxes (`DirtyBox`), so
-  `update!(::TPoisson)` and `body_box!(::TBiotPoisson)` skip untouched regions and redundant host
-  syncs.
-- Saves: 1.5 ms per step for a body remeasured every step (before dirty-box `update!`).
+- WL: resets V, μ₀, μ₁ everywhere, evaluates the sdf everywhere (falling back to `measure` with
+  ForwardDiff for `SetBody`, which has no `sdf` method), measures the band, and zeroes all
+  boundary faces; `update!` recomputes the multigrid coefficients with several kernels per level.
+- TurboLily: `k_measure!` evaluates a pure SDF (`fast_sdf`, recursing through `SetBody` with
+  inlined `sdf`/`map` so no ForwardDiff or local memory enters the full-grid pass) and lists near
+  cells for `k_measure_near!` (which refines `SetBody` distances on the near list to match WL). A
+  byte per cell records whether the cell was in the band and on which side of the body, and only
+  cells that left the band or changed side are reset. The same pass builds the BDIM face lists
+  (3.1) and tracks changed-cell and transition bounding boxes (`DirtyBox`), so `vecBC0!` only
+  touches boundary slices intersecting the dirty box, and `update!(::TPoisson)` and
+  `body_box!(::TBiotPoisson)` skip untouched regions and redundant host syncs.
+- Saves: 1.5 ms per step for a body remeasured every step (before dirty-box `update!`, `fast_sdf`,
+  and dirty-slice `vecBC0!`, which together cut `measure!` by 2.7× on `jelly-biotsavart:7`).
 
 ### 2. Algorithms shared with BiotSavartBCs 1.1
 
@@ -244,9 +248,11 @@ split-precision V(1_RBGS, 2_RBGS) cycle (`vrb_iter!`):
 - Level 1 splits the correction into exact Float32 `prol(cx)` plus a scaled Float16 fine-grid
   correction `δz` (aliasing `levels[1].ϵ`, so zero extra GPU memory), with Float32 on coarse
   levels.
-- Pre-smoothing uses 1 RBGS sweep (`k_pre_rb16!`, restricted directly by `k_restrict_rb!`);
-  post-smoothing uses 5 half-sweeps on `TPoisson` (so cut-cell geometries stay single-cycle at
-  default tolerance) and 4 half-sweeps on Biot-Savart (`exclb=true`).
+- Pre-smoothing uses 1 RBGS sweep (`k_pre_rb16!` / `k_pre_rb32!`, launching only over black cells
+  with x-pairing since red cells are never read before prolongation or the next sweep, and
+  restricted directly by `k_restrict_rb!`); post-smoothing uses x-paired `k_vgs_s!` with 5
+  half-sweeps on `TPoisson` (so cut-cell geometries stay single-cycle at default tolerance) and 4
+  half-sweeps on Biot-Savart (`exclb=true`).
 - Residual mean subtraction and initial norms run in `k_fix_r!` with early exit, fed from
   `k_resid_src!` / `k_resid_biot!`.
 - Coarse levels of ≤ 2048 cells run in one single-block kernel (`k_bottom!`); `ω` and the Float16

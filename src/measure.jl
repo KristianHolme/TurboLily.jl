@@ -33,6 +33,15 @@ function k_mstat_init!(stat)
     return nothing
 end
 
+# Pure signed-distance evaluation without ForwardDiff: WaterLily.sdf falls back to
+# `measure(body, ...)[1]` for `SetBody`, which would pull ForwardDiff and local memory
+# into the full-grid `k_measure!` kernel.
+@inline fast_sdf(body::WaterLily.AutoBody, x, t) = @inline body.sdf((@inline body.map(x, t)), t)
+@inline fast_sdf(body::WaterLily.SetBody{typeof(-)}, x, t) = -fast_sdf(body.a, x, t)
+@inline fast_sdf(body::WaterLily.SetBody, x, t) = body.op(fast_sdf(body.a, x, t), fast_sdf(body.b, x, t))
+@inline fast_sdf(body::WaterLily.NoBody, x, t) = convert(eltype(x), Inf)
+@inline fast_sdf(body::AbstractBody, x, t) = WaterLily.sdf(body, x, t; fastd²=zero(eltype(x)))
+
 # WaterLily.measure! in two passes. The first evaluates the distance in every cell and updates
 # only cells away from the body that were near it, or that changed side since the last measure
 # (a body that moved further than the band in between); it lists the cells near the body. The
@@ -48,7 +57,7 @@ function k_measure!(lo, hi, μ₀, μ₁, V, σ, near_prev, body::B, t::T, d²::
     near = false
     d = zero(T)
     if ok
-        d = WaterLily.sdf(body, loc(0, I, T), t; fastd²=d²)
+        d = fast_sdf(body, loc(0, I, T), t)
         @inbounds σ[l] = d
         near = d^2 < d²
     end
@@ -82,13 +91,24 @@ function k_measure_near!(cap, nearl, μ₀, μ₁, V, σ, body::B, t::T, ϵ::T, 
     ok = k <= min(@inbounds(stat[4]), cap)
     l = ok ? @inbounds(nearl[k]) : i32
     I = coords(g, l)
-    d = ok ? @inbounds(σ[l]) : zero(T)
+    d = zero(T)
+    if ok
+        if B <: WaterLily.SetBody
+            # Refine with WaterLily's gradient-normalized SetBody sdf on the small near list
+            # so scaled SetBody components match WaterLily.measure! exactly.
+            d = WaterLily.sdf(body, loc(0, I, T), t; fastd²=d²)
+            @inbounds σ[l] = d
+        else
+            d = @inbounds σ[l]
+        end
+    end
+    inband = ok & (d^2 < d²)
     vnz = false
     tr = false
     @unroll for i in i32:Int32(D)
         li = l + (i-i32)*g.nc
         cls = 0
-        if ok
+        if inband
             dᵢ, nᵢ, Vᵢ = WaterLily.measure(body, loc(i, I, T), t; fastd²=d²)
             dᵢ = abs(dᵢ) ≤ T(0.5) ? dᵢ : copysign(dᵢ, d)
             @inbounds V[li] = Vᵢ[i]
@@ -108,26 +128,47 @@ function k_measure_near!(cap, nearl, μ₀, μ₁, V, σ, body::B, t::T, ϵ::T, 
             # face in a periodic direction, or a non-Biot-Savart face of a Biot-Savart
             # simulation, where μ₀ is zeroed after this kernel by vecBC0!)
             I[i] == 2i32 && (cls = bdimlow[i] ? max(cls, 1) : 0)
+        elseif ok
+            m0 = d < 0 ? zero(T) : one(T)
+            @inbounds V[li] = zero(T)
+            @inbounds μ₀[li] = m0
+            @unroll for j in i32:Int32(D)
+                @inbounds μ₁[li + (j-i32)*D*g.nc] = zero(T)
+            end
+            cls = m0 != 1 ? 1 : 0
+            I[i] == 2i32 && (cls = bdimlow[i] ? max(cls, 1) : 0)
         end
         wappend!(band, stat, 1, cls == 1, li)
         wappend!(shell, stat, 2, cls == 2, li)
     end
-    warp_box!(stat, 10, ok & tr, I)
+    warp_box!(stat, 10, inband & tr, I)
     vnz && (@inbounds stat[3] = Int32(1))
     return nothing
 end
 
-# zero boundary values for vector fields (WaterLily.BC!(a, zeros, saveexit, perdir))
-function vecBC0!(a, g::Grid{D}, per, saveexit) where D
+# zero boundary values for vector fields (WaterLily.BC!(a, zeros, saveexit, perdir)).
+# When `dlo`/`dhi` are given (a previous measure already zeroed the full boundaries), only
+# directions whose boundary layer (`2` or `n-1`) intersects `dlo:dhi` are updated, over the
+# dirty box expanded by 1 in the tangential directions (to include adjacent edges/corners).
+function vecBC0!(a, g::Grid{D}, per, saveexit, dlo=nothing, dhi=nothing) where D
     z = ConstBC{D,eltype(a)}(ntuple(_->zero(eltype(a)), D))
     for j in 1:D
-        lo = ntuple(_->1, D); hi = ntuple(d-> d==j ? 1 : Int(g.n[d]), D)
+        if dlo !== nothing
+            (dlo[1] > dhi[1]) && return nothing
+            (dlo[j] > 2 && dhi[j] < Int(g.n[j]) - 1) && continue
+            lo = ntuple(d -> d == j ? 1 : max(1, dlo[d] - 1), D)
+            hi = ntuple(d -> d == j ? 1 : min(Int(g.n[d]), dhi[d] + 1), D)
+        else
+            lo = ntuple(_->1, D); hi = ntuple(d-> d==j ? 1 : Int(g.n[d]), D)
+        end
         launch_face(k_bc!, lo, hi, j, a, g, z, zero(eltype(a)), saveexit, per[j])
     end
+    return nothing
 end
 
 function WaterLily.measure!(a::TFlow{D,T}, body::AbstractBody; t=zero(T), ϵ=1) where {D,T}
     g = a.grid
+    was_valid = a.dirty.valid
     while true
         @cuda k_mstat_init!(a.mstat)
         d² = T((2+ϵ)^2)
@@ -136,14 +177,19 @@ function WaterLily.measure!(a::TFlow{D,T}, body::AbstractBody; t=zero(T), ϵ=1) 
         # one thread per entry of the near list; threads past the count (on the device) return
         launch1(k_measure_near!, length(a.nearl), a.nearl, a.μ₀, a.μ₁, a.V, a.σ, body, T(t), T(ϵ),
                 d², g, a.mstat, a.band, a.shell, a.bdimlow)
-        vecBC0!(a.μ₀, g, a.per, false)
-        vecBC0!(a.V, g, a.per, a.exitBC)
         st = hostcopy!(a.mstat_h, a.mstat)
         a.nband, a.nshell = st[1], st[2]
         a.Vzero = st[3] == 0
         if a.nband <= length(a.band) && a.nshell <= length(a.shell) && st[4] <= length(a.nearl)
             dlo = ntuple(d -> Int(st[4 + d]), D)
             dhi = ntuple(d -> Int(st[7 + d]), D)
+            if was_valid
+                vecBC0!(a.μ₀, g, a.per, false, dlo, dhi)
+                vecBC0!(a.V, g, a.per, a.exitBC, dlo, dhi)
+            else
+                vecBC0!(a.μ₀, g, a.per, false)
+                vecBC0!(a.V, g, a.per, a.exitBC)
+            end
             if dlo[1] <= dhi[1]
                 if a.dirty.valid && a.dirty.lo[1] <= a.dirty.hi[1]
                     a.dirty.lo = min.(a.dirty.lo, dlo)
@@ -166,6 +212,7 @@ function WaterLily.measure!(a::TFlow{D,T}, body::AbstractBody; t=zero(T), ϵ=1) 
         a.shell = CuVector{Int32}(undef, 2a.nshell + 1024)
         a.nearl = CuVector{Int32}(undef, 2st[4] + 1024)
         a.near .= 0x01
+        was_valid = false
     end
     return nothing
 end

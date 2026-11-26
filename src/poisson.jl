@@ -196,12 +196,16 @@ Multigrid pressure solver with the same algorithm as `WaterLily.MultiLevelPoisso
 (Jacobi pre-smoothing, red-black Gauss-Seidel post-smoothing, adaptive ω), with
 fused CUDA kernels, compressed regular-cell stencils and one host synchronisation
 per V-cycle.
+
+`ml` is its own type parameter. WaterLily 1.12's multigrid solver carries `perdir`
+as a parameter, so a field written `MultiLevelPoisson{T,S,V}` is not concrete.
+`M<:MultiLevelPoisson{T,S,V}` is set to `typeof(ml)`, and a read of `p.ml` stays inferred.
 """
-struct TPoisson{T,S,V,D,R,P} <: AbstractPoisson{T,S,V}
+struct TPoisson{T,S,V,D,R,P,M<:MultiLevelPoisson{T,S,V}} <: AbstractPoisson{T,S,V}
     x :: S
     L :: V
     z :: S
-    ml :: MultiLevelPoisson{T,S,V}
+    ml :: M
     levels :: Vector{Level{D,T,S,V,R,P}}
     per :: P
     n :: Vector{Int16}
@@ -235,7 +239,7 @@ function TPoisson(x::AbstractArray{T,D}, L, z; perdir=(), dirty=nothing) where {
         ϵ1 = CUDA.zeros(Float16, 1)
         r1 = CUDA.zeros(Float16, 1)
     end
-    p = TPoisson{T,typeof(x),typeof(L),D,typeof(levels[1].op.reg),typeof(per)}(x, L, z, ml, levels, per, Int16[], perdir, RedBuf(Grid(x)),
+    p = TPoisson{T,typeof(x),typeof(L),D,typeof(levels[1].op.reg),typeof(per),typeof(ml)}(x, L, z, ml, levels, per, Int16[], perdir, RedBuf(Grid(x)),
         CUDA.ones(Float32, 2), CUDA.zeros(Float32, 2), CUDA.zeros(Float64, 1),
         Dict{GraphKey,Union{Nothing,CuGraphExec}}(), Set{GraphKey}(), dirty,
         ϵ1, r1, CuVector{Float32}(Float32[1f0, 1f0]), usevrb)
@@ -1348,6 +1352,31 @@ end
 end
 @inline uall(u, l, g::Grid{3}) = (@inbounds(u[l]), @inbounds(u[l+g.nc]), @inbounds(u[l+2g.nc]))
 @inline uall(u, l, g::Grid{2}) = (@inbounds(u[l]), @inbounds(u[l+g.nc]))
+# Solid fraction in `project_source`, WaterLily's `δv(L,I)`.
+# Interior cells and regular cells are `1+D/(2d)`, which matches `δv` there.
+# An irregular domain face (index 2 or `nᵢ−1`) takes `(L⁻+L⁺)/2`, or `max(L⁻,L⁺)`
+# when `BC!` zeroed one coefficient (`L⁻·L⁺ = 0`).
+@inline function δv_coef(op::Op{D}, I, l) where D
+    reg = isreg(op, l)
+    sf = 1 + (reg ? op.Dreg : @inbounds(op.Dg[l]))/(2D)
+    g = op.g
+    edge = false
+    @unroll for i in i32:Int32(D)
+        edge |= (I[i] == Int32(2)) | (I[i] == g.n[i] - i32)
+    end
+    if edge & !reg
+        s = zero(op.Lreg)
+        @unroll for i in i32:Int32(D)
+            ci = (i-i32)*g.nc
+            a = @inbounds(op.L[l+ci])
+            b = @inbounds(op.L[l+g.s[i]+ci])
+            face = (I[i] == Int32(2)) | (I[i] == g.n[i] - i32)
+            s += ifelse(face & iszero(a*b), max(a, b), (a+b)/2)
+        end
+        return 1 - s/D
+    end
+    return sf
+end
 # `xf`: an XBC to apply the x faces of BC! here (and read the face values BC! will leave),
 # or nothing when BC! was applied before
 function k_resid_src!(lo, hi, ps, ps2, pm, r, x, u, V, op::Op{D}, idt, useV::Bool, xf) where D
@@ -1365,7 +1394,7 @@ function k_resid_src!(lo, hi, ps, ps2, pm, r, x, u, V, op::Op{D}, idt, useV::Boo
                 du += uhi(xf, u, I, l, i, g, per) - ulo(xf, u, I, l, i, g, per)
                 useV && (@inbounds dv += V[l+g.s[i]+ci] - V[l+ci])
             end
-            z = useV ? du - (1 + (isreg(op,l) ? op.Dreg : @inbounds(op.Dg[l]))/(2D))*dv : du
+            z = useV ? du - δv_coef(op, I, l)*dv : du
             v = z*idt - mult_f(op, I, l, px)
         end
         @inbounds r[l] = v
@@ -1393,7 +1422,7 @@ function k_resid_biot!(lo, hi, ps, ps2, pm, r, x, u, V, op::Op{D}, idt, useV::Bo
                 @inbounds du += u[l+g.s[i]+ci] - u[l+ci]
                 useV && (@inbounds dv += V[l+g.s[i]+ci] - V[l+ci])
             end
-            z = useV ? du - (1 + (isreg(op,l) ? op.Dreg : @inbounds(op.Dg[l]))/(2D))*dv : du
+            z = useV ? du - δv_coef(op, I, l)*dv : du
             v = z*idt - mult_f(op, I, l, px)
         end
         @inbounds r[l] = v

@@ -247,9 +247,19 @@ function core_and_shell(g::Grid{D}, fullx=false) where D
     end
     return (clo, chi), slabs
 end
+# Exact algebraic identity for `WaterLily.quick` (3 min/max + abs/ifelse vs 8 min/max)
+@fastmath @inline function quick_fast(u::T, c::T, d::T) where T
+    x = d - c; y = c - u
+    neg = x < zero(T)
+    ax = abs(x)
+    sy = ifelse(neg, -y, y)
+    q = fma(T(1/3), ax, T(1/6)*sy)
+    m = max(zero(T), min(q, min(T(9)*sy, ax)))
+    return ifelse(neg, c - m, c + m)
+end
 # per-cell update with y/z faces interior and the full x range; the x faces use the
 # branch-free `fluxb`, which handles the domain-boundary faces x=2 (lower) and x=n (upper)
-function k_momc!(lo, hi, out, uin, u0, g::AGrid{D}, dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool) where {D,T,F,A}
+function k_momc!(lo, hi, out, uin, u0, g::AGrid{D}, dt::T, ν::T, λ::F, per, acc::A, t::T, ::Val{corr}, ::Val{same_u}) where {D,T,F,A,corr,same_u}
     I, ok = cellidx(lo, hi); ok || return
     l = lin(g, I)
     @unroll for i in i32:Int32(D)
@@ -262,8 +272,9 @@ function k_momc!(lo, hi, out, uin, u0, g::AGrid{D}, dt::T, ν::T, λ::F, per, ac
         end
         r += accel(acc, i, I, t, T)
         li = l + (i-i32)*g.nc
-        @fastmath v = @inbounds(u0[li]) + dt*r
-        @inbounds out[li] = corr ? T(0.5)*(uin[li] + v) : v
+        c0 = @inbounds uin[li]
+        @fastmath v = (same_u ? c0 : @inbounds(u0[li])) + dt*r
+        @inbounds out[li] = corr ? T(0.5)*(c0 + v) : v
     end
     return nothing
 end
@@ -271,8 +282,8 @@ end
 # the reloads then stay in L2 (core 2.26 → 1.68 ms at 512×192×192 on an A10)
 kernel_threads(::typeof(k_momc!), ::Val{3}, ext) = ext[1]*ext[2] >= BIG_PLANE ? (32, 1, 8) : threads_for(Val(3))
 shrinkable(::typeof(k_momc!)) = true
-launch_core!(a::TFlow{D,T}, lo, hi, out, uin, t, corr) where {D,T} =
-    launch(k_momc!, lo, hi, out, uin, a.u⁰, a.sgrid, a.Δt[end], a.ν, a.λ, a.per, a.acc, T(t), corr)
+launch_core!(a::TFlow{D,T}, lo, hi, out, uin, t, corr, λ) where {D,T} =
+    launch(k_momc!, lo, hi, out, uin, a.u⁰, a.sgrid, a.Δt[end], a.ν, λ, a.per, a.acc, T(t), Val(corr), Val(uin === a.u⁰))
 # all boundary slabs in one launch: thread t takes cell t-start[b] of slab b (x fastest)
 function k_momslabs!(nt, lo::NTuple{K}, ext::NTuple{K}, start::NTuple{K,Int32}, out, uin, u0, g::Grid{D},
                      dt::T, ν::T, λ::F, per, acc::A, t::T, corr::Bool) where {K,D,T,F,A}
@@ -284,9 +295,9 @@ function k_momslabs!(nt, lo::NTuple{K}, ext::NTuple{K}, start::NTuple{K,Int32}, 
     mom_cell!(I, out, uin, u0, g, dt, ν, λ, per, acc, t, corr)
     return nothing
 end
-function launch_mom!(a::TFlow{D,T}, out, uin, t, corr) where {D,T}
-    launch_core!(a, a.mom_clo, a.mom_chi, out, uin, t, corr)
-    launch1(k_momslabs!, a.slab_nt, a.slab_lo, a.slab_ext, a.slab_start, out, uin, a.u⁰, a.grid, a.Δt[end], a.ν, a.λ, a.per, a.acc, T(t), corr)
+function launch_mom!(a::TFlow{D,T}, out, uin, t, corr, λ = (D == 3 && a.λ === WaterLily.quick) ? quick_fast : a.λ) where {D,T}
+    launch_core!(a, a.mom_clo, a.mom_chi, out, uin, t, corr, λ)
+    launch1(k_momslabs!, a.slab_nt, a.slab_lo, a.slab_ext, a.slab_start, out, uin, a.u⁰, a.grid, a.Δt[end], a.ν, λ, a.per, a.acc, T(t), corr)
 end
 
 # BDIM update on the listed faces: k_band! for the band list (μ₀≠1, μ₁=0), k_shell! for the
@@ -375,9 +386,10 @@ end
 end
 function mom_update!(a::TFlow{D,T}, out, uin, t, corr) where {D,T}
     g, dt = a.grid, a.Δt[end]
-    launch_mom!(a, out, uin, t, corr)
-    launch1(k_band!, a.nband, a.band, out, uin, a.u⁰, a.V, a.μ₀, a.μ₁, g, dt, a.ν, a.λ, a.per, a.acc, T(t), corr)
-    launch1(k_shell!, 8a.nshell, a.nshell, a.shell, out, uin, a.u⁰, a.V, a.μ₀, a.μ₁, g, dt, a.ν, a.λ, a.per, a.acc, T(t), corr)
+    λ = (D == 3 && a.λ === WaterLily.quick) ? quick_fast : a.λ
+    launch_mom!(a, out, uin, t, corr, λ)
+    launch1(k_band!, a.nband, a.band, out, uin, a.u⁰, a.V, a.μ₀, a.μ₁, g, dt, a.ν, λ, a.per, a.acc, T(t), corr)
+    launch1(k_shell!, 8a.nshell, a.nshell, a.shell, out, uin, a.u⁰, a.V, a.μ₀, a.μ₁, g, dt, a.ν, λ, a.per, a.acc, T(t), corr)
 end
 
 # ---------------------------------------------------------------- boundary conditions

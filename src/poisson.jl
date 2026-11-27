@@ -83,6 +83,9 @@ struct Scaled{P,T}; p::P; s::T; end
 struct ShiftScaled{P,T}; p::P; s::T; apply::Bool; iD::T; end
 @inline (f::ShiftScaled)(Ip, lp) = (f.apply ? f.p(Ip, lp) - f.s : f.p(Ip, lp))*f.iD
 
+@inline pre_odsum(pe::Pre{3}) = pe.m[1] + pe.p[1] + pe.m[2] + pe.p[2] + pe.m[3] + pe.p[3]
+@inline pre_odsum(pe::Pre{2}) = pe.m[1] + pe.p[1] + pe.m[2] + pe.p[2]
+
 # Σ_nb L·f (off-diagonal part of A) with neighbour values from f(I,l)
 @inline function offdiag_f(op::Op{D}, I, l, f::F) where {D,F}
     g, per = op.g, op.per
@@ -100,6 +103,17 @@ struct ShiftScaled{P,T}; p::P; s::T; apply::Bool; iD::T; end
     end
     return s
 end
+@inline function offdiag_f(op::Op{D}, I, l, f::Pre{D}) where D
+    g = op.g
+    isreg(op, l) && return op.Lreg * pre_odsum(f)
+    s = zero(op.Lreg)
+    @unroll for j in i32:Int32(D)
+        cj = (j-i32)*g.nc
+        s += f.m[j]*@inbounds(op.L[l+cj]) + f.p[j]*@inbounds(op.L[l+g.s[j]+cj])
+    end
+    return s
+end
+@inline offdiag_f(op::Op{D}, I, l, f::Scaled{<:Pre{D}}) where D = offdiag_f(op, I, l, f.p) * f.s
 # A·f at cell I: Σ_nb L·(f_nb − f), as WaterLily.mult. D is unused, so a constant
 # field gives 0 in Float32 where the stored diagonal is not −ΣL.
 @inline function mult_f(op::Op{D}, I, l, f::F) where {D,F}
@@ -121,6 +135,22 @@ end
     end
     return s
 end
+@inline function mult_f(op::Op{D}, I, l, f::Pre{D}) where D
+    g = op.g; fc = f.c
+    if isreg(op, l)
+        return D == 3 ?
+            op.Lreg * ((f.m[1] - fc) + (f.p[1] - fc) + (f.m[2] - fc) + (f.p[2] - fc) + (f.m[3] - fc) + (f.p[3] - fc)) :
+            op.Lreg * ((f.m[1] - fc) + (f.p[1] - fc) + (f.m[2] - fc) + (f.p[2] - fc))
+    end
+    s = zero(op.Lreg)
+    @unroll for j in i32:Int32(D)
+        cj = (j-i32)*g.nc
+        s += @inbounds(op.L[l+cj])*(f.m[j] - fc) + @inbounds(op.L[l+g.s[j]+cj])*(f.p[j] - fc)
+    end
+    return s
+end
+@inline mult_f(op::Op{D}, I, l, f::Scaled{<:Pre{D}}) where D = mult_f(op, I, l, f.p) * f.s
+@inline mult_f(op::Op{D}, I, l, f::ShiftScaled{<:Pre{D}}) where D = mult_f(op, I, l, f.p) * f.iD
 @inline mult(op::Op, I, l, x::AbstractArray) = mult_f(op, I, l, AV(x))
 
 """
@@ -186,8 +216,8 @@ const SLOT_R0 = 2         # Σ|r|, max|r| of the corrected residual before the f
 const SLOT_R = 3          # Σ|r|, max|r| after an iteration
 const SLOT_PROJ_CFL = 4   # max of the CFL flux of the projected velocity (`cfl!`)
 
-# key of a cached graph: (`iteration!` flags, objectid of the fine residual buffer)
-const GraphKey = Tuple{NTuple{3,Bool},UInt}
+# key of a cached graph: (`iteration!` flags, objectid of fine `r`, and of fine `x` when `iteration!` writes it)
+const GraphKey = Tuple{NTuple{4,Bool},UInt,UInt}
 
 """
     TPoisson
@@ -197,7 +227,7 @@ Multigrid pressure solver with the same algorithm as `WaterLily.MultiLevelPoisso
 fused CUDA kernels, compressed regular-cell stencils and one host synchronisation
 per V-cycle.
 """
-struct TPoisson{T,S,V,D,R,P} <: AbstractPoisson{T,S,V}
+mutable struct TPoisson{T,S,V,D,R,P} <: AbstractPoisson{T,S,V}
     x :: S
     L :: V
     z :: S
@@ -213,32 +243,54 @@ struct TPoisson{T,S,V,D,R,P} <: AbstractPoisson{T,S,V}
     graphs :: Dict{GraphKey,Union{Nothing,CuGraphExec}}   # see `graphed!`
     seen :: Set{GraphKey}
     dirty :: Union{Nothing,DirtyBox{D}}
-    ϵ1 :: CuVector{Float16}          # level-1 scaled Float16 δz buffer (aliases first half of levels[1].ϵ)
-    r1 :: CuVector{Float16}          # level-1 scaled Float16 r̃ buffer (aliases second half of levels[1].ϵ)
+    gb :: Grid{D}                    # split red/black level-1 grid: (cld(n1-2, 2), n2, ...)
+    ϵb :: CuVector{Float16}          # level-1 scaled Float16 black δz (views into levels[1].ϵ)
+    ϵr :: CuVector{Float16}          # level-1 scaled Float16 red δz
+    rb :: CuVector{Float16}          # level-1 scaled Float16 black r̃
+    rr :: CuVector{Float16}          # level-1 scaled Float16 red r̃
+    reg_rb :: CuVector{UInt8}        # backing buffer for split regular flags
+    regb :: CuVector{UInt8}          # black cell regular flags (view into reg_rb)
+    regr :: CuVector{UInt8}          # red cell regular flags (view into reg_rb)
     scd :: CuVector{Float32}         # [sc, 1/sc] dynamic Float16 scale on the device
     usevrb :: Bool                   # V(1_RBGS, 2_RBGS): Float16 δz + Float32 cx on level 1, Float32 coarse
+    streak1 :: Int8                  # consecutive 1-iter solves for w == 1 (predictor)
+    streak2 :: Int8                  # consecutive 1-iter solves for w != 1 (corrector)
+    cfl_ready :: Bool                # whether `mom_project!` already fetched `SLOT_PROJ_CFL`
 end
 function TPoisson(x::AbstractArray{T,D}, L, z; perdir=(), dirty=nothing) where {T,D}
     ml = MultiLevelPoisson(x, L, z; perdir)
     nl = length(ml.levels)
     per = Per(ntuple(j->j ∈ perdir, D))
     levels = [Level(ml.levels[l], l < nl ? coarsen_mask(ml.levels[l].x, ml.levels[l+1].x) : ntuple(_->false,D), per) for l in 1:nl]
+    g1 = levels[1].op.g
     usevrb = nl >= 2 && !any(lv -> oddper(lv.op), levels)
     if usevrb
         e0 = levels[1].ϵ
         fill!(e0, zero(T))
-        n = length(e0)
+        nx_half = cld(Int(g1.n[1]) - 2, 2)
+        gb = Grid((nx_half, Int.(Base.tail(g1.n))...))
+        nsp = Int(gb.nc)
         ptr = reinterpret(CuPtr{Float16}, pointer(e0))
-        ϵ1 = unsafe_wrap(CuArray, ptr, n; own=false)
-        r1 = unsafe_wrap(CuArray, ptr + sizeof(Float16) * n, n; own=false)
+        ϵb = unsafe_wrap(CuArray, ptr, nsp; own=false)
+        ϵr = unsafe_wrap(CuArray, ptr + sizeof(Float16) * nsp, nsp; own=false)
+        rb = unsafe_wrap(CuArray, ptr + 2 * sizeof(Float16) * nsp, nsp; own=false)
+        rr = unsafe_wrap(CuArray, ptr + 3 * sizeof(Float16) * nsp, nsp; own=false)
+        reg_rb = CUDA.zeros(UInt8, 2 * nsp)
+        rptr = pointer(reg_rb)
+        regb = unsafe_wrap(CuArray, rptr, nsp; own=false)
+        regr = unsafe_wrap(CuArray, rptr + nsp, nsp; own=false)
     else
-        ϵ1 = CUDA.zeros(Float16, 1)
-        r1 = CUDA.zeros(Float16, 1)
+        gb = g1
+        ϵb = CUDA.zeros(Float16, 1); ϵr = CUDA.zeros(Float16, 1)
+        rb = CUDA.zeros(Float16, 1); rr = CUDA.zeros(Float16, 1)
+        reg_rb = CUDA.zeros(UInt8, 1)
+        regb = CUDA.zeros(UInt8, 1); regr = CUDA.zeros(UInt8, 1)
     end
     p = TPoisson{T,typeof(x),typeof(L),D,typeof(levels[1].op.reg),typeof(per)}(x, L, z, ml, levels, per, Int16[], perdir, RedBuf(Grid(x)),
         CUDA.ones(Float32, 2), CUDA.zeros(Float32, 2), CUDA.zeros(Float64, 1),
         Dict{GraphKey,Union{Nothing,CuGraphExec}}(), Set{GraphKey}(), dirty,
-        ϵ1, r1, CuVector{Float32}(Float32[1f0, 1f0]), usevrb)
+        gb, ϵb, ϵr, rb, rr, reg_rb, regb, regr, CuVector{Float32}(Float32[1f0, 1f0]), usevrb,
+        Int8(0), Int8(0), false)
     finish_update!(p)
 end
 TPoisson(flow::AbstractFlow) = TPoisson(flow.p, flow.μ₀, flow.σ; perdir=flow.perdir, dirty = flow isa TFlow ? flow.dirty : nothing)
@@ -444,8 +496,14 @@ const GS2_TX, GS2_TY, GS2_CH = 32, 8, 16
 const GS2_CELLS = 2^18
 "Neighbour values of cell I for offdiag_f, identified by the neighbour's index tuple."
 struct NBV{T}; I::NTuple{3,Int32}; xm::T; xp::T; ym::T; yp::T; zm::T; zp::T; end
-@inline (f::NBV)(Ip, lp) = Ip[1] != f.I[1] ? (Ip[1] < f.I[1] ? f.xm : f.xp) :
-                           Ip[2] != f.I[2] ? (Ip[2] < f.I[2] ? f.ym : f.yp) : (Ip[3] < f.I[3] ? f.zm : f.zp)
+@inline function offdiag_f(op::Op{3}, I, l, f::NBV)
+    g = op.g
+    isreg(op, l) && return op.Lreg * (f.xm + f.xp + f.ym + f.yp + f.zm + f.zp)
+    nc = g.nc
+    return ((f.xm*@inbounds(op.L[l]) + f.xp*@inbounds(op.L[l+i32])) +
+            (f.ym*@inbounds(op.L[l+nc]) + f.yp*@inbounds(op.L[l+nc+g.s[2]]))) +
+           (f.zm*@inbounds(op.L[l+Int32(2)*nc]) + f.zp*@inbounds(op.L[l+Int32(2)*nc+g.s[3]]))
+end
 "A one-element stand-in for the regular flags: the prefetched flag of the cell being updated."
 struct Flag <: AbstractVector{UInt8}; v::UInt8; end
 @inline Base.getindex(f::Flag, i::Integer) = f.v
@@ -598,23 +656,83 @@ function k_fix_r!(lo, hi, ps, pm, r, op::Op{D}, fixd) where D
     block_partial!(ps, pm, a, a)
     return nothing
 end
-# Pass 1a (level 1): black cells of the RBGS pre-sweep from ϵ=0 into scaled Float16 `ϵ1`
-# (x-paired so every lane in a warp is on the same (y,z) row; red cells are never read
-# before `k_prol_dz!` overwrites them).
-function k_pre_rb16!(lo, hi, ϵ1, r, op::Op{D}, scd) where D
+# Split red/black layout on level 1: `gb` has size (cld(n1-2, 2), n2, ...).
+# Pair iv = 1:gb.n[1] covers x-indices {2*iv, 2*iv+1} with black at 2*iv+qb, red at 2*iv+(1-qb).
+@inline split_lin(gb::Grid{3}, Iv) = i32 + (Iv[1] - i32) + (Iv[2] - i32)*gb.s[2] + (Iv[3] - i32)*gb.s[3]
+@inline split_lin(gb::Grid{2}, Iv) = i32 + (Iv[1] - i32) + (Iv[2] - i32)*gb.s[2]
+@inline split_lin(gb::Grid{3}, iv, j, k) = i32 + (iv - i32) + (j - i32)*gb.s[2] + (k - i32)*gb.s[3]
+@inline split_lin(gb::Grid{2}, iv, j) = i32 + (iv - i32) + (j - i32)*gb.s[2]
+@inline split_range(g::Grid{D}, gb::Grid{D}) where D =
+    (ntuple(d -> d == 1 ? 1 : 2, D), ntuple(d -> d == 1 ? Int(gb.n[1]) : Int(g.n[d]) - 1, D))
+
+function k_pack_reg!(lo, hi, regb, regr, reg, g::Grid{D}, gb::Grid{D}) where D
     Iv, ok = cellidx(lo, hi); ok || return
-    g = op.g
-    fs = D == 3 ? (Iv[2] + Iv[3]) : Iv[2]
-    p = (fs + i32) % Int32(2)
-    i = Int32(2)*Iv[1] - i32 - p
+    iv = Iv[1]; n1 = g.n[1]
+    lb = split_lin(gb, Iv)
+    qb = (D == 3 ? (Iv[2] + Iv[3]) : Iv[2]) & i32
+    qr = i32 - qb
+    ib = Int32(2)*iv + qb
+    ib <= n1 - i32 && (@inbounds regb[lb] = reg[lin(g, setj(Iv, 1, ib))])
+    ir = Int32(2)*iv + qr
+    ir <= n1 - i32 && (@inbounds regr[lb] = reg[lin(g, setj(Iv, 1, ir))])
+    return nothing
+end
+function pack_reg!(p::TPoisson{T,S,V,D}, lo, hi) where {T,S,V,D}
+    p.usevrb || return nothing
+    g = p.levels[1].op.g; gb = p.gb
+    slo = ntuple(d -> d == 1 ? max(1, lo[1] >> 1) : lo[d], D)
+    shi = ntuple(d -> d == 1 ? min(Int(gb.n[1]), hi[1] >> 1) : hi[d], D)
+    all(slo .<= shi) && launch(k_pack_reg!, slo, shi, p.regb, p.regr, p.levels[1].op.reg, g, gb)
+    return nothing
+end
+
+@inline function split_pre(arr, op::Op{3}, gb::Grid{3}, I::NTuple{3,Int32}, iv, q, c_val=0f0)
+    g = op.g; n1 = g.n[1]; nx_half = gb.n[1]
+    i, j, k = I
+    xm_iv = (op.per[1] & (i == Int32(2))) ? nx_half : (q == 0 ? iv - i32 : iv)
+    xp_iv = (op.per[1] & (i == n1 - i32)) ? i32 : (q == 0 ? iv : iv + i32)
+    ym_j = (op.per[2] & (j == Int32(2))) ? g.n[2] - i32 : j - i32
+    yp_j = (op.per[2] & (j == g.n[2] - i32)) ? Int32(2) : j + i32
+    zm_k = (op.per[3] & (k == Int32(2))) ? g.n[3] - i32 : k - i32
+    zp_k = (op.per[3] & (k == g.n[3] - i32)) ? Int32(2) : k + i32
+    xm = (!op.per[1] & (i == Int32(2))) ? 0f0 : Float32(@inbounds arr[split_lin(gb, xm_iv, j, k)])
+    xp = (!op.per[1] & (i == n1 - i32)) ? 0f0 : Float32(@inbounds arr[split_lin(gb, xp_iv, j, k)])
+    ym = (!op.per[2] & (j == Int32(2))) ? 0f0 : Float32(@inbounds arr[split_lin(gb, iv, ym_j, k)])
+    yp = (!op.per[2] & (j == g.n[2] - i32)) ? 0f0 : Float32(@inbounds arr[split_lin(gb, iv, yp_j, k)])
+    zm = (!op.per[3] & (k == Int32(2))) ? 0f0 : Float32(@inbounds arr[split_lin(gb, iv, j, zm_k)])
+    zp = (!op.per[3] & (k == g.n[3] - i32)) ? 0f0 : Float32(@inbounds arr[split_lin(gb, iv, j, zp_k)])
+    return Pre(I, c_val, (xm, ym, zm), (xp, yp, zp))
+end
+@inline function split_pre(arr, op::Op{2}, gb::Grid{2}, I::NTuple{2,Int32}, iv, q, c_val=0f0)
+    g = op.g; n1 = g.n[1]; nx_half = gb.n[1]
+    i, j = I
+    xm_iv = (op.per[1] & (i == Int32(2))) ? nx_half : (q == 0 ? iv - i32 : iv)
+    xp_iv = (op.per[1] & (i == n1 - i32)) ? i32 : (q == 0 ? iv : iv + i32)
+    ym_j = (op.per[2] & (j == Int32(2))) ? g.n[2] - i32 : j - i32
+    yp_j = (op.per[2] & (j == g.n[2] - i32)) ? Int32(2) : j + i32
+    xm = (!op.per[1] & (i == Int32(2))) ? 0f0 : Float32(@inbounds arr[split_lin(gb, xm_iv, j)])
+    xp = (!op.per[1] & (i == n1 - i32)) ? 0f0 : Float32(@inbounds arr[split_lin(gb, xp_iv, j)])
+    ym = (!op.per[2] & (j == Int32(2))) ? 0f0 : Float32(@inbounds arr[split_lin(gb, iv, ym_j)])
+    yp = (!op.per[2] & (j == g.n[2] - i32)) ? 0f0 : Float32(@inbounds arr[split_lin(gb, iv, yp_j)])
+    return Pre(I, c_val, (xm, ym), (xp, yp))
+end
+
+# Pass 1a (level 1, split R/B): black cells of RBGS pre-sweep from ϵ=0 into scaled Float16 `ϵb`.
+function k_pre_rb16_sp!(lo, hi, ϵb, r, regb, op::Op{D}, gb::Grid{D}, scd) where D
+    Iv, ok = cellidx(lo, hi); ok || return
+    g = op.g; iv = Iv[1]
+    q = (D == 3 ? (Iv[2] + Iv[3]) : Iv[2]) & i32
+    i = Int32(2)*iv + q
     i <= g.n[1] - i32 || return
     I = setj(Iv, 1, i); l = lin(g, I)
+    lb = split_lin(gb, Iv)
+    o = withflag(op, @inbounds(regb[lb]))
     sc = @inbounds scd[1]
-    pr = Pre(AV(r), op, I, l)
-    e = isdeep(op, l) ?
-        (pr.c - offdiag_f(op, I, l, Scaled(pr, op.iDreg))) * op.iDreg :
-        (pr.c - offdiag_f(op, I, l, RiD(r, op))) * getiD(op, l)
-    @inbounds ϵ1[l] = pack16(e, sc)
+    pr = Pre(AV(r), o, I, l)
+    e = isdeep(o, l) ?
+        (pr.c - offdiag_f(o, I, l, Scaled(pr, o.iDreg))) * o.iDreg :
+        (pr.c - offdiag_f(o, I, l, RiD(r, o))) * getiD(o, l)
+    @inbounds ϵb[lb] = pack16(e, sc)
     return nothing
 end
 # Pass 1a (coarse levels, Float32): black cells of the RBGS pre-sweep from ϵ=0 (x-paired).
@@ -703,29 +821,84 @@ end
 end
 @inline aprol_regsum(dm::NTuple{3,Float32}, dp::NTuple{3,Float32}) = dm[1] + dp[1] + dm[2] + dp[2] + dm[3] + dp[3]
 @inline aprol_regsum(dm::NTuple{2,Float32}, dp::NTuple{2,Float32}) = dm[1] + dp[1] + dm[2] + dp[2]
-@inline pre_odsum(pe::Pre{3,Float32}) = pe.m[1] + pe.p[1] + pe.m[2] + pe.p[2] + pe.m[3] + pe.p[3]
-@inline pre_odsum(pe::Pre{2,Float32}) = pe.m[1] + pe.p[1] + pe.m[2] + pe.p[2]
 
-# Pass 2 (level 1, in-place on `ϵ1`): computes Float32 `r̃ = r - A·prol(cx)` into Float16 `r1`,
-# leaves black cells of `ϵ1` untouched (`δz_blk = ϵ_blk`), and runs the first red GS sweep on `ϵ1`.
-function k_prol_dz!(lo, hi, ϵ1, r1, cx, gc::Grid{D}, c::Per, r, op::Op{D}, scd) where D
-    I, ok = cellidx(lo, hi); ok || return
-    sc = @inbounds scd[1]; isc = @inbounds scd[2]
-    g = op.g; l = lin(g, I)
-    Ic = down(I, c); lc = lin(gc, Ic)
-    cc = @inbounds cx[lc]
-    dm, dp = aprol_terms(cx, gc, c, op.per, I, Ic, lc, cc)
-    reg = isreg(op, l)
-    ap = reg ? op.Lreg * aprol_regsum(dm, dp) : aprol_irreg(op, I, l, c, dm, dp)
-    rt = @inbounds(r[l]) - ap
-    @inbounds r1[l] = pack16(rt, sc)
-    sidx = D == 3 ? (I[1] + I[2] + I[3]) : (I[1] + I[2])
-    if isodd(sidx)
-        pe = PreOff(CastF32(ϵ1), op, I, l)
-        od = reg ? op.Lreg * pre_odsum(pe) : offdiag_f(op, I, l, pe)
-        iD = reg ? op.iDreg : @inbounds(op.iD[l])
-        @inbounds ϵ1[l] = pack16((rt - isc * od) * iD, sc)
+# Pass 1b (level 1, split R/B): restrict r₁ = -offdiag(ϵb) over red cells into `rc`, zero `cx`.
+function k_restrict_rb_sp!(lo, hi, rc, cx, gc::Grid{D}, ϵb, regr, op::Op{D}, gb::Grid{D}, c::Per, scd) where D
+    Ic, ok = cellidx(lo, hi); ok || return
+    isc = @inbounds scd[2]
+    gf = op.g
+    J0 = ntuple(d -> c[d] ? Int32(2)*Ic[d] - Int32(2) : Ic[d], Val(D))
+    s = 0f0
+    if D == 3
+        for dz in Int32(0):Int32(c[3]), dy in Int32(0):Int32(c[2]), dx in Int32(0):Int32(c[1])
+            i = J0[1] + dx; j = J0[2] + dy; k = J0[3] + dz
+            if isodd(i + j + k)
+                iv = i >> 1; q = i & i32
+                J = (i, j, k); l = lin(gf, J)
+                o = withflag(op, @inbounds(regr[split_lin(gb, iv, j, k)]))
+                s -= offdiag_f(o, J, l, split_pre(ϵb, o, gb, J, iv, q))
+            end
+        end
+    else
+        for dy in Int32(0):Int32(c[2]), dx in Int32(0):Int32(c[1])
+            i = J0[1] + dx; j = J0[2] + dy
+            if isodd(i + j)
+                iv = i >> 1; q = i & i32
+                J = (i, j); l = lin(gf, J)
+                o = withflag(op, @inbounds(regr[split_lin(gb, iv, j)]))
+                s -= offdiag_f(o, J, l, split_pre(ϵb, o, gb, J, iv, q))
+            end
+        end
     end
+    lc = lin(gc, Ic)
+    @inbounds rc[lc] = s * isc
+    @inbounds cx[lc] = 0f0
+    return nothing
+end
+
+# Pass 2 (level 1, split R/B): writes `rb`/`rr` = pack16(r - A·prol(cx)) and runs first red GS sweep into `ϵr`.
+function k_prol_dz_sp!(lo, hi, ϵb, ϵr, rb, rr, regb, regr, cx, gc::Grid{D}, c::Per, r, op::Op{D}, gb::Grid{D}, scd) where D
+    Iv, ok = cellidx(lo, hi); ok || return
+    sc = @inbounds scd[1]; isc = @inbounds scd[2]
+    g = op.g; n1 = g.n[1]; iv = Iv[1]
+    lb = split_lin(gb, Iv)
+    qb = (D == 3 ? (Iv[2] + Iv[3]) : Iv[2]) & i32
+    qr = i32 - qb
+
+    ib = Int32(2)*iv + qb
+    if ib <= n1 - i32
+        Ib = setj(Iv, 1, ib); l = lin(g, Ib)
+        Ic = down(Ib, c); lc = lin(gc, Ic)
+        cc = @inbounds cx[lc]
+        dm, dp = aprol_terms(cx, gc, c, op.per, Ib, Ic, lc, cc)
+        ob = withflag(op, @inbounds(regb[lb]))
+        ap = isreg(ob, l) ? op.Lreg * aprol_regsum(dm, dp) : aprol_irreg(ob, Ib, l, c, dm, dp)
+        @inbounds rb[lb] = pack16(@inbounds(r[l]) - ap, sc)
+    end
+
+    ir = Int32(2)*iv + qr
+    if ir <= n1 - i32
+        Ir = setj(Iv, 1, ir); l = lin(g, Ir)
+        Ic = down(Ir, c); lc = lin(gc, Ic)
+        cc = @inbounds cx[lc]
+        dm, dp = aprol_terms(cx, gc, c, op.per, Ir, Ic, lc, cc)
+        orr = withflag(op, @inbounds(regr[lb]))
+        reg = isreg(orr, l)
+        ap = reg ? op.Lreg * aprol_regsum(dm, dp) : aprol_irreg(orr, Ir, l, c, dm, dp)
+        rt = @inbounds(r[l]) - ap
+        @inbounds rr[lb] = pack16(rt, sc)
+        pe = split_pre(ϵb, orr, gb, Ir, iv, qr)
+        od = reg ? op.Lreg * pre_odsum(pe) : offdiag_f(orr, Ir, l, pe)
+        iD = reg ? op.iDreg : @inbounds(op.iD[l])
+        @inbounds ϵr[lb] = pack16((rt - isc * od) * iD, sc)
+    end
+    return nothing
+end
+# Simple prolongation `z = ϵ + prol(cx)` when coarse level uses `gs2!` for all 4 sweeps.
+function k_vprol_add!(lo, hi, zb, ϵb, cx, gc::Grid{D}, c::Per, op::Op{D}) where D
+    I, ok = cellidx(lo, hi); ok || return
+    l = lin(op.g, I)
+    @inbounds zb[l] = ϵb[l] + cx[lin(gc, down(I, c))]
     return nothing
 end
 # Pass 2 (coarse levels, Float32): fused prolongation (`ϵb + prol(cx)`) and first red GS sweep.
@@ -767,20 +940,33 @@ function k_vprol_red!(lo, hi, zb, ϵb, cx, gc::Grid{D}, c::Per, rb, op::Op{D}) w
     end
     return nothing
 end
-# Single RBGS half sweep on Float16 (`ϵ1`/`r1`, level 1) or Float32 (coarse levels),
-# paired along x so all 32 lanes of a warp stay on the same (y,z) row.
+# Single RBGS half sweep on split Float16 buffers (level 1): coalesced unit-stride reads/writes.
+function k_vgs_sp!(lo, hi, outc, inc, rc, regc, op::Op{D}, gb::Grid{D}, k0::Int32) where D
+    Iv, ok = cellidx(lo, hi); ok || return
+    g = op.g; iv = Iv[1]
+    fs = D == 3 ? (Iv[2] + Iv[3]) : Iv[2]
+    q = (fs + k0 - i32) & i32
+    i = Int32(2)*iv + q
+    i <= g.n[1] - i32 || return
+    I = setj(Iv, 1, i); l = lin(g, I)
+    lb = split_lin(gb, Iv)
+    o = withflag(op, @inbounds(regc[lb]))
+    pe = split_pre(inc, o, gb, I, iv, q)
+    v = (Float32(@inbounds rc[lb]) - offdiag_f(o, I, l, pe)) * getiD(o, l)
+    @inbounds outc[lb] = pack16(v, 1f0)
+    return nothing
+end
+# Single RBGS half sweep on Float32 (coarse levels), paired along x.
 function k_vgs_s!(lo, hi, zb, rb, op::Op{D}, k0::Int32) where D
     Iv, ok = cellidx(lo, hi); ok || return
-    E = eltype(zb)
     g = op.g
     fs = D == 3 ? (Iv[2] + Iv[3]) : Iv[2]
     p = (fs + k0) % Int32(2)
     i = Int32(2)*Iv[1] - i32 - p
     i <= g.n[1] - i32 || return
     I = setj(Iv, 1, i); l = lin(g, I)
-    pe = PreOff(CastF32(zb), op, I, l)
-    v = (Float32(@inbounds rb[l]) - offdiag_f(op, I, l, pe)) * getiD(op, l)
-    @inbounds zb[l] = E === Float16 ? Float16(clamp(v, -65000f0, 65000f0)) : v
+    pe = PreOff(AV(zb), op, I, l)
+    @inbounds zb[l] = (rb[l] - offdiag_f(op, I, l, pe)) * getiD(op, l)
     return nothing
 end
 # Coarse-level final black GS sweep: copies red cells and updates black cells directly into `xb`.
@@ -796,35 +982,100 @@ function k_vblk_coarse!(lo, hi, xb, zb, rb, op::Op{D}) where D
     end
     return nothing
 end
-# Level-1 FP32 outer update: `r -= ω·(A·prol(cx) + A·(δz/sc))`, `x += ω·(prol(cx) + δz/sc)`, plus norms.
-function k_incr_dz!(lo, hi, ps, pm, r, x, ϵ1, cx, gc::Grid{D}, c::Per, op::Op{D}, ωd, scd, ::Val{exclb}) where {D, exclb}
-    I, ok = cellidx(lo, hi)
-    ω = @inbounds ωd[1]; isc = @inbounds scd[2]
-    a = 0f0; m = 0f0
-    if ok
-        g = op.g; l = lin(g, I)
-        pe = Pre(CastF32(ϵ1), op, I, l)
-        Ic = down(I, c); lc = lin(gc, Ic)
-        cc = @inbounds cx[lc]
-        dm, dp = aprol_terms(cx, gc, c, op.per, I, Ic, lc, cc)
-        if isreg(op, l)
-            az = op.Lreg * (aprol_regsum(dm, dp) + isc * (pre_odsum(pe) - Float32(2D) * pe.c))
-        else
-            az = aprol_irreg(op, I, l, c, dm, dp) + isc * mult_f(op, I, l, pe)
+# Level-1 FP32 outer update on split R/B buffers: `r -= ω·(A·prol(cx) + A·(δz/sc))`, `x += ω·(prol(cx) + δz/sc)`.
+@inline function incr_cell_sp!(I::NTuple{D,Int32}, r, x, ec::Float32, pe::Pre{D}, o::Op{D}, cx, gc::Grid{D}, c::Per, ω, isc, ::Val{exclb}) where {D,exclb}
+    g = o.g; l = lin(g, I)
+    Ic = down(I, c); lc = lin(gc, Ic)
+    cc = @inbounds cx[lc]
+    dm, dp = aprol_terms(cx, gc, c, o.per, I, Ic, lc, cc)
+    if isreg(o, l)
+        az = o.Lreg * (aprol_regsum(dm, dp) + isc * (pre_odsum(pe) - Float32(2D) * ec))
+    else
+        az = aprol_irreg(o, I, l, c, dm, dp) + isc * mult_f(o, I, l, pe)
+    end
+    v = @inbounds(r[l]) - ω * az
+    @inbounds r[l] = v
+    @inbounds x[l] += ω * (cc + isc * ec)
+    av = abs(v)
+    edge = false
+    if exclb
+        @unroll for d in i32:Int32(D)
+            edge |= (I[d] == Int32(2)) | (I[d] == g.n[d] - i32)
         end
-        v = @inbounds(r[l]) - ω * az
-        @inbounds r[l] = v
-        @inbounds x[l] += ω * (cc + isc * pe.c)
-        a = abs(v)
-        edge = false
-        if exclb
-            @unroll for d in i32:Int32(D)
-                edge |= (I[d] == Int32(2)) | (I[d] == g.n[d] - i32)
+    end
+    return av, (edge ? 0f0 : av)
+end
+function k_incr_dz_sp2!(lo, hi, ps, pm, r, x, ϵb, ϵr, regb, regr, cx, gc::Grid{D}, c::Per, op::Op{D}, gb::Grid{D}, ωd, scd, ex::Val{exclb}) where {D,exclb}
+    Iv, ok = cellidx(lo, hi)
+    ω = @inbounds ωd[1]; isc = @inbounds scd[2]
+    a_sum = 0f0; m_max = 0f0
+    if ok
+        g = op.g; n1 = g.n[1]; nx_half = gb.n[1]; iv = Iv[1]
+        lb = split_lin(gb, Iv)
+        qb = (D == 3 ? (Iv[2] + Iv[3]) : Iv[2]) & i32
+        qr = i32 - qb
+        eb_c = Float32(@inbounds ϵb[lb])
+        er_c = Float32(@inbounds ϵr[lb])
+        ob = withflag(op, @inbounds(regb[lb]))
+        orr = withflag(op, @inbounds(regr[lb]))
+        if D == 3
+            j, k = Iv[2], Iv[3]
+            ym_j = (op.per[2] & (j == Int32(2))) ? g.n[2] - i32 : j - i32
+            yp_j = (op.per[2] & (j == g.n[2] - i32)) ? Int32(2) : j + i32
+            zm_k = (op.per[3] & (k == Int32(2))) ? g.n[3] - i32 : k - i32
+            zp_k = (op.per[3] & (k == g.n[3] - i32)) ? Int32(2) : k + i32
+            lym = split_lin(gb, iv, ym_j, k); lyp = split_lin(gb, iv, yp_j, k)
+            lzm = split_lin(gb, iv, j, zm_k); lzp = split_lin(gb, iv, j, zp_k)
+            prev_iv = (op.per[1] & (iv == i32)) ? nx_half : iv - i32
+            next_iv = (op.per[1] & (iv == nx_half)) ? i32 : iv + i32
+            lprev = split_lin(gb, prev_iv, j, k); lnext = split_lin(gb, next_iv, j, k)
+            er_prev = Float32(@inbounds ϵr[lprev]); er_next = Float32(@inbounds ϵr[lnext])
+            er_ym = Float32(@inbounds ϵr[lym]); er_yp = Float32(@inbounds ϵr[lyp])
+            er_zm = Float32(@inbounds ϵr[lzm]); er_zp = Float32(@inbounds ϵr[lzp])
+            eb_prev = Float32(@inbounds ϵb[lprev]); eb_next = Float32(@inbounds ϵb[lnext])
+            eb_ym = Float32(@inbounds ϵb[lym]); eb_yp = Float32(@inbounds ϵb[lyp])
+            eb_zm = Float32(@inbounds ϵb[lzm]); eb_zp = Float32(@inbounds ϵb[lzp])
+
+            ib = Int32(2)*iv + qb
+            if ib <= n1 - i32
+                Ib = (ib, j, k)
+                xm = (!op.per[1] & (ib == Int32(2))) ? 0f0 : (qb == 0 ? er_prev : er_c)
+                xp = (!op.per[1] & (ib == n1 - i32)) ? 0f0 : (qb == 0 ? er_c : er_next)
+                ym = (!op.per[2] & (j == Int32(2))) ? 0f0 : er_ym
+                yp = (!op.per[2] & (j == g.n[2] - i32)) ? 0f0 : er_yp
+                zm = (!op.per[3] & (k == Int32(2))) ? 0f0 : er_zm
+                zp = (!op.per[3] & (k == g.n[3] - i32)) ? 0f0 : er_zp
+                av, mv = incr_cell_sp!(Ib, r, x, eb_c, Pre(Ib, eb_c, (xm, ym, zm), (xp, yp, zp)), ob, cx, gc, c, ω, isc, ex)
+                a_sum += av; m_max = max(m_max, mv)
+            end
+            ir = Int32(2)*iv + qr
+            if ir <= n1 - i32
+                Ir = (ir, j, k)
+                xm = (!op.per[1] & (ir == Int32(2))) ? 0f0 : (qr == 0 ? eb_prev : eb_c)
+                xp = (!op.per[1] & (ir == n1 - i32)) ? 0f0 : (qr == 0 ? eb_c : eb_next)
+                ym = (!op.per[2] & (j == Int32(2))) ? 0f0 : eb_ym
+                yp = (!op.per[2] & (j == g.n[2] - i32)) ? 0f0 : eb_yp
+                zm = (!op.per[3] & (k == Int32(2))) ? 0f0 : eb_zm
+                zp = (!op.per[3] & (k == g.n[3] - i32)) ? 0f0 : eb_zp
+                av, mv = incr_cell_sp!(Ir, r, x, er_c, Pre(Ir, er_c, (xm, ym, zm), (xp, yp, zp)), orr, cx, gc, c, ω, isc, ex)
+                a_sum += av; m_max = max(m_max, mv)
+            end
+        else
+            ib = Int32(2)*iv + qb
+            if ib <= n1 - i32
+                Ib = (ib, Iv[2])
+                av, mv = incr_cell_sp!(Ib, r, x, eb_c, split_pre(ϵr, ob, gb, Ib, iv, qb, eb_c), ob, cx, gc, c, ω, isc, ex)
+                a_sum += av; m_max = max(m_max, mv)
+            end
+            ir = Int32(2)*iv + qr
+            if ir <= n1 - i32
+                Ir = (ir, Iv[2])
+                av, mv = incr_cell_sp!(Ir, r, x, er_c, split_pre(ϵb, orr, gb, Ir, iv, qr, er_c), orr, cx, gc, c, ω, isc, ex)
+                a_sum += av; m_max = max(m_max, mv)
             end
         end
-        m = edge ? 0f0 : a
     end
-    block_partial!(ps, pm, a, m)
+    block_partial!(ps, pm, a_sum, m_max)
     return nothing
 end
 function k_set_scale!(scd, maxs, slot::Int32)
@@ -1094,19 +1345,24 @@ function vrb_coarse!(p::TPoisson, l::Int, lb::Int)
             launch(k_vgs_s!, clo, chi, coarse.x, coarse.r, coarse.op, k0)
         end
     end
-    launch(k_vprol_red!, inside_lo(gf), inside_hi(gf), fine.z, fine.ϵ, coarse.x, gc, cp, fine.r, fine.op)
-    launch(k_vgs_s!, lo, hi, fine.z, fine.r, fine.op, Int32(1))
-    launch(k_vgs_s!, lo, hi, fine.z, fine.r, fine.op, Int32(2))
-    launch(k_vblk_coarse!, inside_lo(gf), inside_hi(gf), fine.x, fine.z, fine.r, fine.op)
+    if usegs2(fine.op)
+        launch(k_vprol_add!, inside_lo(gf), inside_hi(gf), fine.z, fine.ϵ, coarse.x, gc, cp, fine.op)
+        gs2!(fine.z, fine.ϵ, fine.r, fine.op, 2)
+        gs2!(fine.ϵ, fine.x, fine.r, fine.op, 2)
+    else
+        launch(k_vprol_red!, inside_lo(gf), inside_hi(gf), fine.z, fine.ϵ, coarse.x, gc, cp, fine.r, fine.op)
+        launch(k_vgs_s!, lo, hi, fine.z, fine.r, fine.op, Int32(1))
+        launch(k_vgs_s!, lo, hi, fine.z, fine.r, fine.op, Int32(2))
+        launch(k_vblk_coarse!, inside_lo(gf), inside_hi(gf), fine.x, fine.z, fine.r, fine.op)
+    end
     return nothing
 end
-# One V-cycle iteration: scaled Float16 `δz` + exact Float32 `prol(cx)` on level 1 (5 post
-# half-sweeps for `TPoisson` to keep cut-cell `r∞` single-cycle; 4 for Biot-Savart `exclb`),
-# Float32 on coarse levels. Leaves all level buffers unswapped and `top.z` untouched.
-function vrb_iter!(p::TPoisson; fix::Bool=false, exclb::Bool=false, adapt::Bool=true)
+# One V-cycle body up through the fine post-smoothing sweeps (without `k_incr_dz_sp2!` / `k_omega!`).
+function vrb_body!(p::TPoisson; fix::Bool=false, exclb::Bool=false)
     lb = bottom_index(p)
     top, c2 = p.levels[1], p.levels[2]
     g1, g2 = top.op.g, c2.op.g
+    gb = p.gb
     cp = Per(top.c)
     if fix
         @cuda k_mkfix!(p.fixd, p.red.s, p.nsd)
@@ -1115,9 +1371,9 @@ function vrb_iter!(p::TPoisson; fix::Bool=false, exclb::Bool=false, adapt::Bool=
         finish!(p.red, nb, p.red.s, p.red.m, SLOT_R0; fixd=p.fixd)
         @cuda k_set_scale!(p.scd, p.red.m, Int32(SLOT_R0))
     end
-    lo, hi = gs_range_x(g1)
-    launch(k_pre_rb16!, lo, hi, p.ϵ1, top.r, top.op, p.scd)
-    launch(k_restrict_rb!, inside_lo(g2), inside_hi(g2), c2.r, c2.x, g2, p.ϵ1, top.op, cp, p.scd)
+    slo, shi = split_range(g1, gb)
+    launch(k_pre_rb16_sp!, slo, shi, p.ϵb, top.r, p.regb, top.op, gb, p.scd)
+    launch(k_restrict_rb_sp!, inside_lo(g2), inside_hi(g2), c2.r, c2.x, g2, p.ϵb, p.regr, top.op, gb, cp, p.scd)
     if 2 == lb
         bottom!(p, lb; swap=false)
     elseif 2 < length(p.levels)
@@ -1129,12 +1385,20 @@ function vrb_iter!(p::TPoisson; fix::Bool=false, exclb::Bool=false, adapt::Bool=
             launch(k_vgs_s!, clo, chi, c2.x, c2.r, c2.op, k0)
         end
     end
-    launch(k_prol_dz!, inside_lo(g1), inside_hi(g1), p.ϵ1, p.r1, c2.x, g2, cp, top.r, top.op, p.scd)
-    launch(k_vgs_s!, lo, hi, p.ϵ1, p.r1, top.op, Int32(1))
-    launch(k_vgs_s!, lo, hi, p.ϵ1, p.r1, top.op, Int32(2))
-    launch(k_vgs_s!, lo, hi, p.ϵ1, p.r1, top.op, Int32(1))
-    !exclb && launch(k_vgs_s!, lo, hi, p.ϵ1, p.r1, top.op, Int32(2))
-    red_launch(k_incr_dz!, inside_lo(g1), inside_hi(g1), p.red, SLOT_R, top.r, top.x, p.ϵ1, c2.x, g2, cp, top.op, p.ωd, p.scd, Val(exclb))
+    launch(k_prol_dz_sp!, slo, shi, p.ϵb, p.ϵr, p.rb, p.rr, p.regb, p.regr, c2.x, g2, cp, top.r, top.op, gb, p.scd)
+    launch(k_vgs_sp!, slo, shi, p.ϵb, p.ϵr, p.rb, p.regb, top.op, gb, Int32(1))
+    launch(k_vgs_sp!, slo, shi, p.ϵr, p.ϵb, p.rr, p.regr, top.op, gb, Int32(2))
+    launch(k_vgs_sp!, slo, shi, p.ϵb, p.ϵr, p.rb, p.regb, top.op, gb, Int32(1))
+    !exclb && launch(k_vgs_sp!, slo, shi, p.ϵr, p.ϵb, p.rr, p.regr, top.op, gb, Int32(2))
+    return nothing
+end
+# One V-cycle iteration: scaled Float16 `δz` (split R/B layout) + exact Float32 `prol(cx)` on level 1
+# (5 post half-sweeps for `TPoisson`, 4 for Biot-Savart `exclb`), Float32 on coarse levels.
+function vrb_iter!(p::TPoisson; fix::Bool=false, exclb::Bool=false, adapt::Bool=true)
+    vrb_body!(p; fix, exclb)
+    top, c2 = p.levels[1], p.levels[2]
+    slo, shi = split_range(top.op.g, p.gb)
+    red_launch(k_incr_dz_sp2!, slo, shi, p.red, SLOT_R, top.r, top.x, p.ϵb, p.ϵr, p.regb, p.regr, c2.x, c2.op.g, Per(top.c), top.op, p.gb, p.ωd, p.scd, Val(exclb))
     @cuda k_set_scale!(p.scd, p.red.m, Int32(SLOT_R))
     adapt && @cuda k_omega!(p.ωd, p.red.s, fix)
     return nothing
@@ -1171,7 +1435,7 @@ seen, capture on the second, graph replay afterwards. If the capture fails, that
 (key, buffer state) keeps running `f()` plainly.
 """
 function graphed!(f::F, p::TPoisson, key) where F
-    k = (key, objectid(p.levels[1].r))
+    k = (key, objectid(p.levels[1].r), key[4] ? UInt(0) : objectid(p.levels[1].x))
     if haskey(p.graphs, k)
         ex = p.graphs[k]
         if ex === nothing           # the capture failed earlier
@@ -1189,17 +1453,13 @@ function graphed!(f::F, p::TPoisson, key) where F
     return nothing
 end
 """
-    capture_graph(f, p)
+    capture_stream_graph(f)
 
-Capture the launches of `f()` into a CUDA graph and return its executable, or `nothing`
-(with the level buffers of `p` as before the call) if the capture is not possible.
+Capture the launches of `f()` into a CUDA graph on a private non-blocking stream and
+return its executable, or `nothing` if capture is not supported or fails.
 """
-function capture_graph(f::F, p::TPoisson) where F
-    if CUFUNCTION_LOCK === nothing
-        @warn "TurboLily: CUDA.jl's kernel compile lock was not found; the multigrid cycles run without CUDA graphs" maxlog=1
-        return nothing
-    end
-    state = [(lv.r, lv.ϵ) for lv in p.levels]
+function capture_stream_graph(f::F) where F
+    CUFUNCTION_LOCK === nothing && return nothing
     # Capture on a private non-blocking stream in relaxed mode, so that CUDA calls of
     # other tasks (possibly scheduled on this thread, possibly on the legacy stream)
     # cannot touch or depend on the capturing stream. Nothing runs during a capture;
@@ -1222,15 +1482,30 @@ function capture_graph(f::F, p::TPoisson) where F
     finally
         GC.enable(gc)
     end
-    if g === nothing
-        for (lv, (r, ϵ)) in zip(p.levels, state); lv.r, lv.ϵ = r, ϵ; end
+    g === nothing && return nothing
+    return CUDA.instantiate(g)
+end
+"""
+    capture_graph(f, p)
+
+Capture the launches of `f()` into a CUDA graph and return its executable, or `nothing`
+(with the level buffers of `p` as before the call) if the capture is not possible.
+"""
+function capture_graph(f::F, p::TPoisson) where F
+    if CUFUNCTION_LOCK === nothing
+        @warn "TurboLily: CUDA.jl's kernel compile lock was not found; the multigrid cycles run without CUDA graphs" maxlog=1
         return nothing
     end
-    return CUDA.instantiate(g)
+    state = [(lv.r, lv.ϵ) for lv in p.levels]
+    ex = capture_stream_graph(f)
+    if ex === nothing
+        for (lv, (r, ϵ)) in zip(p.levels, state); lv.r, lv.ϵ = r, ϵ; end
+    end
+    return ex
 end
 # one multigrid iteration: V-cycle, fine smoothing with norms (Σ|r|, max|r|) into slot 3, ω update
 function iteration!(p::TPoisson; fix=false, exclb=false, adapt=true)
-    graphed!(p, (fix, exclb, adapt)) do
+    graphed!(p, (fix, exclb, adapt, false)) do
         if p.usevrb
             vrb_iter!(p; fix, exclb, adapt)
         else
@@ -1248,15 +1523,15 @@ Multigrid iterations on `A x = z` where the level-1 residual `r` (uncorrected, w
 sum in slot `SLOT_RSUM` of `p.red`) was set by the caller. Convergence is tested on `scale·r`, so a
 caller solving for `p = x/Δt` passes `scale = Δt` and WaterLily's tolerances keep their meaning.
 """
-function k_setfix!(fixd, tiny::Float32)
+function k_init_solve!(fixd, ωd, tiny::Float32)
     @inbounds fixd[1] = 0f0; @inbounds fixd[2] = tiny
+    @inbounds ωd[1] = 1f0; @inbounds ωd[2] = 1f0
     return nothing
 end
 function solve!(p::TPoisson{T}, scale; tol=2e-3, itmx=32) where T
     top = p.levels[1]
     r₁tol = WaterLily.l1n_tol(p.ml.levels[1], tol)/scale; r∞tol = tol/scale
-    @cuda k_setfix!(p.fixd, Float32(2eps(T)/scale))
-    fill!(p.ωd, 1)
+    @cuda k_init_solve!(p.fixd, p.ωd, Float32(2eps(T)/scale))
     nᵖ = 0
     while nᵖ < itmx
         iteration!(p; fix = nᵖ == 0)
@@ -1286,8 +1561,7 @@ function WaterLily.solver!(p::TPoisson; tol=2e-3, itmx=32)
     lv = p.levels[1]; g = lv.op.g; lo, hi = inside_lo(g), inside_hi(g)
     checkcap(p.red, nblocks(lo, hi))
     nb = launch(k_residual!, lo, hi, p.red.ps, p.red.ps2, p.red.pm, lv.r, lv.z, lv.x, lv.op; cap=length(p.red.ps))
-    finish!(p.red, nb, p.red.s, p.red.m, SLOT_RSUM)
-    finish!(p.red, nb, p.red.s, p.red.m, SLOT_R0; ps=p.red.ps2)
+    finish2!(p.red, nb, p.red.s, p.red.m, SLOT_RSUM, SLOT_R0)
     solve!(p, 1; tol, itmx)
 end
 
@@ -1467,13 +1741,114 @@ function k_proj_cfl!(lo, hi, ps, pm, unew, uold, x, op::Op{D}, dt::T, bc::B, t::
     block_partial!(ps, pm, 0f0, m)
     return nothing
 end
+@inline function proj_dx_sp!(uout, uin, I::NTuple{3,Int32}, l, ec::Float32, pe::Pre{3},
+                             xold, op::Op{3}, dm::NTuple{3,Float32}, c::Per,
+                             ω::Float32, isc::Float32, dt::Float32, xf)
+    g = op.g; per = op.per; reg = isreg(op, l)
+    dm1 = (c[1] & isodd(I[1])) ? 0f0 : dm[1]
+    dm2 = (c[2] & isodd(I[2])) ? 0f0 : dm[2]
+    dm3 = (c[3] & isodd(I[3])) ? 0f0 : dm[3]
+    @inbounds dx1 = (xold[l] - xold[nbm(g, I, l, 1, per)]) - ω * (dm1 + isc * (pe.m[1] - ec))
+    @inbounds dx2 = (xold[l] - xold[nbm(g, I, l, 2, per)]) - ω * (dm2 + isc * (pe.m[2] - ec))
+    @inbounds dx3 = (xold[l] - xold[nbm(g, I, l, 3, per)]) - ω * (dm3 + isc * (pe.m[3] - ec))
+    L1 = reg ? op.Lreg : @inbounds(op.L[l])
+    L2 = reg ? op.Lreg : @inbounds(op.L[l + g.nc])
+    L3 = reg ? op.Lreg : @inbounds(op.L[l + Int32(2)*g.nc])
+    @inbounds v1 = uin[l] - dt * L1 * dx1
+    @inbounds v2 = uin[l + g.nc] - dt * L2 * dx2
+    @inbounds v3 = uin[l + Int32(2)*g.nc] - dt * L3 * dx3
+    @inbounds uout[l] = v1
+    @inbounds uout[l + g.nc] = v2
+    @inbounds uout[l + Int32(2)*g.nc] = v3
+    xfaces!(xf, uout, I, l, g, (v1, v2, v3))
+    return (v1, v2, v3)
+end
+@inline function incr_proj_cell!(uout, uin, xout, xin, r, I::NTuple{3,Int32}, ec::Float32, pe::Pre{3},
+                                 o::Op{3}, cx, gc::Grid{3}, c::Per, ω::Float32, isc::Float32, dt::Float32, xf)
+    g = o.g; l = lin(g, I)
+    Ic = down(I, c); lc = lin(gc, Ic); cc = @inbounds cx[lc]
+    dm, dp = aprol_terms(cx, gc, c, o.per, I, Ic, lc, cc)
+    if isreg(o, l)
+        az = o.Lreg * (aprol_regsum(dm, dp) + isc * (pre_odsum(pe) - 6f0 * ec))
+    else
+        az = aprol_irreg(o, I, l, c, dm, dp) + isc * mult_f(o, I, l, pe)
+    end
+    v = @inbounds(r[l]) - ω * az
+    @inbounds xout[l] = @inbounds(xin[l]) + ω * (cc + isc * ec)
+    vs = proj_dx_sp!(uout, uin, I, l, ec, pe, xin, o, dm, c, ω, isc, dt, xf)
+    return abs(v), vs, dm, dp
+end
+function k_incr_proj_1c!(lo, hi, ps, pm, r, xout, xin, uout, uin, ϵb, ϵr, regb, regr, cx, gc::Grid{3},
+                         c::Per, op::Op{3}, gb::Grid{3}, ωd, scd, dt::Float32, xf)
+    I, ok = cellidx(lo, hi)
+    ω = @inbounds ωd[1]; isc = @inbounds scd[2]
+    a = 0f0
+    if ok
+        i, j, k = I; iv = i >> 1; q = i & i32
+        lb = split_lin(gb, iv, j, k)
+        black = iseven(i + j + k)
+        ec = Float32(black ? @inbounds(ϵb[lb]) : @inbounds(ϵr[lb]))
+        o = withflag(op, black ? @inbounds(regb[lb]) : @inbounds(regr[lb]))
+        pe = split_pre(black ? ϵr : ϵb, o, gb, I, iv, q, ec)
+        a, _, _, _ = incr_proj_cell!(uout, uin, xout, xin, r, I, ec, pe, o, cx, gc, c, ω, isc, dt, xf)
+    end
+    block_partial!(ps, pm, a, a)
+    return nothing
+end
+function k_incr_proj_cfl_1c!(lo, hi, ps, pm, pm2, r, xout, xin, uout, uin, ϵb, ϵr, regb, regr, cx, gc::Grid{3},
+                             c::Per, op::Op{3}, gb::Grid{3}, ωd, scd, dt::T, bc::B, t::T, exit::Bool, xf) where {T,B}
+    I, ok = cellidx(lo, hi)
+    ω = @inbounds ωd[1]; isc = @inbounds scd[2]
+    a = 0f0; mcfl = 0f0
+    if ok
+        g = op.g; per = op.per
+        i, j, k = I; iv = i >> 1; q = i & i32
+        lb = split_lin(gb, iv, j, k)
+        black = iseven(i + j + k)
+        ec = Float32(black ? @inbounds(ϵb[lb]) : @inbounds(ϵr[lb]))
+        o = withflag(op, black ? @inbounds(regb[lb]) : @inbounds(regr[lb]))
+        pe = split_pre(black ? ϵr : ϵb, o, gb, I, iv, q, ec)
+        l = lin(g, I)
+        ru = upflags(op, l)
+        a, vs, dm, dp = incr_proj_cell!(uout, uin, xout, xin, r, I, ec, pe, o, cx, gc, c, ω, isc, dt, xf)
+        @unroll for d in i32:Int32(3)
+            ci = (d - i32) * g.nc; s = g.s[d]; Id = I[d]; nd = g.n[d]
+            v = vs[d]
+            lw = (bc !== nothing && (Id == Int32(2)) & !per[d]) ? bc(d, loc(d, I, T), t) : v
+            up = if Id < nd - i32
+                ddp = c[d] ? (isodd(Id) ? dm[d] : 0f0) : dp[d]
+                @inbounds dxp = (xin[l + s] - xin[l]) + ω * (ddp + isc * (pe.p[d] - ec))
+                L = ru[d] ? op.Lreg : @inbounds(op.L[l + s + ci])
+                @inbounds(uin[l + s + ci]) - dt * L * dxp
+            elseif bc === nothing
+                vup = @inbounds uin[l + s + ci]
+                @inbounds uout[l + s + ci] = vup
+                vup
+            elseif per[d]
+                l2 = l - (nd - Int32(3)) * s
+                ddp = c[d] ? (isodd(Id) ? dm[d] : 0f0) : dp[d]
+                @inbounds dxp = (xin[l2] - xin[l]) + ω * (ddp + isc * (pe.p[d] - ec))
+                L = ru[d] ? op.Lreg : @inbounds(op.L[l2 + ci])
+                @inbounds(uin[l2 + ci]) - dt * L * dxp
+            elseif exit & (d == i32)
+                @inbounds uin[l + s + ci]
+            else
+                bc(d, loc(d, setj(I, d, nd), T), t)
+            end
+            mcfl += max(0f0, up) + max(0f0, -lw)
+        end
+    end
+    block_partial_sm2!(ps, pm, pm2, a, a, mcfl)
+    return nothing
+end
 # (WaterLily ≥ 1.9.1: domain BCs at t and the convective exit (predictor) are applied here,
 # and the step is Δt/w with w=1 in the predictor and w=2 in the corrector)
 # `cfl=true`: the CFL flux maximum of the final velocity goes to SLOT_PROJ_CFL of b.red (see `cfl!`),
 # from the projection kernel, which then writes to `a.f` (swapped into `a.u`)
 # `kwargs` (`tol`, `itmx`) go to `solve!` at scale `Δt/w`, as WaterLily forwards them to `solver!`.
-function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t; cfl=false, kwargs...) where {D,T}
+function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t; cfl=false, tol=2e-3, itmx=32) where {D,T}
     # x faces of BC! (non-periodic x) in the residual and projection kernels, the rest of BC! after them
+    b.cfl_ready = false
     xf = a.per[1] ? nothing : XBC(a.bc, T(t), a.exitBC)
     xf === nothing && BC!(a, a.u, t)
     w == 1 && a.exitBC && exitBC!(a, a.u, a.u⁰, a.Δt[end], t)
@@ -1481,10 +1856,50 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t; cfl=false
     lo, hi = inside_lo(g), inside_hi(g)
     checkcap(b.red, nblocks(lo, hi))
     nb = launch(k_resid_src!, lo, hi, b.red.ps, b.red.ps2, b.red.pm, lv.r, lv.x, a.u, a.V, lv.op, inv(dt), !a.Vzero, xf; cap=length(b.red.ps))
-    finish!(b.red, nb, b.red.s, b.red.m, SLOT_RSUM)
-    finish!(b.red, nb, b.red.s, b.red.m, SLOT_R0; ps=b.red.ps2)
+    finish2!(b.red, nb, b.red.s, b.red.m, SLOT_RSUM, SLOT_R0)
     xf === nothing || BC!(a, a.u, t; jfirst=2)
-    solve!(b, dt; kwargs...)
+    if (w == 1 ? b.streak1 : b.streak2) >= Int8(3) && D == 3 && b.usevrb && itmx >= 1
+        c2 = b.levels[2]
+        @cuda k_init_solve!(b.fixd, b.ωd, Float32(2eps(T)/dt))
+        graphed!(b, (true, false, false, true)) do
+            vrb_body!(b; fix=true, exclb=false)
+        end
+        if cfl
+            nb1 = launch(k_incr_proj_cfl_1c!, lo, hi, b.red.ps, b.red.pm, b.red.ps2, lv.r, lv.z, lv.x, a.f, a.u,
+                         b.ϵb, b.ϵr, b.regb, b.regr, c2.x, c2.op.g, Per(lv.c), lv.op, b.gb, b.ωd, b.scd,
+                         dt, a.bc, T(t), a.exitBC, xf; cap=length(b.red.ps))
+            finish_sm2!(b.red, nb1, b.red.s, b.red.m, SLOT_R, SLOT_PROJ_CFL)
+        else
+            nb1 = launch(k_incr_proj_1c!, lo, hi, b.red.ps, b.red.pm, lv.r, lv.z, lv.x, a.f, a.u,
+                         b.ϵb, b.ϵr, b.regb, b.regr, c2.x, c2.op.g, Per(lv.c), lv.op, b.gb, b.ωd, b.scd,
+                         dt, xf; cap=length(b.red.ps))
+            finish!(b.red, nb1, b.red.s, b.red.m, SLOT_R)
+        end
+        fetch!(b.red)
+        r₁tol = WaterLily.l1n_tol(b.ml.levels[1], tol) / dt; r∞tol = tol / dt
+        @log ", 0, $(getmax(b.red,SLOT_R0)*dt), $(getsum(b.red,SLOT_R0)*dt)\n"
+        rnew, r∞ = getsum(b.red, SLOT_R), getmax(b.red, SLOT_R)
+        @log ", 1, $(r∞*dt), $(rnew*dt)\n"
+        if rnew < r₁tol && r∞ < r∞tol
+            push!(b.n, 1)
+            w == 1 ? (b.streak1 = Int8(3)) : (b.streak2 = Int8(3))
+            lv.x, lv.z = lv.z, lv.x
+            a.p = lv.x; b.x = lv.x; a.σ = lv.z; b.z = lv.z
+            perBC!(lv.x, lv.op.g, b.per)
+            cfl && (b.cfl_ready = true)
+            copy_exit!(a, a.f, a.u)
+            a.u, a.f = a.f, a.u
+            BC!(a, a.u, t; jfirst = xf === nothing ? 1 : 2)
+            return nothing
+        end
+        w == 1 ? (b.streak1 = Int8(0)) : (b.streak2 = Int8(0))
+        nb = launch(k_resid_src!, lo, hi, b.red.ps, b.red.ps2, b.red.pm, lv.r, lv.x, a.u, a.V, lv.op, inv(dt), !a.Vzero, nothing; cap=length(b.red.ps))
+        finish2!(b.red, nb, b.red.s, b.red.m, SLOT_RSUM, SLOT_R0)
+    end
+    solve!(b, dt; tol, itmx)
+    s_cur = w == 1 ? b.streak1 : b.streak2
+    s_next = (!isempty(b.n) && b.n[end] == 1) ? min(s_cur + Int8(1), Int8(3)) : Int8(0)
+    w == 1 ? (b.streak1 = s_next) : (b.streak2 = s_next)
     if cfl
         red_launch(k_proj_cfl!, inside_lo(g), inside_hi(g), b.red, SLOT_PROJ_CFL, a.f, a.u, b.x, lv.op, dt, a.bc, T(t), a.exitBC, xf)
         copy_exit!(a, a.f, a.u)
@@ -1495,13 +1910,15 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TPoisson, w::Int, t; cfl=false
     BC!(a, a.u, t; jfirst = xf === nothing ? 1 : 2)
 end
 "WaterLily.CFL of the velocity projected by `mom_project!(...; cfl=true)`."
+cfl!(a::TFlow, b::TPoisson; Δt_max=10) = (b.cfl_ready || fetch!(b.red); min(Δt_max, inv(getmax(b.red, SLOT_PROJ_CFL) + 5a.ν)))
 cfl!(a::TFlow, b::AbstractPoisson; Δt_max=10) = (fetch!(b.red); min(Δt_max, inv(getmax(b.red, SLOT_PROJ_CFL) + 5a.ν)))
 
 # Streaming kernels (no shared-memory sums): 32×8×1 blocks are 3–7 % faster than 32×4×2.
 # The Jacobi kernels keep 32×4×2, whose blocks hold whole 2ᵈ coarsening blocks (`FusedR`).
 for k in (:k_gs!, :k_incr!, :k_prol_incr!, :k_resid_src!, :k_resid_biot!, :k_proj!, :k_proj_cfl!,
-          :k_fix_r!, :k_pre_rb16!, :k_pre_rb32!, :k_restrict_rb!, :k_prol_dz!, :k_vprol_red!,
-          :k_vgs_s!, :k_vblk_coarse!, :k_incr_dz!)
+          :k_incr_proj_1c!, :k_incr_proj_cfl_1c!,
+          :k_fix_r!, :k_pack_reg!, :k_pre_rb16_sp!, :k_pre_rb32!, :k_restrict_rb!, :k_restrict_rb_sp!,
+          :k_prol_dz_sp!, :k_vprol_red!, :k_vprol_add!, :k_vgs_s!, :k_vgs_sp!, :k_vblk_coarse!, :k_incr_dz_sp2!)
     @eval kernel_threads(::typeof($k), ::Val{3}, ext) = ext[1]*ext[2] >= BIG_PLANE ? (32, 8, 1) : threads_for(Val(3))
     @eval shrinkable(::typeof($k)) = true
 end

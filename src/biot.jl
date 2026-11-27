@@ -33,6 +33,11 @@ struct TBiotPoisson{T,S,V,D,P<:TPoisson,W,G,K} <: AbstractPoisson{T,S,V}
     boxes :: Vector{Tuple{NTuple{D,Int},NTuple{D,Int}}}   # per level (lo,hi) body box (empty box: lo > hi)
     bst :: CuVector{Int32}            # [box lo, box hi, near count per level]
     images :: NTuple{K,Int32}         # symmetry planes (faces ±j) with image vortices
+    irreg2 :: CuArray{UInt8,D}        # level-2 mask: 1 where any 4×4 fine neighbor has `!isreg`
+    fmm_graphs :: Dict{Any,Any}       # cached CUDA graphs for `fmm!`
+    fmm_seen :: Set{Any}
+    pflow_graphs :: Dict{UInt,Any}    # cached CUDA graphs for `pflowBC!`
+    pflow_seen :: Set{UInt}
 end
 function TBiotPoisson(flow::TFlow{D,T}; nonbiotfaces=(), fmm=true, symmetry=()) where {D,T}
     # argument checks as BiotSavartBCs.BiotSavartPoisson
@@ -60,11 +65,13 @@ function TBiotPoisson(flow::TFlow{D,T}; nonbiotfaces=(), fmm=true, symmetry=()) 
         pois, pois.x, pois.L, pois.z, ω, g, tar, tadj, pois.n, flow.perdir, pois.red,
         CuVector{Int32}(B), [CuVector{Float32}(undef, length(t)) for t in tar],
         [CuVector{Int32}(undef, length(t)) for t in tar], zeros(Int, nl), Tuple{NTuple{D,Int},NTuple{D,Int}}[],
-        CuVector{Int32}(undef, 6 + nl), Int32.(Tuple(symmetry)))
+        CuVector{Int32}(undef, 6 + nl), Int32.(Tuple(symmetry)),
+        CUDA.zeros(UInt8, Int.(g[2].n)), Dict{Any,Any}(), Set{Any}(), Dict{UInt,Any}(), Set{UInt}())
     body_box!(b)
+    mark_irreg2!(b)
     return b
 end
-WaterLily.update!(b::TBiotPoisson) = (WaterLily.update!(b.pois); body_box!(b))
+WaterLily.update!(b::TBiotPoisson) = (WaterLily.update!(b.pois); body_box!(b); mark_irreg2!(b))
 Base.getproperty(b::TBiotPoisson, s::Symbol) = s === :levels ? getfield(b, :pois).levels : getfield(b, s)
 
 # Body box (BiotSavartBCs.transition_box): the cells with 0 < L < 1 on some face, grown by one
@@ -199,10 +206,44 @@ end
     dac = 0.25f0*((c01 + c11 - c00 - c10) + (S(Int32(0), Int32(2)) + S(i32, Int32(2)) - S(Int32(0), -i32) - S(i32, -i32)))
     return dab, dac
 end
+function k_mark_irreg2!(lo, hi, irreg2, g2::Grid{D}, op::Op{D}) where D
+    Ic, ok = cellidx(lo, hi); ok || return
+    g = op.g
+    J0 = ntuple(d-> Int32(2)*Ic[d] - Int32(2), Val(D))
+    ir = false
+    if D == 3
+        for dk in Int32(-1):Int32(2)
+            k = clamp(J0[3] + dk, i32, g.n[3]); lk = (k - i32)*g.s[3]
+            for dj in Int32(-1):Int32(2)
+                j = clamp(J0[2] + dj, i32, g.n[2]); lj = (j - i32)*g.s[2] + lk
+                for di in Int32(-1):Int32(2)
+                    i = clamp(J0[1] + di, i32, g.n[1])
+                    ir |= !isreg(op, i + lj)
+                end
+            end
+        end
+    else
+        for dj in Int32(-1):Int32(2)
+            j = clamp(J0[2] + dj, i32, g.n[2]); lj = (j - i32)*g.s[2]
+            for di in Int32(-1):Int32(2)
+                i = clamp(J0[1] + di, i32, g.n[1])
+                ir |= !isreg(op, i + lj)
+            end
+        end
+    end
+    @inbounds irreg2[lin(g2, Ic)] = ir ? UInt8(1) : UInt8(0)
+    return nothing
+end
+function mark_irreg2!(b::TBiotPoisson)
+    lo, hi = clip(b.boxes[2]..., inside_lo(b.g[2]), inside_hi(b.g[2]))
+    all(d-> lo[d] <= hi[d], 1:length(lo)) || return
+    launch(k_mark_irreg2!, lo, hi, b.irreg2, b.g[2], b.levels[1].op)
+end
 # level-2 vorticity = Σ over the 2ᵈ fine cells of the level-1 curl (zero outside buff=2)
-function k_curl_restrict!(lo, hi, ω2, g2::Grid{D}, u, g::Grid{D}) where D
+function k_curl_restrict!(lo, hi, ω2, g2::Grid{D}, u, g::Grid{D}, irreg2) where D
     I, ok = cellidx(lo, hi); ok || return
     l2 = lin(g2, I)
+    irreg2 !== nothing && @inbounds(irreg2[l2]) == UInt8(0) && return nothing
     J0 = ntuple(d-> Int32(2)*I[d] - Int32(2), Val(D))
     if D == 3 && (J0[1] >= Int32(3)) & (J0[1] <= g.n[1] - Int32(3)) &
                  (J0[2] >= Int32(3)) & (J0[2] <= g.n[2] - Int32(3)) &
@@ -268,7 +309,7 @@ layer_width(::Val{2}) = 10
 function fill_ω!(b::TBiotPoisson{T,S,V,D}, ω1, u) where {T,S,V,D}
     g = b.g
     launch(k_curl_layer!, ntuple(_->3,D), ntuple(d->Int(g[1].n[d])-2,D), ω1, u, g[1], Int32(layer_width(Val(D))))
-    launch(k_curl_restrict!, inside_lo(g[2]), inside_hi(g[2]), b.ω[1], g[2], u, g[1])
+    launch(k_curl_restrict!, inside_lo(g[2]), inside_hi(g[2]), b.ω[1], g[2], u, g[1], nothing)
 end
 
 # ---------------------------------------------------------------- FMM interactions
@@ -304,6 +345,7 @@ end
 # Sum over the source box olo:ohi minus the hole ilo:ihi (no hole on the top level). Each
 # x-line is split around the hole so the inner loop has no branch.
 # Lane p of P handles the outer rows p, p+P, …
+@inline rsqrt_approx(x::Float32) = ccall("llvm.nvvm.rsqrt.approx.ftz.f", llvmcall, Float32, (Float32,), x)
 @inline function xline(::Val{i}, x::NTuple{3}, ω, g::Grid{3}, ls, a, b, r2, r3) where i
     j = i % 3 + 1; k = (i + 1) % 3 + 1
     cj = Int32(j-1)*g.nc; ck = Int32(k-1)*g.nc
@@ -312,7 +354,7 @@ end
     for s1 in a:b
         r1 = x[1] - s1
         r = (r1, r2, r3)
-        ir = CUDA.rsqrt(r1*r1 + r23)
+        ir = rsqrt_approx(r1*r1 + r23)
         @inbounds s += (ω[ls+s1+cj]*r[k] - ω[ls+s1+ck]*r[j])*(ir*ir*ir)
     end
     return s
@@ -388,15 +430,20 @@ function k_interact!(n, tar, idx, own, ω, g::Grid{D}, top::Bool, bottom::Bool, 
     val = 0f0
     if valid
         val = target_sum(T, i, ω, g, top, bottom, p, P)
-        @unroll for m in i32:Int32(2^K - 1)   # empty unless images are requested
-            Tm = T; sgn = 1f0
-            @unroll for b in i32:Int32(K)
-                if (m >> (b - i32)) & i32 == i32
-                    Tm, sb = reflect(Tm, imgs[b], i, g)
-                    sgn *= sb
+        if K > 0
+            # Non-unrolled loop over image reflections keeps registers <= 80 on Turing
+            m = i32; mend = Int32(2^K - 1)
+            while m <= mend
+                Tm = T; sgn = 1f0
+                @unroll for b in i32:Int32(K)
+                    if (m >> (b - i32)) & i32 == i32
+                        Tm, sb = reflect(Tm, imgs[b], i, g)
+                        sgn *= sb
+                    end
                 end
+                val += sgn*target_sum(Tm, i, ω, g, top, bottom, p, P)
+                m += i32
             end
-            val += sgn*target_sum(Tm, i, ω, g, top, bottom, p, P)
         end
     end
     off = P ÷ Int32(2)
@@ -445,20 +492,38 @@ coarse-to-fine projection; the level-1 target slots of `ω1` then hold the induc
 velocity. Every target stores its own sum in `b.own`. With `update`, only the targets that
 see the body box are summed (BiotSavartBCs.fmmBC! with `idx`); the others keep their own sums.
 """
+function graphed_biot!(f::F, graphs, seen, key) where F
+    if haskey(graphs, key)
+        ex = graphs[key]
+        ex === nothing ? f() : CUDA.launch(ex)
+    elseif key in seen
+        ex = capture_stream_graph(f)
+        graphs[key] = ex
+        ex === nothing ? f() : CUDA.launch(ex)
+    elseif length(graphs) < 32
+        push!(seen, key); f()
+    else
+        f()
+    end
+    return nothing
+end
 function fmm!(b::TBiotPoisson{T,S,V,D}, ω1; update=false) where {T,S,V,D}
     ωs = (ω1, b.ω...)
     nl = length(ωs)
-    for l in 1:nl
-        update && launch1(k_settar!, length(b.tar[l]), b.tar[l], ωs[l], b.own[l])
-        n = update ? b.nnear[l] : length(b.tar[l])
-        n == 0 && continue
-        # lanes per target (measured on the benchmark cases): about 32k lanes per level, 1 to 16
-        # per target, and at least one per image sum, which keeps the sources per warp small
-        P = clamp(prevpow(2, max(1, 32768 ÷ n)), min(2^length(b.images), 16), 16)
-        @cuda threads=256 blocks=cld(n*P, 256) k_interact!(Int32(n), b.tar[l], update ? b.near[l] : nothing, b.own[l], ωs[l], b.g[l], l == 1, l == nl, Int32(P), b.images)
-    end
-    for l in nl-1:-1:1
-        launch1(k_project!, length(b.tar[l]), b.tar[l], ωs[l], b.g[l], ωs[l+1], b.g[l+1])
+    key = (objectid(ω1), update, update ? Tuple(b.nnear) : ())
+    graphed_biot!(b.fmm_graphs, b.fmm_seen, key) do
+        for l in 1:nl
+            update && launch1(k_settar!, length(b.tar[l]), b.tar[l], ωs[l], b.own[l])
+            n = update ? b.nnear[l] : length(b.tar[l])
+            n == 0 && continue
+            # lanes per target (measured on the benchmark cases): about 32k lanes per level, 1 to 16
+            # per target, and at least one per image sum, which keeps the sources per warp small
+            P = clamp(prevpow(2, max(1, 32768 ÷ n)), min(2^length(b.images), 16), 16)
+            @cuda threads=256 blocks=cld(n*P, 256) k_interact!(Int32(n), b.tar[l], update ? b.near[l] : nothing, b.own[l], ωs[l], b.g[l], l == 1, l == nl, Int32(P), b.images)
+        end
+        for l in nl-1:-1:1
+            launch1(k_project!, length(b.tar[l]), b.tar[l], ωs[l], b.g[l], ωs[l+1], b.g[l+1])
+        end
     end
 end
 # a[tar[k]] = s[k]
@@ -552,15 +617,17 @@ Recompute ω of `u - Δt·L∇p` in the body box on every level (BiotSavartBCs.b
 the layer, level 2 from the fine curls, levels ≥3 restricted. With `full`, levels ≥3 are
 restricted everywhere, after `fill_ω!` has written levels 1 and 2.
 """
-function body_ω!(b::TBiotPoisson{T,S,V,D}, ω1, u, p, dt; full=false) where {T,S,V,D}
-    g = b.g; U = UC(u, p, b.levels[1].op, dt)
+function body_ω!(b::TBiotPoisson{T,S,V,D}, ω1, u, p, dt; full=false, skip_reg=false) where {T,S,V,D}
+    g = b.g; U = UC(u, p, b.levels[1].op, dt); w = layer_width(Val(D))
     lo, hi = clip(b.boxes[1]..., ntuple(_->3, D), ntuple(d->Int(g[1].n[d])-2, D))
-    launch(k_curl_layer!, lo, hi, ω1, U, g[1], Int32(layer_width(Val(D))))
+    if all(d-> lo[d] <= hi[d], 1:D) && any(d-> lo[d] <= w || hi[d] >= Int(g[1].n[d]) - w + 1, 1:D)
+        launch(k_curl_layer!, lo, hi, ω1, U, g[1], Int32(w))
+    end
     lo, hi = clip(b.boxes[2]..., inside_lo(g[2]), inside_hi(g[2]))
-    launch(k_curl_restrict!, lo, hi, b.ω[1], g[2], U, g[1])
+    all(d-> lo[d] <= hi[d], 1:D) && launch(k_curl_restrict!, lo, hi, b.ω[1], g[2], U, g[1], skip_reg ? b.irreg2 : nothing)
     for l in 3:length(g)
         lo, hi = full ? (inside_lo(g[l]), inside_hi(g[l])) : clip(b.boxes[l]..., inside_lo(g[l]), inside_hi(g[l]))
-        launch(k_vrestrict!, lo, hi, b.ω[l-1], g[l], b.ω[l-2], g[l-1])
+        all(d-> lo[d] <= hi[d], 1:D) && launch(k_vrestrict!, lo, hi, b.ω[l-1], g[l], b.ω[l-2], g[l-1])
     end
 end
 # Σ|r| and max|r| over a cell list (block partials)
@@ -627,15 +694,14 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w::Int, t; cfl=f
     r₁tol = WaterLily.l1n_tol(b.pois.ml.levels[1], tol)/dt; r∞tol = tol/dt
     # vorticity of u - Δt·L∇p, Biot-Savart boundary velocity
     fill_ω!(b, a.f, a.u)
-    body_ω!(b, a.f, a.u, a.p, dt; full=true)
+    body_ω!(b, a.f, a.u, a.p, dt; full=true, skip_reg=true)
     fmm!(b, a.f)
     launch1(k_biotbc!, nt, tar1, b.tadj, a.u, a.f, top.r, U, g, false)
     # residual r = (div(u) - δv·div(V))/Δt - A p (Σr in SLOT_RSUM, non-boundary norms in SLOT_BIOT_R0)
     lo, hi = inside_lo(g), inside_hi(g)
     checkcap(red, nblocks(lo, hi))
     nb = launch(k_resid_biot!, lo, hi, red.ps, red.ps2, red.pm, top.r, a.p, a.u, a.V, op, idt, !a.Vzero; cap=length(red.ps))
-    finish!(red, nb, red.s, red.m, SLOT_RSUM)
-    finish!(red, nb, red.s, red.m, SLOT_BIOT_R0; ps=red.ps2)
+    finish2!(red, nb, red.s, red.m, SLOT_RSUM, SLOT_BIOT_R0)
     launch1(k_fixresid2!, nt, tar1, b.tadj, a.u, top.r, red.s, Int32(SLOT_RSUM), dt, idt, g)
     list_norms!(b, b.B, top.r, SLOT_B_AFTER)
     fetch!(red)
@@ -654,7 +720,7 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w::Int, t; cfl=f
         end
         r₁mg, r∞in = getsum(red, SLOT_R), getmax(red, SLOT_R)   # max over cells away from the boundary
         # Biot-Savart update of the boundary velocity with the current p
-        body_ω!(b, a.f, a.u, a.p, dt)
+        body_ω!(b, a.f, a.u, a.p, dt; skip_reg=true)
         fmm!(b, a.f; update=true)
         list_norms!(b, b.B, top.r, SLOT_B_BEFORE)
         nb = cld(nt, 256); checkcap(red, nb)
@@ -676,7 +742,9 @@ function WaterLily.mom_project!(a::TFlow{D,T}, b::TBiotPoisson, w::Int, t; cfl=f
     else
         launch(k_proj!, inside_lo(g), inside_hi(g), a.u, a.p, op, dt, nothing)
     end
-    pflowBC!(a.u, g)
+    graphed_biot!(b.pflow_graphs, b.pflow_seen, objectid(a.u)) do
+        pflowBC!(a.u, g)
+    end
 end
 """
     TurboLily.BiotSimulation(dims, uBC, L; nonbiotfaces=(), fmm=true, symmetry=(), kwargs...)

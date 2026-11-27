@@ -321,6 +321,75 @@ end
     end
     return nothing
 end
+@inline function warp_red_sm2(s::Union{Float32,Float64}, m1::Float32, m2::Float32)
+    off = Int32(16)
+    while off > 0
+        s += shfl_down_sync(0xffffffff, s, off)
+        m1 = max(m1, shfl_down_sync(0xffffffff, m1, off))
+        m2 = max(m2, shfl_down_sync(0xffffffff, m2, off))
+        off >>= 1
+    end
+    return s, m1, m2
+end
+@inline function block_red_sm2(s::S, m1::Float32, m2::Float32) where S
+    shs = CuStaticSharedArray(S, 32)
+    shm1 = CuStaticSharedArray(Float32, 32)
+    shm2 = CuStaticSharedArray(Float32, 32)
+    t = flat_tid()
+    nt = blockDim().x*blockDim().y*blockDim().z
+    s, m1, m2 = warp_red_sm2(s, m1, m2)
+    lane = t % Int32(32) + i32
+    wid = t ÷ Int32(32) + i32
+    nw = (nt + Int32(31)) ÷ Int32(32)
+    lane == i32 && (@inbounds shs[wid] = s; @inbounds shm1[wid] = m1; @inbounds shm2[wid] = m2)
+    sync_threads()
+    if wid == i32
+        s = lane <= nw ? @inbounds(shs[lane]) : zero(S)
+        m1 = lane <= nw ? @inbounds(shm1[lane]) : 0f0
+        m2 = lane <= nw ? @inbounds(shm2[lane]) : 0f0
+        s, m1, m2 = warp_red_sm2(s, m1, m2)
+    end
+    return s, m1, m2
+end
+@inline function warp_red2(s1::Float64, s2::Float64, m::Float32)
+    off = Int32(16)
+    while off > 0
+        s1 += shfl_down_sync(0xffffffff, s1, off)
+        s2 += shfl_down_sync(0xffffffff, s2, off)
+        m = max(m, shfl_down_sync(0xffffffff, m, off))
+        off >>= 1
+    end
+    return s1, s2, m
+end
+@inline function block_red2(s1::Float64, s2::Float64, m::Float32)
+    shs1 = CuStaticSharedArray(Float64, 32)
+    shs2 = CuStaticSharedArray(Float64, 32)
+    shm = CuStaticSharedArray(Float32, 32)
+    t = flat_tid()
+    nt = blockDim().x*blockDim().y*blockDim().z
+    s1, s2, m = warp_red2(s1, s2, m)
+    lane = t % Int32(32) + i32
+    wid = t ÷ Int32(32) + i32
+    nw = (nt + Int32(31)) ÷ Int32(32)
+    lane == i32 && (@inbounds shs1[wid] = s1; @inbounds shs2[wid] = s2; @inbounds shm[wid] = m)
+    sync_threads()
+    if wid == i32
+        s1 = lane <= nw ? @inbounds(shs1[lane]) : 0.0
+        s2 = lane <= nw ? @inbounds(shs2[lane]) : 0.0
+        m = lane <= nw ? @inbounds(shm[lane]) : 0f0
+        s1, s2, m = warp_red2(s1, s2, m)
+    end
+    return s1, s2, m
+end
+"Write this block's (sum, max1, max2) partials to `ps/pm/pm2[block]`."
+@inline function block_partial_sm2!(ps, pm, pm2, s::Float32, m1::Float32, m2::Float32)
+    s, m1, m2 = block_red_sm2(s, m1, m2)
+    if flat_tid() == 0
+        b = flat_bid()
+        @inbounds ps[b] = s; @inbounds pm[b] = m1; @inbounds pm2[b] = m2
+    end
+    return nothing
+end
 @inline skip_fix(::Nothing) = false
 @inline skip_fix(fixd) = abs(@inbounds(fixd[1])) <= @inbounds(fixd[2])
 # (sum,max) of the block partials 1:nb, grid-strided; block b writes its result to outs/outm[k+b-1]
@@ -338,6 +407,36 @@ function k_finish!(ps, pm, nb::Int32, outs, outm, k::Int32, fixd=nothing)
     end
     return nothing
 end
+# (sum1, sum2, max) of the block partials 1:nb, grid-strided
+function k_finish_2s!(ps, ps2, pm, nb::Int32, outs1, outs2, outm, k1::Int32, k2::Int32)
+    s1 = 0.0; s2 = 0.0; m = 0f0
+    i = (blockIdx().x - i32)*blockDim().x + threadIdx().x
+    while i <= nb
+        @inbounds s1 += Float64(ps[i]); @inbounds s2 += Float64(ps2[i]); @inbounds m = max(m, pm[i])
+        i += gridDim().x*blockDim().x
+    end
+    s1, s2, m = block_red2(s1, s2, m)
+    if threadIdx().x == i32
+        b = blockIdx().x - i32
+        @inbounds outs1[k1 + b] = s1; @inbounds outs2[k2 + b] = s2; @inbounds outm[k2 + b] = m
+    end
+    return nothing
+end
+# (sum,max1,max2) of the block partials 1:nb, grid-strided
+function k_finish_sm2!(ps, pm, pm2, nb::Int32, outs, outm, outm2, k1::Int32, k2::Int32)
+    s = 0.0; m1 = 0f0; m2 = 0f0
+    i = (blockIdx().x - i32)*blockDim().x + threadIdx().x
+    while i <= nb
+        @inbounds s += Float64(ps[i]); @inbounds m1 = max(m1, pm[i]); @inbounds m2 = max(m2, pm2[i])
+        i += gridDim().x*blockDim().x
+    end
+    s, m1, m2 = block_red_sm2(s, m1, m2)
+    if threadIdx().x == i32
+        b = blockIdx().x - i32
+        @inbounds outs[k1 + b] = s; @inbounds outm[k1 + b] = m1; @inbounds outm2[k2 + b] = m2
+    end
+    return nothing
+end
 # (sum,max) of Float64/Float32 values 1:nq in one block
 function k_finish2!(qs, qm, nq::Int32, outs, outm, k::Int32, fixd=nothing)
     skip_fix(fixd) && return nothing
@@ -346,6 +445,24 @@ function k_finish2!(qs, qm, nq::Int32, outs, outm, k::Int32, fixd=nothing)
     s, m = block_red(s, m)
     if threadIdx().x == i32
         @inbounds outs[k] = s; @inbounds outm[k] = m
+    end
+    return nothing
+end
+function k_finish2_2s!(qs, qs2, qm, nq::Int32, outs, outm, k1::Int32, k2::Int32)
+    i = threadIdx().x
+    s1 = i <= nq ? @inbounds(qs[i]) : 0.0; s2 = i <= nq ? @inbounds(qs2[i]) : 0.0; m = i <= nq ? @inbounds(qm[i]) : 0f0
+    s1, s2, m = block_red2(s1, s2, m)
+    if threadIdx().x == i32
+        @inbounds outs[k1] = s1; @inbounds outs[k2] = s2; @inbounds outm[k1] = m; @inbounds outm[k2] = m
+    end
+    return nothing
+end
+function k_finish2_sm2!(qs, qm, qm2, nq::Int32, outs, outm, k1::Int32, k2::Int32)
+    i = threadIdx().x
+    s = i <= nq ? @inbounds(qs[i]) : 0.0; m1 = i <= nq ? @inbounds(qm[i]) : 0f0; m2 = i <= nq ? @inbounds(qm2[i]) : 0f0
+    s, m1, m2 = block_red_sm2(s, m1, m2)
+    if threadIdx().x == i32
+        @inbounds outs[k1] = s; @inbounds outm[k1] = m1; @inbounds outm[k2] = m2
     end
     return nothing
 end
@@ -369,13 +486,16 @@ struct RedBuf
     pm::CuVector{Float32}
     hs::Vector{Float64}
     qs::CuVector{Float64}    # per-block results of the first level of `finish!`
+    qs2::CuVector{Float64}
     qm::CuVector{Float32}
+    qm2::CuVector{Float32}
 end
 const FINISH_BLOCKS = 64
 function RedBuf(nb::Integer, n=8)
     s = CUDA.zeros(Float64, 2n)
     RedBuf(s, view(s, n+1:2n), CUDA.zeros(Float32,nb), CUDA.zeros(Float32,nb), CUDA.zeros(Float32,nb),
-        zeros(Float64,2n), CUDA.zeros(Float64, FINISH_BLOCKS), CUDA.zeros(Float32, FINISH_BLOCKS))
+        zeros(Float64,2n), CUDA.zeros(Float64, FINISH_BLOCKS), CUDA.zeros(Float64, FINISH_BLOCKS),
+        CUDA.zeros(Float32, FINISH_BLOCKS), CUDA.zeros(Float32, FINISH_BLOCKS))
 end
 """
     finish!(b::RedBuf, nb, outs, outm, k; ps=b.ps)
@@ -390,6 +510,26 @@ function finish!(b::RedBuf, nb, outs, outm, k; ps=b.ps, fixd=nothing)
     else
         @cuda threads=256 blocks=FINISH_BLOCKS k_finish!(ps, b.pm, Int32(nb), b.qs, b.qm, i32, fixd)
         @cuda threads=FINISH_BLOCKS k_finish2!(b.qs, b.qm, Int32(FINISH_BLOCKS), outs, outm, Int32(k), fixd)
+    end
+    return nothing
+end
+"Reduce `(b.ps, b.pm) -> (outs[k1], outm[k1])` and `(b.ps2, b.pm) -> (outs[k2], outm[k2])` in one pass."
+function finish2!(b::RedBuf, nb, outs, outm, k1, k2)
+    if nb <= 16384
+        @cuda threads=1024 k_finish_2s!(b.ps, b.ps2, b.pm, Int32(nb), outs, outs, outm, Int32(k1), Int32(k2))
+    else
+        @cuda threads=256 blocks=FINISH_BLOCKS k_finish_2s!(b.ps, b.ps2, b.pm, Int32(nb), b.qs, b.qs2, b.qm, i32, i32)
+        @cuda threads=FINISH_BLOCKS k_finish2_2s!(b.qs, b.qs2, b.qm, Int32(FINISH_BLOCKS), outs, outm, Int32(k1), Int32(k2))
+    end
+    return nothing
+end
+"Reduce `(b.ps, b.pm) -> (outs[k1], outm[k1])` and `b.ps2 -> outm[k2]` in one reduction pass."
+function finish_sm2!(b::RedBuf, nb, outs, outm, k1, k2)
+    if nb <= 16384
+        @cuda threads=1024 k_finish_sm2!(b.ps, b.pm, b.ps2, Int32(nb), outs, outm, outm, Int32(k1), Int32(k2))
+    else
+        @cuda threads=256 blocks=FINISH_BLOCKS k_finish_sm2!(b.ps, b.pm, b.ps2, Int32(nb), b.qs, b.qm, b.qm2, i32, i32)
+        @cuda threads=FINISH_BLOCKS k_finish2_sm2!(b.qs, b.qm, b.qm2, Int32(FINISH_BLOCKS), outs, outm, Int32(k1), Int32(k2))
     end
     return nothing
 end

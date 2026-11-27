@@ -26,7 +26,7 @@ KernelAbstractions 0.10 on RTX 2080 Ti and A10. Benchmarked on A100, GH200, RTX 
 - `T=Float32` and `mem=CuArray` only. One GPU per simulation.
 - Grid size: kernels use 32-bit indices, so D·cells (with ghosts) ≤ 2³¹−1: about 715M cells in 3D.
   2048×576×576 (680M cells, 82 GiB) runs on a GH200.
-- `flow.u`, `flow.u⁰`, `flow.f` are swapped, not copied: read `sim.flow.u` afresh after a step.
+- `flow.u`, `flow.u⁰`, `flow.f`, `flow.p`, `flow.σ` are swapped, not copied: read `sim.flow.u` and `sim.flow.p` afresh after a step.
 - `BiotSimulation`: no `fmm=false`, no periodic directions, at least two Biot-Savart levels.
 - No automatic differentiation (`ForwardDiff.Dual` element types are rejected).
 - The pressure solver has its own layout: `pois.levels[1].r`, `.iD` and `residual!` do not exist.

@@ -342,6 +342,7 @@ function WaterLily.update!(p::TPoisson{T}) where T
             end
             deep_lo, deep_hi = update_box(dlo, dhi, g, p.per, 2, 1)
             set_deep!(op, deep_lo, deep_hi)
+            l == 1 && pack_reg!(p, deep_lo, deep_hi)
         end
         return p
     end
@@ -363,6 +364,7 @@ function WaterLily.update!(p::TPoisson{T}) where T
             launch(k_diag_coarse!, inside_lo(g), inside_hi(g), op.L, op.Dg, op.iD, op.reg, g, op.Lreg)
         end
         set_deep!(op)
+        l == 1 && pack_reg!(p, inside_lo(g), inside_hi(g))
     end
     return p
 end
